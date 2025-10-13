@@ -222,7 +222,7 @@ class Go2NodeFactory:
                 executable='tts_node',
                 name='tts_node',
                 parameters=[{
-                    'api_key': os.getenv('ELEVENLABS_API_KEY', ''),
+                    'api_key': os.getenv('ELEVENLABS_API_KEY', 'sk_3780451df60d857a49338b33aed7f57c5b2f933ee5f4942f'),
                     'provider': 'elevenlabs',
                     'voice_name': 'XrExE9yKIg1WjnnlVkGX',
                     'local_playback': False,

@@ -20,6 +20,8 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 from enum import Enum
 import threading
+import itertools
+import re
 
 from pydub import AudioSegment
 from pydub.playback import play
@@ -29,6 +31,19 @@ import requests
 from std_msgs.msg import String
 from go2_interfaces.msg import WebRtcReq
 
+import threading, itertools
+_PLAYBACK_LOCK = threading.Lock()
+_SESSION_COUNTER = itertools.count(1)
+
+
+# near imports
+try:
+    from go2_robot_sdk.domain.constants.webrtc_topics import WEBRTC_TOPICS
+    AUDIO_TOPIC_STR = WEBRTC_TOPICS["AUDIO_HUB_REQ"]   # "rt/api/audiohub/request"
+except Exception:
+    AUDIO_TOPIC_STR = "rt/api/audiohub/request"
+
+_SESSION_COUNTER = itertools.count(1)  # monotonic, never repeats during process lifetime
 
 class AudioFormat(Enum):
     """Supported audio formats"""
@@ -258,7 +273,7 @@ class EnhancedTTSNode(Node):
         self._setup_communication()
         
         # RTC topic constants (imported from domain)
-        self.RTC_TOPIC = {"AUDIO_HUB_REQ": 1003}  # Fallback if import fails
+        self.RTC_TOPIC = AUDIO_TOPIC_STR #{"AUDIO_HUB_REQ": "1003"}  # Fallback if import fails
         
         # Log initialization
         self._log_initialization()
@@ -325,48 +340,108 @@ class EnhancedTTSNode(Node):
         #     Empty, "clear_tts_cache", self.clear_cache_callback
         # )
     
+    def _chunk_text(self, text: str, max_chars: int = 200) -> list[str]:
+        """
+        Split text at natural boundaries, keeping each chunk <= max_chars.
+        Priority: . ! ? ; : ,  — then fall back to word wrap.
+        """
+        text = re.sub(r'\s+', ' ', text).strip()
+        if len(text) <= max_chars:
+            return [text]
+
+        # First pass: split on sentence enders while keeping them
+        parts = re.split(r'(?<=[.!?])\s+', text)
+        chunks = []
+        buf = ""
+
+        def flush():
+            nonlocal buf
+            if buf.strip():
+                chunks.append(buf.strip())
+            buf = ""
+
+        for part in parts:
+            if not part:
+                continue
+            if len(buf) + 1 + len(part) <= max_chars:
+                buf = (buf + " " + part).strip() if buf else part
+            else:
+                # try softer break inside the part
+                if len(part) > max_chars:
+                    softs = re.split(r'(?<=[;:,])\s+', part)
+                    for s in softs:
+                        if len(buf) + 1 + len(s) <= max_chars:
+                            buf = (buf + " " + s).strip() if buf else s
+                        else:
+                            flush()
+                            if len(s) <= max_chars:
+                                buf = s
+                            else:
+                                # last resort: word wrap
+                                words = s.split()
+                                cur = ""
+                                for w in words:
+                                    if len(cur) + 1 + len(w) <= max_chars:
+                                        cur = (cur + " " + w).strip() if cur else w
+                                    else:
+                                        if cur:
+                                            chunks.append(cur)
+                                        cur = w
+                                if cur:
+                                    buf = cur
+                else:
+                    flush()
+                    buf = part
+        flush()
+        return chunks
+
+    def _synthesize_chunk(self, text: str) -> bytes:
+        """Return MP3 bytes for a single chunk, using cache when possible."""
+        audio_data = self.cache.get(text, self.config.voice_name, self.config.provider.value)
+        if audio_data:
+            return audio_data
+
+        audio_data = self.tts_provider.synthesize(text)
+        if not audio_data:
+            raise RuntimeError("TTS provider returned no audio")
+        # Save to cache
+        self.cache.put(text, self.config.voice_name, self.config.provider.value, audio_data)
+        return audio_data
+
     def tts_callback(self, msg: String) -> None:
-        """Handle incoming TTS requests"""
         try:
-            text = msg.data.strip()
-            if not text:
+            full_text = msg.data.strip()
+            if not full_text:
                 self.get_logger().warn("Received empty TTS request")
                 return
-            
-            self.get_logger().info(f'🎤 TTS Request: "{text}" (voice: {self.config.voice_name})')
-            
-            # Check cache first
-            cache_hit = False
-            audio_data = self.cache.get(text, self.config.voice_name, self.config.provider.value)
-            
-            if audio_data:
-                self.get_logger().info("💾 Cache hit - using cached audio")
-                cache_hit = True
-            else:
-                # Generate new speech
-                self.get_logger().info("🔊 Generating new speech...")
-                audio_data = self.tts_provider.synthesize(text)
-                
-                if audio_data:
-                    # Cache the result
-                    if self.cache.put(text, self.config.voice_name, self.config.provider.value, audio_data):
-                        self.get_logger().info("💾 Audio cached successfully")
-                else:
-                    self.get_logger().error("❌ Failed to generate speech")
+
+            pieces = self._chunk_text(full_text, max_chars=30)
+            n = len(pieces)
+            self.get_logger().info(f"🎤 TTS request split into {n} chunk(s)")
+
+            # -------- Phase A: PREFETCH all audio --------
+            audios: list[bytes] = []
+            for i, piece in enumerate(pieces, 1):
+                self.get_logger().info(f"🔊 Generating chunk {i}/{n}…")
+                try:
+                    audio_mp3 = self._synthesize_chunk(piece)
+                except Exception as e:
+                    self.get_logger().error(f"❌ Failed to synthesize chunk {i}: {e}")
                     return
-            
-            # Process and play audio
-            if self.config.local_playback:
-                self._play_locally(audio_data)
-            else:
-                self._play_on_robot(audio_data)
-            
-            # Log success
-            status = "cached" if cache_hit else "generated"
-            self.get_logger().info(f"✅ TTS completed successfully ({status})")
-            
+                audios.append(audio_mp3)
+
+            # -------- Phase B: PLAYBACK sequentially --------
+            for i, (piece, audio_mp3) in enumerate(zip(pieces, audios), 1):
+                preview = (piece[:60] + "…") if len(piece) > 60 else piece
+                self.get_logger().info(f'📤 Playing chunk {i}/{n}: "{preview}"')
+                self._play_on_robot(audio_mp3)   # uses the stable, locked sender
+                #time.sleep(0.35)                 # small gap between utterances
+
+            self.get_logger().info("✅ TTS completed successfully (all chunks)")
+
         except Exception as e:
-            self.get_logger().error(f"❌ TTS processing error: {str(e)}")
+            self.get_logger().error(f"❌ TTS processing error: {e}")
+
     
     def _play_locally(self, audio_data: bytes) -> None:
         """Play audio locally"""
@@ -376,7 +451,66 @@ class EnhancedTTSNode(Node):
             self.get_logger().info("🔊 Local playback completed")
         except Exception as e:
             self.get_logger().error(f"❌ Local playback error: {str(e)}")
-    
+
+    def _make_robot_friendly_wav(self, audio_mp3: bytes, pad_ms: int = 400) -> bytes:
+        audio = AudioSegment.from_mp3(io.BytesIO(audio_mp3))
+        audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)  # mono, 16-bit PCM
+        if pad_ms > 0:
+            audio = audio + AudioSegment.silent(duration=pad_ms, frame_rate=16000)
+        out = io.BytesIO()
+        audio.export(out, format="wav", parameters=["-acodec", "pcm_s16le"])
+        return out.getvalue()
+
+    def _play_on_robot(self, audio_data: bytes) -> None:
+        # Serialize: if something is playing, wait your turn
+        with _PLAYBACK_LOCK:
+            try:
+                wav_data = self._make_robot_friendly_wav(audio_data, pad_ms=400)
+
+                # Base64 + chunking (smaller chunks help jitter)
+                b64 = base64.b64encode(wav_data)
+                chunk_size = 4096  # bytes in base64 stream
+                chunks = [b64[i:i+chunk_size] for i in range(0, len(b64), chunk_size)]
+                total = len(chunks)
+
+                # One session id per utterance
+                sid = next(_SESSION_COUNTER)
+
+                # Timing knobs (tuned to avoid overlap/flush issues)
+                t_after_start   = 0.25   # wait after START before first chunk
+                t_between_chunks= 0.12   # 100–120 ms is usually safe
+                t_before_end    = 1.10   # let buffer drain fully
+
+                # Optional: send a pre-reset END if you still see overlap
+                # self._send_audio_command(4002, "", session_id=sid)
+                # time.sleep(0.30)
+
+                # START
+                self._send_audio_command(4001, "", session_id=sid)
+                time.sleep(t_after_start)
+
+                # CHUNKS — 1..N
+                for i, c in enumerate(chunks, 1):
+                    block = {
+                        "current_block_index": i,
+                        "total_block_number": total,
+                        "block_content": c.decode("ascii"),
+                    }
+                    self._send_audio_command(4003, json.dumps(block), session_id=sid)
+                    time.sleep(t_between_chunks)
+
+                # No duplicate last chunk (avoid “echo”)
+                time.sleep(t_before_end)
+
+                # END
+                self._send_audio_command(4002, "", session_id=sid)
+
+            except Exception as e:
+                self.get_logger().error(f"❌ Robot playback error: {e}")
+
+
+
+    '''
     def _play_on_robot(self, audio_data: bytes) -> None:
         """Send audio to robot for playback"""
         try:
@@ -425,16 +559,15 @@ class EnhancedTTSNode(Node):
             
         except Exception as e:
             self.get_logger().error(f"❌ Robot playback error: {str(e)}")
-    
-    def _send_audio_command(self, api_id: int, parameter: str) -> None:
-        """Send audio command to robot"""
+    '''    
+    def _send_audio_command(self, api_id: int, parameter: str, session_id: int = 0) -> None:
         req = WebRtcReq()
-        req.api_id = api_id
-        req.priority = 0
+        req.id = int(session_id)        # same id per utterance; new id for next one
+        req.api_id = int(api_id)
+        req.priority = 1                # <- REQUIRED for your driver (variant #2)
         req.parameter = parameter
-        req.topic = self.RTC_TOPIC["AUDIO_HUB_REQ"]
-        self.audio_pub.publish(req)
-    
+        req.topic = self.RTC_TOPIC
+        self.audio_pub.publish(req)    
     def _log_initialization(self) -> None:
         """Log initialization details"""
         cache_stats = self.cache.get_cache_stats()
