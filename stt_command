@@ -1,0 +1,1 @@
+os2 launch stt_node odas_stt_localized.launch.py mode:=separated audio_port:=9004 tracked_port:=9000 n_channels:=4

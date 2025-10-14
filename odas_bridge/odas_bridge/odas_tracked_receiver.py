@@ -3,6 +3,7 @@ import rclpy, socket, json
 from rclpy.node import Node
 from std_msgs.msg import String
 from geometry_msgs.msg import Vector3Stamped
+from std_msgs.msg import Bool
 
 class TrackedTCPServer(Node):
     def __init__(self):
@@ -10,8 +11,12 @@ class TrackedTCPServer(Node):
         self.declare_parameter('port', 9000)
         self.port = int(self.get_parameter('port').value)
 
+        self.declare_parameter('min_activity', 0.2)  # tweak 0..1
+        self.min_activity = float(self.get_parameter('min_activity').value)
+
         self.pub_json = self.create_publisher(String, '/audio/odas/tracked_json', 10)
         self.pub_vec  = self.create_publisher(Vector3Stamped, '/audio/odas/doa', 10)
+        self.pub_vact  = self.create_publisher(Bool, '/audio/voice_active', 10)
 
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -75,10 +80,11 @@ class TrackedTCPServer(Node):
             self.pub_json.publish(String(data=s))
 
             # derive a simple DoA vector from the most active source (activity > 0)
-            srcs = j.get('sources', [])
+            srcs = j.get('src', j.get('sources', []))
+
             if srcs:
                 best = max(srcs, key=lambda t: t.get('activity', 0.0))
-                if float(best.get('activity', 0.0)) > 0.0:
+                if float(best.get('activity', 0.0)) > self.min_activity:
                     v = Vector3Stamped()
                     v.header.stamp = self.get_clock().now().to_msg()
                     v.header.frame_id = 'mic_array'
@@ -86,8 +92,14 @@ class TrackedTCPServer(Node):
                     v.vector.y = float(best.get('y', 0.0))
                     v.vector.z = float(best.get('z', 0.0))
                     self.pub_vec.publish(v)
+                    self.pub_vact.publish(Bool(data=True))
+                else:
+                    self.pub_vact.publish(Bool(data=False))
+            else:
+                self.pub_vact.publish(Bool(data=False))
         except Exception as e:
             self.get_logger().warn(f'JSON parse error: {e}')
+            self.pub_vact.publish(Bool(data=False))
 
 def main():
     rclpy.init()
