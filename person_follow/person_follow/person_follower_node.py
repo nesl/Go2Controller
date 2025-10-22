@@ -12,7 +12,11 @@ from vision_msgs.msg import Detection2DArray
 
 from tf2_ros import Buffer, TransformListener, TransformException
 from tf2_geometry_msgs import do_transform_point
-
+import re
+from std_msgs.msg import String
+import json
+from rclpy.duration import Duration  # (already imported above in your file)
+from rclpy.time import Time
 
 class PersonFollower(Node):
     """
@@ -47,6 +51,18 @@ class PersonFollower(Node):
         self.declare_parameter("lost_timeout_s", 0.8)         # stop if not seen within this time
         self.declare_parameter("smoothing_alpha", 0.4)        # low-pass on commands [0..1]
 
+        # --- Name-orient parameters ---
+        self.declare_parameter("stt_json_topic", "/audio/stt_doa_json")
+        self.declare_parameter("trigger_words", ["bob"])   # case-insensitive, word-boundary
+        self.declare_parameter("name_debounce_s", 2.0)     # ignore re-triggers within this
+        self.declare_parameter("name_timeout_s", 3.0)      # give up if not aligned by then
+        self.declare_parameter("name_k_ang", 1.5)          # P gain for name-orient
+        self.declare_parameter("name_max_ang_speed", 1.0)  # rad/s clamp
+        self.declare_parameter("name_min_turn_speed", 0.15)# rad/s minimum to overcome friction
+        self.declare_parameter("name_stop_thresh_deg", 2.0)# done if |err| <= this
+
+
+
         # --------------- Read params ---------------
         self.detected_topic   = self.get_parameter("detected_topic").value
         self.cmd_vel_topic    = self.get_parameter("robot_cmd_vel").value
@@ -63,6 +79,33 @@ class PersonFollower(Node):
         self.db_yaw           = float(self.get_parameter("yaw_deadband_rad").value)
         self.lost_timeout_s   = float(self.get_parameter("lost_timeout_s").value)
         self.alpha            = float(self.get_parameter("smoothing_alpha").value)
+
+
+        self.stt_json_topic    = self.get_parameter("stt_json_topic").value
+        self.trigger_words     = [str(w).lower() for w in self.get_parameter("trigger_words").value]
+        self.name_debounce_s   = float(self.get_parameter("name_debounce_s").value)
+        self.name_timeout_s    = float(self.get_parameter("name_timeout_s").value)
+        self.name_k_ang        = float(self.get_parameter("name_k_ang").value)
+        self.name_max_w        = float(self.get_parameter("name_max_ang_speed").value)
+        self.name_min_turn     = float(self.get_parameter("name_min_turn_speed").value)
+        self.name_stop_deg     = float(self.get_parameter("name_stop_thresh_deg").value)
+
+
+        self._name_regex = re.compile(r"\b(" + "|".join(map(re.escape, self.trigger_words)) + r")\b", re.IGNORECASE)
+
+        # Name-orient state
+        self._orient_active = False
+        self._orient_goal_delta = 0.0      # radians; how much we want to rotate from start yaw
+        self._orient_start_yaw = 0.0       # radians; yaw when goal was armed
+        self._orient_started_at = None     # rclpy Time
+        self._last_name_trigger_at = self.get_clock().now() - Duration(seconds=999.0)
+
+        stt_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
+                             history=HistoryPolicy.KEEP_LAST, durability=DurabilityPolicy.VOLATILE)
+        self.sub_stt = self.create_subscription(String, self.stt_json_topic, self._on_stt_json, stt_qos)
+
+
+
 
         # --------------- QoS (sensor-ish) ---------------
         qos = QoSProfile(
@@ -92,8 +135,44 @@ class PersonFollower(Node):
 
         # cache of the latest selected target in map frame
         self._latest_target_map_ps: Optional[PointStamped] = None
+        
+        self.declare_parameter("turn_ref_frame", "odom")  # continuous frame to measure yaw (odom recommended)
+        self.turn_ref_frame = self.get_parameter("turn_ref_frame").value
+
 
     # ------------------ Helpers ------------------
+
+    def _current_yaw_ref_base(self) -> float:
+        """
+        Return robot yaw (rad) of base_frame in the chosen reference frame (default: odom),
+        wrapped to (-pi, pi]. This uses TF: target = turn_ref_frame, source = base_frame,
+        i.e., the pose of base in the ref frame (no map involvement).
+        """
+
+        try:
+            tf_base_to_ref = self.tf_buffer.lookup_transform(
+                self.turn_ref_frame,   # target (ref)
+                self.base_frame,       # source (base)
+                Time(),                # latest
+                Duration(seconds=0.2),
+            )
+            q = tf_base_to_ref.transform.rotation
+            # Yaw from quaternion (Z-up)
+            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            yaw = math.atan2(siny_cosp, cosy_cosp)  # (-pi, pi]
+            return yaw
+        except Exception as e:
+            self.get_logger().warn(f"Yaw lookup (ref={self.turn_ref_frame}) failed: {e}")
+            return 0.0
+
+
+    def _wrap_pi(self, a: float) -> float:
+
+        a = (a + math.pi) % (2.0*math.pi) - math.pi
+        return a
+
+
 
     def _select_nearest_person(self, dets: Detection2DArray) -> Optional[PointStamped]:
         best_ps = None
@@ -163,10 +242,103 @@ class PersonFollower(Node):
     def _lp(self, prev: float, new: float) -> float:
         return (1.0 - self.alpha) * prev + self.alpha * new
 
+    def _on_stt_json(self, msg: String):
+        """
+        Expect JSON like: {"text": "...","azimuth_deg": <float>, ...}
+        azimuth_deg is relative to robot base frame: 0°=+X (forward), +90°=left.
+        We rotate by -azimuth so the speaker lands at ~0° (straight ahead).
+        """
+
+        # Debounce
+        now = self.get_clock().now()
+        if (now - self._last_name_trigger_at) < rclpy.duration.Duration(seconds=self.name_debounce_s):
+            return
+
+        try:
+            data = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().warn(f"Bad STT JSON: {e}")
+            return
+
+        text = (data.get("text") or "").strip()
+        if not text or not self._name_regex.search(text):
+            return
+
+        az = data.get("azimuth_deg", None)
+        if az is None:
+            self.get_logger().warn("Trigger heard but no azimuth_deg in STT JSON.")
+            return
+
+        # Arm orientation goal
+        yaw_now = self._current_yaw_ref_base()   # was _current_yaw_map_base()
+        self._orient_start_yaw = yaw_now
+        
+        # Normalize azimuth to (-180, 180], and avoid the ambiguous +180 exactly
+        az_deg = float(az)
+        if az_deg <= -180.0 or az_deg > 180.0:
+            az_deg = ((az_deg + 180.0) % 360.0) - 180.0
+        # If exactly +180, choose a direction; use the sign of the provided value if any.
+        if az_deg == 180.0:
+            az_deg = 179.9  # tiny nudge to break tie to CCW (left). If you prefer right, use -179.9.
+
+        # Arm the relative rotation goal: +deg = CCW (left), -deg = CW (right)
+        self._orient_goal_delta = math.radians(az_deg)
+        
+        self._orient_started_at = now
+        self._orient_active = True
+        self._last_name_trigger_at = now
+
+        self.get_logger().info(f"Name trigger: '{text}' az={float(az):.1f}° → rotate {math.degrees(self._orient_goal_delta):.1f}°")
+
+
+
     # ------------------ Control Loop ------------------
 
     def control_loop(self):
         now = self.get_clock().now()
+
+        # 0) If we’re in name-orient mode, rotate first; pause following.
+        if self._orient_active:
+
+            # Timeout
+            if (now - self._orient_started_at) > Duration(seconds=self.name_timeout_s):
+                self.get_logger().info("Name-orient timeout; resuming follow.")
+                self._orient_active = False
+                self._stop("name-timeout")
+                return
+
+            # How far we've turned since we started the name-orient
+            yaw_now = self._current_yaw_ref_base()
+            turned = self._wrap_pi(yaw_now - self._orient_start_yaw)       # (-pi, pi]
+
+            # Shortest-angle error to remaining goal
+            # err = wrap(goal - turned)
+            raw = self._orient_goal_delta - turned
+            err = math.atan2(math.sin(raw), math.cos(raw))                  # (-pi, pi]
+
+            # Done?
+            if abs(math.degrees(err)) <= self.name_stop_deg:
+                self._orient_active = False
+                self._stop("name-aligned")
+                return
+
+            # P-control on angular error
+            w = self.name_k_ang * err
+
+            # Minimum turning rate to overcome static friction
+            if abs(w) < self.name_min_turn:
+                w = self.name_min_turn if w >= 0.0 else -self.name_min_turn
+
+            # Clamp
+            w = max(-self.name_max_w, min(self.name_max_w, w))
+
+            cmd = Twist()
+            cmd.linear.x = 0.0
+            cmd.angular.z = float(w)
+            self._publish_smoothed(cmd, reason="name-orient")
+            return
+
+
 
         # Lost target?
         if self.last_seen_time is None or (now - self.last_seen_time) > Duration(seconds=self.lost_timeout_s):

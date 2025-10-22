@@ -470,21 +470,31 @@ class STTFasterWhisperNode(Node):
                 # Update RViz marker visibility each tick
                 self._update_marker_visibility()
                 
+                
+                    
+                
+                # append raw samples for exact final transcription
+                # (pull corresponding raw int16 slice)
+                win_samps = int(self.wg_window_ms * self.fs / 1000)
+                hop_s = int(self.wg_hop_ms * self.fs / 1000)
+                # slice again (safe & simple)
+                mono_np = np.frombuffer(np.array(self._mono_ring, dtype=np.int16)[-win_samps:].tobytes(), dtype='<i2')
+                
                 if not self._utt_active:
                     self._utt_active = True
                     self._utt_start_time_ns = t_start_ns
                     self._utt_samples = []
                     self.doa_hist_speech = []
+                    self._utt_samples.append(mono_np.copy())
+                else:
+                    # Subsequent chunks: only append the NEW part (the hop)
+                    hop_np = mono_np[-hop_s:] if hop_s < len(mono_np) else mono_np
+                    self._utt_samples.append(hop_np.copy())
                     
-                self.doa_hist_speech.extend(self.doa_hist)
-                # append raw samples for exact final transcription
-                # (pull corresponding raw int16 slice)
-                win_samps = int(self.wg_window_ms * self.fs / 1000)
-                # slice again (safe & simple)
-                mono_np = np.frombuffer(np.array(self._mono_ring, dtype=np.int16)[-win_samps:].tobytes(), dtype='<i2')
-                self._utt_samples.append(mono_np.copy())
                 self._last_speech_time_ns = t_end_ns
 
+
+                self.doa_hist_speech.extend(self.doa_hist)
                 # hard stop on max length
                 if (t_end_ns - self._utt_start_time_ns) / 1e6 >= self.wg_max_utter_ms:
                     self._finalize_utterance(t_end_ns)
