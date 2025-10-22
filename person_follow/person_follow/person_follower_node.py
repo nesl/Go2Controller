@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+import math
+from typing import Optional
+
+import rclpy
+from rclpy.node import Node
+from rclpy.duration import Duration
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+
+from geometry_msgs.msg import Twist, PointStamped
+from vision_msgs.msg import Detection2DArray
+
+from tf2_ros import Buffer, TransformListener, TransformException
+from tf2_geometry_msgs import do_transform_point
+
+
+class PersonFollower(Node):
+    """
+    Subscribe: detected_objects  (vision_msgs/Detection2DArray) in map frame
+    Publish:   /cmd_vel          (geometry_msgs/Twist)
+    TF:        map -> base_link
+
+    Behavior:
+      - Track nearest 'person' with a 3D pose
+      - Maintain ~desired_distance in front
+      - Stop if too close, or if person lost for lost_timeout_s
+    """
+
+    def __init__(self):
+        super().__init__("person_follower")
+
+        # ---------------- Params ----------------
+        self.declare_parameter("detected_topic", "detected_objects")
+        self.declare_parameter("robot_cmd_vel", "/cmd_vel")
+        self.declare_parameter("target_class", "person")
+        self.declare_parameter("map_frame", "map")
+        self.declare_parameter("base_frame", "base_link")
+
+        # control
+        self.declare_parameter("desired_distance_m", 1.0)     # target following distance
+        self.declare_parameter("stop_distance_m", 0.6)        # immediate stop if closer than this
+        self.declare_parameter("max_lin_speed", 0.6)          # m/s
+        self.declare_parameter("max_ang_speed", 1.2)          # rad/s
+        self.declare_parameter("k_lin", 0.8)                  # linear gain on distance error
+        self.declare_parameter("k_ang", 1.5)                  # angular gain on bearing
+        self.declare_parameter("yaw_deadband_rad", 0.05)      # avoid oscillations
+        self.declare_parameter("lost_timeout_s", 0.8)         # stop if not seen within this time
+        self.declare_parameter("smoothing_alpha", 0.4)        # low-pass on commands [0..1]
+
+        # --------------- Read params ---------------
+        self.detected_topic   = self.get_parameter("detected_topic").value
+        self.cmd_vel_topic    = self.get_parameter("robot_cmd_vel").value
+        self.target_class     = self.get_parameter("target_class").value
+        self.map_frame        = self.get_parameter("map_frame").value
+        self.base_frame       = self.get_parameter("base_frame").value
+
+        self.desired_d        = float(self.get_parameter("desired_distance_m").value)
+        self.stop_d           = float(self.get_parameter("stop_distance_m").value)
+        self.max_v            = float(self.get_parameter("max_lin_speed").value)
+        self.max_w            = float(self.get_parameter("max_ang_speed").value)
+        self.k_lin            = float(self.get_parameter("k_lin").value)
+        self.k_ang            = float(self.get_parameter("k_ang").value)
+        self.db_yaw           = float(self.get_parameter("yaw_deadband_rad").value)
+        self.lost_timeout_s   = float(self.get_parameter("lost_timeout_s").value)
+        self.alpha            = float(self.get_parameter("smoothing_alpha").value)
+
+        # --------------- QoS (sensor-ish) ---------------
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
+
+        # --------------- Pub/Sub ---------------
+        self.sub = self.create_subscription(Detection2DArray, self.detected_topic,
+                                            self.dets_cb, qos)
+        self.pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+
+        # --------------- TF ---------------
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # --------------- State ---------------
+        self.last_seen_time = None
+        self.last_cmd = Twist()
+
+        # 20 Hz control loop
+        self.timer = self.create_timer(0.05, self.control_loop)
+
+        self.get_logger().info("person_follower started. Following nearest person.")
+
+        # cache of the latest selected target in map frame
+        self._latest_target_map_ps: Optional[PointStamped] = None
+
+    # ------------------ Helpers ------------------
+
+    def _select_nearest_person(self, dets: Detection2DArray) -> Optional[PointStamped]:
+        best_ps = None
+        best_dist2 = float("inf")
+
+        for d in dets.detections:
+            # Should have at least one hypothesis with pose filled by your detector
+            if not d.results:
+                continue
+            hyp = d.results[0]
+            if not hyp.hypothesis.class_id:
+                continue
+            if self.target_class not in hyp.hypothesis.class_id.lower():
+                continue
+
+            # pose is expressed in dets.header.frame_id (expected: map)
+            p = hyp.pose.pose.position
+            ps = PointStamped()
+            ps.header = dets.header
+            ps.point.x, ps.point.y, ps.point.z = float(p.x), float(p.y), float(p.z)
+
+            # distance in map from origin isn't meaningful—compare in base frame after TF,
+            # but to choose "nearest", we can temporarily use map distance to (0,0) if multiple persons.
+            # We'll transform later anyway.
+            # Use planar distance wrt map origin—fine if multiple persons aren’t very close together.
+            dist2 = p.x * p.x + p.y * p.y
+            if dist2 < best_dist2:
+                best_dist2 = dist2
+                best_ps = ps
+
+        return best_ps
+
+    def dets_cb(self, msg: Detection2DArray):
+        target = self._select_nearest_person(msg)
+        if target is None:
+            return
+
+        # Cache + timestamp
+        self._latest_target_map_ps = target
+        self.last_seen_time = self.get_clock().now()
+
+    def _transform_to_base(self, ps_map: PointStamped) -> Optional[PointStamped]:
+        try:
+            # Ensure we have a transform for the target stamp; fall back to latest if needed
+            tf_map_to_base = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                ps_map.header.frame_id,
+                rclpy.time.Time.from_msg(ps_map.header.stamp),
+                timeout=Duration(seconds=0.2),
+            )
+        except TransformException:
+            try:
+                tf_map_to_base = self.tf_buffer.lookup_transform(
+                    self.base_frame, ps_map.header.frame_id, rclpy.time.Time(), timeout=Duration(seconds=0.2)
+                )
+            except TransformException as e2:
+                self.get_logger().warn(f"TF map->base failed: {e2}")
+                return None
+
+        try:
+            ps_base = do_transform_point(ps_map, tf_map_to_base)
+            return ps_base
+        except Exception as e:
+            self.get_logger().warn(f"Transform point failed: {e}")
+            return None
+
+    def _lp(self, prev: float, new: float) -> float:
+        return (1.0 - self.alpha) * prev + self.alpha * new
+
+    # ------------------ Control Loop ------------------
+
+    def control_loop(self):
+        now = self.get_clock().now()
+
+        # Lost target?
+        if self.last_seen_time is None or (now - self.last_seen_time) > Duration(seconds=self.lost_timeout_s):
+            self._stop("lost/no target")
+            return
+
+        if self._latest_target_map_ps is None:
+            self._stop("no cached target")
+            return
+
+        # Transform target into base frame
+        ps_base = self._transform_to_base(self._latest_target_map_ps)
+        if ps_base is None:
+            self._stop("tf error")
+            return
+
+        # Person in robot base frame
+        x = ps_base.point.x  # forward
+        y = ps_base.point.y  # left
+        d = math.hypot(x, y)
+        bearing = math.atan2(y, x)  # +left
+
+        # Safety: if too close or behind (x<0), stop linear and just reorient
+        if d < self.stop_d:
+            cmd = Twist()
+            # keep a tiny orienting turn if bearing big and person not centered
+            if abs(bearing) > self.db_yaw:
+                cmd.angular.z = max(-self.max_w, min(self.max_w, self.k_ang * bearing))
+            self._publish_smoothed(cmd, reason="too close")
+            return
+
+        # If we don't see them ahead (x <= 0), rotate in place toward them
+        if x <= 0.0:
+            cmd = Twist()
+            if abs(bearing) > self.db_yaw:
+                cmd.angular.z = max(-self.max_w, min(self.max_w, self.k_ang * bearing))
+            self._publish_smoothed(cmd, reason="target behind")
+            return
+
+        # Proportional control
+        err_d = d - self.desired_d
+        v = self.k_lin * err_d
+        w = self.k_ang * bearing
+
+        # Deadband for small headings
+        if abs(bearing) < self.db_yaw:
+            w = 0.0
+
+        # Clamp
+        v = max(-self.max_v, min(self.max_v, v))
+        w = max(-self.max_w, min(self.max_w, w))
+
+        # Don’t drive forward aggressively while we’re not facing the target
+        if abs(bearing) > 0.6:  # ~34°
+            v *= 0.3
+
+        # Publish
+        cmd = Twist()
+        cmd.linear.x = max(0.0, v)  # don’t back up; just let person walk out
+        cmd.angular.z = w
+        self._publish_smoothed(cmd, reason="tracking")
+
+    def _publish_smoothed(self, cmd: Twist, reason: str):
+        # Low-pass filter the commands to avoid jerks
+        sm = Twist()
+        sm.linear.x  = self._lp(self.last_cmd.linear.x, cmd.linear.x)
+        sm.angular.z = self._lp(self.last_cmd.angular.z, cmd.angular.z)
+        self.pub.publish(sm)
+        self.last_cmd = sm
+        # Optional: debug
+        # self.get_logger().debug(f"{reason}: v={sm.linear.x:.2f}, w={sm.angular.z:.2f}")
+
+    def _stop(self, why: str):
+        stop = Twist()
+        self._publish_smoothed(stop, reason=f"stop:{why}")
+
+
+def main():
+    rclpy.init()
+    node = PersonFollower()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

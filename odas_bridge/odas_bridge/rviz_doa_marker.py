@@ -49,7 +49,7 @@ class DoAMarker(Node):
         if self.prefer_vec:
             self.create_subscription(Vector3Stamped, '/audio/odas/doa', self.on_vec, 10)
         self.create_subscription(Float32, '/audio/active_azimuth_deg', self.on_az, 10)
-        self.create_subscription(Bool, '/audio/voice_active', self.on_vact, 10)
+        self.create_subscription(Bool, '/audio/voice_active_speech', self.on_vact, 10)
 
         self.create_timer(1.0/15.0, self.tick)
         self.get_logger().info(f"RViz DoA marker → {self.topic}, frame='{self.frame_id}'")

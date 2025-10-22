@@ -40,9 +40,9 @@ def generate_launch_description():
        
         DeclareLaunchArgument('mic_parent', default_value='base_link'),
         DeclareLaunchArgument('mic_child',  default_value='mic_array'),
-        DeclareLaunchArgument('mic_x', default_value='0.10'),
+        DeclareLaunchArgument('mic_x', default_value='0.220'),
         DeclareLaunchArgument('mic_y', default_value='0.00'),
-        DeclareLaunchArgument('mic_z', default_value='0.25'),
+        DeclareLaunchArgument('mic_z', default_value='0.09'),
         # RPY are **radians**
         DeclareLaunchArgument('mic_roll',  default_value='0'),
         DeclareLaunchArgument('mic_pitch', default_value='0'),

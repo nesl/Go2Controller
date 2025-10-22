@@ -30,6 +30,8 @@ setup(
             'localized_speech_publisher = odas_bridge.localized_speech_publisher:main',
             'active_channel_selector = odas_bridge.active_channel_selector:main',
             'doa_marker = odas_bridge.rviz_doa_marker:main',
+            'ssl_doa = odas_bridge.ssldoareader:main',
+            'stt_angle = odas_bridge.stt_angle:main'
 
         ],
     },
