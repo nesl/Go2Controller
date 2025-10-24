@@ -42,9 +42,9 @@ class FasterWhisperWorker(threading.Thread):
     """
     Background transcriber to avoid blocking ROS callbacks.
     """
-    def __init__(self, model_size, device, compute_type, translate, language, out_queue, logger):
+    def __init__(self, model, translate, language, out_queue, logger):
         super().__init__(daemon=True)
-        self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        self.model = model #WhisperModel(model_size, device=device, compute_type=compute_type)
         self.translate = translate
         self.language = language if language else None
         self.q = queue.Queue()
@@ -164,13 +164,20 @@ class STTFasterWhisperNode(Node):
         self.declare_parameter("ref_ch", 0)                 # index into mic_lanes to pick one channel
 
         # STT configuration
-        self.declare_parameter("model_size", "small")      # e.g., "small", "medium", "large-v3"
-        self.declare_parameter("device", "cpu")            # "cuda" or "cpu"
-        self.declare_parameter("compute_type", "int8")   # "float16", "int8_float16", "int8"
+
         self.declare_parameter("translate", False)          # True: translate to English
         self.declare_parameter("language", "en")              # force language or leave empty to auto
 
+        # NEW: role-specific model configs
+        # Final transcription (heavier) defaults
+        self.declare_parameter("stt_model_size", "medium")
+        self.declare_parameter("stt_device", "cpu")
+        self.declare_parameter("stt_compute_type", "int8")
 
+        # Gating / endpointing (lighter) defaults
+        self.declare_parameter("wg_model_size", "small")
+        self.declare_parameter("wg_device", "cpu")
+        self.declare_parameter("wg_compute_type", "int8")
 
         # --- Whisper-driven endpointing params ---
         self.declare_parameter("wg_window_ms", 3000)        # analyze last N ms
@@ -215,6 +222,22 @@ class STTFasterWhisperNode(Node):
         self.translate = bool(self.get_parameter("translate").value)
         self.language = str(self.get_parameter("language").value).strip() or None
 
+        self.stt_model_size = (str(self.get_parameter("stt_model_size").value) or self.model_size)
+        self.stt_device = (str(self.get_parameter("stt_device").value) or self.device)
+        self.stt_compute_type = (str(self.get_parameter("stt_compute_type").value) or self.compute_type)
+
+        self.wg_model_size = (str(self.get_parameter("wg_model_size").value) or self.model_size)
+        self.wg_device = (str(self.get_parameter("wg_device").value) or self.device)
+        self.wg_compute_type = (str(self.get_parameter("wg_compute_type").value) or self.compute_type)
+
+        # Load separate models
+        self.gate_model = WhisperModel(
+            self.wg_model_size, device=self.wg_device, compute_type=self.wg_compute_type
+        )
+        self.worker_model = WhisperModel(
+            self.stt_model_size, device=self.stt_device, compute_type=self.stt_compute_type
+        )
+
 
 
         # Publishers
@@ -254,7 +277,7 @@ class STTFasterWhisperNode(Node):
         # Background transcriber
         self.out_q = queue.Queue()
         self.worker = FasterWhisperWorker(
-            self.model_size, self.device, self.compute_type,
+            self.worker_model,
             self.translate, self.language,
             self.out_q, self.get_logger()
         )
@@ -295,7 +318,7 @@ class STTFasterWhisperNode(Node):
         # Reuse the same loaded model from self.worker for gating (no 2nd load)
         #model = WhisperModel(self.model_size, device=self.device, compute_type=self.compute_type)
         self.wg = WhisperGateWorker(
-            self.worker.model,  # reuse model instance
+            self.gate_model,  # reuse model instance
             self.language, self.translate, self._win_out, self.get_logger()
         )
         self.wg.start()
