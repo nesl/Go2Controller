@@ -216,9 +216,6 @@ class STTFasterWhisperNode(Node):
         assert 0 <= self.ref_ch < len(self.mic_lanes), "ref_ch out of range of mic_lanes"
         self.pick_lane = self.mic_lanes[self.ref_ch]
 
-        self.model_size = str(self.get_parameter("model_size").value)
-        self.device = str(self.get_parameter("device").value)
-        self.compute_type = str(self.get_parameter("compute_type").value)
         self.translate = bool(self.get_parameter("translate").value)
         self.language = str(self.get_parameter("language").value).strip() or None
 
@@ -344,8 +341,8 @@ class STTFasterWhisperNode(Node):
         self._last_marker_publish = 0.0
 
         self.get_logger().info(
-            f"STT node: lane={self.pick_lane} fs={self.fs} TC={self.TC} model={self.model_size} "
-            f"device={self.device}/{self.compute_type} translate={self.translate}"
+            f"STT node: lane={self.pick_lane} fs={self.fs} TC={self.TC} "
+          
         )
 
 
