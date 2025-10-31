@@ -42,6 +42,7 @@ from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from tf2_geometry_msgs import do_transform_point
+from std_msgs.msg import String
 
 import cv2
 #import tf_transformations as tft
@@ -146,6 +147,8 @@ class CocoDetectorNode(Node):
         self.model = YOLO("yolo11x.pt")     # change path if needed
         self.class_labels = None                   # set per-result from YOLO
 
+
+
         self.get_logger().info("CocoDetectorNode started. Publishing map-frame human positions & markers.")
 
     # --------------------
@@ -202,6 +205,7 @@ class CocoDetectorNode(Node):
             self.cam.rectifyImage(cv_img_raw, cv_img_rect)
         except Exception:
             cv_img_rect = cv_img_raw
+
 
         # --- YOLO inference ---
         results = self.model.predict(cv_img_rect, verbose=False, device=self.device)

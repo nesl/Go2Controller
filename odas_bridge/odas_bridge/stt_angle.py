@@ -7,7 +7,10 @@ import struct
 from collections import deque, Counter
 
 import numpy as np
-import webrtcvad
+
+import sys
+import torch
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 from faster_whisper import WhisperModel
 
 import rclpy
@@ -38,14 +41,67 @@ def quat_from_yaw_pitch(yaw, pitch, roll=0.0):
     return qx, qy, qz, qw
 
 
-class FasterWhisperWorker(threading.Thread):
-    """
-    Background transcriber to avoid blocking ROS callbacks.
-    """
-    def __init__(self, model, translate, language, out_queue, logger):
+def _resolve_hf_id(name_or_size: str) -> str:
+    s = (name_or_size or "").strip().lower()
+    if "/" in s:
+        return name_or_size  # already a full HF repo id
+    mapping = {
+        "tiny": "openai/whisper-tiny",
+        "base": "openai/whisper-base",
+        "small": "openai/whisper-small",
+        "medium": "openai/whisper-medium",
+        "large": "openai/whisper-large-v3",
+        "large-v3": "openai/whisper-large-v3",
+    }
+    return mapping.get(s, s or "openai/whisper-small")
+
+def _build_hf_asr(model_id: str, language: str, device_str: str, chunk_s: float, batch: int):
+    use_cuda = (device_str.strip().lower() == "cuda") and torch.cuda.is_available()
+    device = 0 if use_cuda else -1
+    dtype = torch.float16 if use_cuda else torch.float32
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        model_id, torch_dtype=dtype, low_cpu_mem_usage=False, use_safetensors=True
+    )
+    asr = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        device=device,
+        chunk_length_s=float(chunk_s),
+        batch_size=int(batch),
+        return_timestamps=True,
+    )
+    gen_kwargs = {"language": (language or None), "task": "transcribe"}
+    return asr, gen_kwargs
+
+def _build_torch_whisper_gate(model_id: str, device_str: str, language: str, translate: bool):
+    use_cuda = (device_str.strip().lower() == "cuda") and torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+    dtype = torch.float16 if use_cuda else torch.float32
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        model_id, torch_dtype=dtype, low_cpu_mem_usage=False, use_safetensors=True
+    ).to(device)
+    model.eval()
+
+    # Force language & task like the pipeline would do
+    forced_ids = processor.get_decoder_prompt_ids(
+        language=(language or None),
+        task=("translate" if translate else "transcribe")
+    )
+    return processor, model, forced_ids, device
+
+class HFWhisperWorker(threading.Thread):
+    def __init__(self, asr_pipeline, gen_kwargs, translate, language, out_queue, logger):
         super().__init__(daemon=True)
-        self.model = model #WhisperModel(model_size, device=device, compute_type=compute_type)
-        self.translate = translate
+        self.asr = asr_pipeline
+        self.gen_kwargs = dict(gen_kwargs)
+        if translate:
+            self.gen_kwargs["task"] = "translate"
         self.language = language if language else None
         self.q = queue.Queue()
         self.out_q = out_queue
@@ -62,36 +118,237 @@ class FasterWhisperWorker(threading.Thread):
             except queue.Empty:
                 continue
             try:
-                # Convert to float32 in [-1,1]
                 audio_f32 = (audio_int16.astype(np.float32) / 32768.0)
-                task = "translate" if self.translate else "transcribe"
-                segments, info = self.model.transcribe(
-                    audio_f32,
-                    language=self.language, task=task,
-                    vad_filter=False,  # VAD already handled
-                    beam_size=5,
-                    best_of=5
-                )
-                text = "".join(seg.text for seg in segments).strip()
+                result = self.asr(audio_f32, generate_kwargs=self.gen_kwargs)
+                text = (result.get("text") or "").strip()
                 self.out_q.put({
                     "text": text,
-                    "language": info.language if hasattr(info, "language") else None,
-                    "duration": getattr(info, "duration", None),
+                    "language": self.gen_kwargs.get("language"),
+                    "duration": None,
                     "azimuth_deg": az,
-                    "stamp": {"sec": stamp.sec, "nanosec": stamp.nanosec}
+                    "stamp": {"sec": stamp.sec, "nanosec": stamp.nanosec},
                 })
             except Exception as e:
                 self.log.warn(f"Transcribe error: {e}")
 
+    def stop(self): self.running = False
+
+class TorchWhisperGateWorker(threading.Thread):
+    """
+    Gate worker using Transformers/PyTorch Whisper.
+    Produces: text, avg_logprob (per-token), max_no_speech (proxy), segments.
+    """
+    def __init__(self, processor, model, forced_ids, device, language, translate, out_q, logger, sample_rate: int):
+        super().__init__(daemon=True)
+        self.processor = processor
+        self.model = model
+        self.forced_ids = forced_ids
+        self.device = device
+        self.language = language
+        self.translate = translate
+        self.q = queue.Queue()
+        self.out_q = out_q
+        self.log = logger
+        self.running = True
+        self.sample_rate = sample_rate
+
+    def submit(self, item: dict):
+        self.q.put(item)
+
     def stop(self):
         self.running = False
 
+    def _avg_token_logprob(self, scores_list, token_ids):
+        """
+        scores_list: list[T (1, vocab)] for *generated* steps (no prompt/forced ids)
+        token_ids:   1D tensor of full sequence ids (includes prompt/forced ids)
+        We align to the last len(scores_list) tokens, which correspond to generated steps.
+        """
+        if not scores_list or token_ids is None or token_ids.numel() == 0:
+            return -99.0
+
+        gen_len = len(scores_list)
+        toks = token_ids[-gen_len:]  # align tail with scores
+        s = 0.0
+        n = 0
+        for step_scores, tok in zip(scores_list, toks):
+            # Cast to float32 to avoid FP16 underflow -> -inf
+            step_logp = torch.log_softmax(step_scores.float()[0], dim=-1)
+            # Guard: token id might be out of range if something went wrong
+            idx = int(tok.item())
+            if 0 <= idx < step_logp.numel():
+                val = float(step_logp[idx].item())
+                if math.isfinite(val):
+                    s += val
+                    n += 1
+        return (s / n) if n else -99.0
+
+    def _voiced_ratio_vad(self, audio_f32: np.ndarray, sr: int) -> float:
+        """
+        WebRTC VAD with:
+          - DC removal
+          - light AGC toward target RMS (-20 dBFS) with a clamp
+          - optional pre-emphasis to lift speech band
+          - EMA noise floor & SNR gate assistance
+        Returns fraction of 20ms frames flagged as speech in the window.
+        """
+        try:
+            import webrtcvad
+            # --- lazy init state ---
+            if not hasattr(self, "_vad"):
+                self._vad = webrtcvad.Vad(2)  # 0..3, 2 is a good compromise
+            if not hasattr(self, "_noise_rms_ema"):
+                self._noise_rms_ema = 1e-3  # start small
+            if not hasattr(self, "_speech_bias"):
+                self._speech_bias = 0.0     # leaky bias to prevent sticky silence
+
+            x = np.asarray(audio_f32, dtype=np.float32)
+            if x.size == 0:
+                return 0.0
+
+            # --- DC removal ---
+            x = x - float(np.mean(x))
+
+            # --- light AGC toward target rms ---
+            rms = float(np.sqrt(np.mean(x * x)) + 1e-12)
+            target_rms = 0.1  # ≈ -20 dBFS
+            if rms > 0:
+                gain = np.clip(target_rms / rms, 0.5, 6.0)  # clamp to avoid pumping
+                x = x * gain
+
+            # --- optional pre-emphasis (helps VAD at low levels) ---
+            # x[t] ← x[t] - 0.97*x[t-1]
+            if x.size > 1:
+                x[1:] = x[1:] - 0.97 * x[:-1]
+
+            # --- convert to S16 for WebRTC ---
+            i16 = np.clip(x, -1.0, 1.0)
+            i16 = (i16 * 32768.0).astype(np.int16)
+
+            # --- 20 ms framing (required by WebRTC VAD) ---
+            frame_len = sr // 50  # 20 ms
+            n = (len(i16) // frame_len) * frame_len
+            if n <= 0:
+                return 0.0
+            buf = i16[:n].tobytes()
+            total = n // frame_len
+            step = frame_len * 2  # bytes
+
+            # --- update noise floor (EMA) using low-energy frames ---
+            # estimate instantaneous rms over the window (post-AGC)
+            inst_rms = float(np.sqrt(np.mean((i16.astype(np.float32) / 32768.0) ** 2)) + 1e-12)
+            alpha_noise = 0.05  # slow EMA
+            # if current energy is low, treat as noise observation
+            if inst_rms < 0.06:  # heuristic
+                self._noise_rms_ema = (1 - alpha_noise) * self._noise_rms_ema + alpha_noise * inst_rms
+
+            # compute simple SNR proxy
+            snr = 20.0 * math.log10(max(inst_rms, 1e-6) / max(self._noise_rms_ema, 1e-6))
+            snr_bonus = 0.0
+            if snr > 6.0:   # above ~6 dB, give VAD a nudge
+                snr_bonus = min((snr - 6.0) / 12.0, 0.3)  # max +0.3 to voiced ratio
+
+            # --- count voiced frames ---
+            vad = self._vad
+            voiced = 0
+            for i in range(0, len(buf), step):
+                frame = buf[i:i + step]
+                if len(frame) < step:
+                    break
+                try:
+                    if vad.is_speech(frame, sr):
+                        voiced += 1
+                except Exception:
+                    pass
+
+            vr = voiced / max(total, 1)
+
+            # --- apply bias/hysteresis (prevents sticky high no_speech) ---
+            # leaky integrate toward recent decision; encourages continuity
+            # increase bias slightly when we see voice; decay otherwise
+            if vr > 0.5:
+                self._speech_bias = min(self._speech_bias + 0.05, 0.4)  # cap
+            else:
+                self._speech_bias = max(self._speech_bias - 0.02, 0.0)
+
+            vr = np.clip(vr + snr_bonus + self._speech_bias, 0.0, 1.0)
+            return float(vr)
+
+        except Exception:
+            return 0.0
+
+    def _compression_ratio(self, text: str) -> float:
+        if not text:
+            return 0.0
+        raw = text.encode("utf-8", errors="ignore")
+        comp = zlib.compress(raw)
+        return (len(raw) / max(len(comp), 1))
+
+    def run(self):
+        while self.running:
+            try:
+                item = self.q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                audio = item["audio_f32"]  # numpy float32 mono in [-1,1]
+                # ------- no-speech proxy via VAD over this window -------
+                try:
+                    # parent node placed this method if you added it as shown above
+                    parent_vad_ratio = getattr(self, "parent_vad_ratio", None)
+                except Exception:
+                    parent_vad_ratio = None
+                # If the worker is attached from the node, you can monkey-patch like:
+                # gate_worker.parent_vad_ratio = node._vad_voiced_ratio
+
+                # Preprocess for Whisper
+                inputs = self.processor(
+                    audio, sampling_rate=self.sample_rate, return_tensors="pt"
+                ).to(self.device)
+                inputs["input_features"] = inputs["input_features"].to(self.model.dtype)
+                with torch.inference_mode():
+                    out = self.model.generate(
+                        **inputs,
+                        forced_decoder_ids=self.forced_ids,
+                        return_dict_in_generate=True,
+                        output_scores=True,
+                        do_sample=False,
+                        num_beams=1,           # keep fast/greedy for the gate
+                        temperature=0.0,
+                    )
+
+                # Decode text
+                seq = out.sequences[0]                   # (seq_len,)
+                text = self.processor.batch_decode([seq], skip_special_tokens=True)[0].strip()
+
+                # Avg token logprob
+                avg_lp = self._avg_token_logprob(out.scores, seq)
+
+                # Simple segment count: 1 if non-empty, else 0
+                seg_cnt = 1 if text else 0
+
+                # --- no_speech proxy from VAD (1 - voiced_ratio) with energy guard ---
+                voiced_ratio = self._voiced_ratio_vad(audio, self.sample_rate)
+                max_no_speech = float(1.0 - voiced_ratio)
+
+
+                # You can also gate with compression ratio if you like:
+                # cr = self._compression_ratio(text)
+
+                self.out_q.put({
+                    "t_start_ns": int(item["t_start_ns"]),
+                    "t_end_ns":   int(item["t_end_ns"]),
+                    "text": text,
+                    "avg_logprob": float(avg_lp),
+                    "max_no_speech": max_no_speech,
+                    "segments": seg_cnt
+                })
+
+            except Exception as e:
+                self.log.warn(f"TorchWhisperGate window error: {e}")
+
+
 class WhisperGateWorker(threading.Thread):
-    """
-    Consumes windows of float32 audio and returns gate metrics.
-    Input item: dict{ 't_start_ns', 't_end_ns', 'audio_f32' }
-    Output item: dict{ 't_start_ns','t_end_ns','text','avg_logprob','max_no_speech','segments' }
-    """
     def __init__(self, model: WhisperModel, language, translate, out_q, logger):
         super().__init__(daemon=True)
         self.model = model
@@ -119,7 +376,7 @@ class WhisperGateWorker(threading.Thread):
                 segments, info = self.model.transcribe(
                     item["audio_f32"],
                     language=self.language, task=task,
-                    vad_filter=True,  # <-- Whisper VAD
+                    vad_filter=True,  # FW VAD on for the gate
                     beam_size=5, best_of=5
                 )
                 text_parts, seg_cnt, sum_lp, max_nsp = [], 0, 0.0, 0.0
@@ -142,8 +399,6 @@ class WhisperGateWorker(threading.Thread):
                 })
             except Exception as e:
                 self.log.warn(f"WhisperGate window error: {e}")
-
-
 class STTFasterWhisperNode(Node):
     """
     Subscribes:
@@ -171,12 +426,12 @@ class STTFasterWhisperNode(Node):
         # NEW: role-specific model configs
         # Final transcription (heavier) defaults
         self.declare_parameter("stt_model_size", "medium")
-        self.declare_parameter("stt_device", "cpu")
-        self.declare_parameter("stt_compute_type", "int8")
+        self.declare_parameter("stt_device", "cuda")
+        self.declare_parameter("stt_compute_type", "float16")
 
         # Gating / endpointing (lighter) defaults
-        self.declare_parameter("wg_model_size", "small")
-        self.declare_parameter("wg_device", "cpu")
+        self.declare_parameter("wg_model_size", "medium")
+        self.declare_parameter("wg_device", "cuda")
         self.declare_parameter("wg_compute_type", "int8")
 
         # --- Whisper-driven endpointing params ---
@@ -227,14 +482,43 @@ class STTFasterWhisperNode(Node):
         self.wg_device = (str(self.get_parameter("wg_device").value) or self.device)
         self.wg_compute_type = (str(self.get_parameter("wg_compute_type").value) or self.compute_type)
 
-        # Load separate models
+
+        self.stt_hf_id = _resolve_hf_id(str(self.get_parameter("stt_model_size").value))
+        self.stt_device = str(self.get_parameter("stt_device").value)
+        self.declare_parameter("stt_chunk_s", 30.0)
+        self.declare_parameter("stt_batch", 8)
+        self.stt_chunk_s = float(self.get_parameter("stt_chunk_s").value)
+        self.stt_batch = int(self.get_parameter("stt_batch").value)
+
+        self.wg_hf_id = _resolve_hf_id(str(self.get_parameter("wg_model_size").value))
+        self.wg_device = str(self.get_parameter("wg_device").value)
+        self.declare_parameter("wg_chunk_s", 15.0)
+        self.declare_parameter("wg_batch", 4)
+        self.wg_chunk_s = float(self.get_parameter("wg_chunk_s").value)
+        self.wg_batch = int(self.get_parameter("wg_batch").value)
+
+        self.get_logger().info(
+            f"Python={sys.executable} CUDA={torch.cuda.is_available()} "
+            f"torch.cuda={torch.version.cuda} cudnn={torch.backends.cudnn.version()}"
+        )
+
+        # Build pipelines
+
+        self.worker_asr, self.worker_gen = _build_hf_asr(
+            self.stt_hf_id, self.language, self.stt_device, self.stt_chunk_s, self.stt_batch
+        )
+
+        self.gate_processor, self.gate_model, self.gate_forced_ids, self.gate_device = _build_torch_whisper_gate(
+            self.wg_hf_id, self.wg_device, self.language, self.translate
+        )
+        
+        '''
         self.gate_model = WhisperModel(
             self.wg_model_size, device=self.wg_device, compute_type=self.wg_compute_type
         )
-        self.worker_model = WhisperModel(
-            self.stt_model_size, device=self.stt_device, compute_type=self.stt_compute_type
-        )
-
+        '''
+        self.declare_parameter("mix_strategy", "mean")  # single|mean|energy_weighted|maxrms
+        self.mix_strategy = str(self.get_parameter("mix_strategy").value).strip().lower()
 
 
         # Publishers
@@ -271,15 +555,12 @@ class STTFasterWhisperNode(Node):
         self.latest_stamp = now_to_msg(self.get_clock())
 
         
-        # Background transcriber
+        # Start workers
         self.out_q = queue.Queue()
-        self.worker = FasterWhisperWorker(
-            self.worker_model,
-            self.translate, self.language,
-            self.out_q, self.get_logger()
+        self.worker = HFWhisperWorker(
+            self.worker_asr, self.worker_gen, self.translate, self.language, self.out_q, self.get_logger()
         )
-        self.worker.start()
-        
+        self.worker.start()       
         
         # Timer to drain completed transcripts
         self.create_timer(0.02, self.drain_outputs)
@@ -312,12 +593,12 @@ class STTFasterWhisperNode(Node):
         # Timer to launch windows and drain results
         self.create_timer(0.05, self._wg_tick)  # 20 Hz
 
-        # Reuse the same loaded model from self.worker for gating (no 2nd load)
-        #model = WhisperModel(self.model_size, device=self.device, compute_type=self.compute_type)
-        self.wg = WhisperGateWorker(
-            self.gate_model,  # reuse model instance
-            self.language, self.translate, self._win_out, self.get_logger()
+        self.wg = TorchWhisperGateWorker(
+            self.gate_processor, self.gate_model, self.gate_forced_ids, self.gate_device,
+            self.language, self.translate, self._win_out, self.get_logger(), sample_rate=self.fs
         )
+        self.wg.parent_vad_ratio = self._vad_voiced_ratio
+        
         self.wg.start()
         
         # Marker params
@@ -340,10 +621,100 @@ class STTFasterWhisperNode(Node):
         self._voice_active = False
         self._last_marker_publish = 0.0
 
+
+        # ---- TTS busy gating ----
+        self.declare_parameter("busy_topic", "/tts_busy")
+        self._tts_busy = False
+        busy_topic = self.get_parameter("busy_topic").get_parameter_value().string_value
+        self.create_subscription(Bool, busy_topic, self._busy_cb, 10)
+
+
         self.get_logger().info(
             f"STT node: lane={self.pick_lane} fs={self.fs} TC={self.TC} "
           
         )
+
+
+    def _vad_voiced_ratio(self, audio_f32: np.ndarray, sr: int) -> float:
+        """Return fraction of frames flagged as speech by WebRTC VAD."""
+        try:
+            vad = getattr(self, "vad", None)
+            if vad is None:
+                self.vad = webrtcvad.Vad(2)  # 0..3, 3=aggressive
+                vad = self.vad
+            # convert to 16-bit PCM
+            x = np.clip(audio_f32, -1.0, 1.0)
+            i16 = (x * 32768.0).astype(np.int16)
+            frame_len = sr // 50  # 20ms
+            n = (len(i16) // frame_len) * frame_len
+            if n <= 0:
+                return 0.0
+            buf = i16[:n].tobytes()
+            total = n // frame_len
+            voiced = 0
+            step = frame_len * 2
+            for i in range(0, len(buf), step):
+                frame = buf[i:i+step]
+                if len(frame) < step:
+                    break
+                try:
+                    if vad.is_speech(frame, sr):
+                        voiced += 1
+                except Exception:
+                    pass
+            return (voiced / max(total, 1))
+        except Exception:
+            return 0.0
+
+
+    def _select_mono(self, frames: np.ndarray) -> np.ndarray:
+        """
+        frames shape: [N, TC] int16. Use self.mic_lanes and self.pick_lane.
+        Returns int16 mono array according to self.mix_strategy.
+        """
+        if self.mix_strategy == "single":
+            return frames[:, self.pick_lane].astype(np.int16)
+
+        sel = frames[:, self.mic_lanes]
+        if self.mix_strategy == "mean":
+            mix = sel.astype(np.int32).mean(axis=1)
+            return np.clip(mix, -32768, 32767).astype(np.int16)
+
+        if self.mix_strategy == "energy_weighted":
+            sel_f = sel.astype(np.float32)
+            rms = np.sqrt((sel_f ** 2).mean(axis=0)) + 1e-8
+            w = rms / rms.sum()
+            mix = (sel_f * w).sum(axis=1)
+            return np.clip(mix, -32768, 32767).astype(np.int16)
+
+        if self.mix_strategy == "maxrms":
+            sel_f = sel.astype(np.float32)
+            rms = np.sqrt((sel_f ** 2).mean(axis=0))
+            best = int(np.argmax(rms))
+            return sel[:, best].astype(np.int16)
+
+        # Fallback to single
+        return frames[:, self.pick_lane].astype(np.int16)
+
+
+
+    def _busy_cb(self, msg: Bool):
+        self.get_logger().info(
+            f"STT node: busy={msg.data}"
+          
+        )
+        was = self._tts_busy
+        self._tts_busy = bool(msg.data)
+        if self._tts_busy and not was:
+            # Robot just started speaking → wipe in-progress state so nothing leaks through
+            self._utt_active = False
+            self._utt_start_time_ns = None
+            self._utt_samples = []
+            self._last_speech_time_ns = None
+            self.doa_hist_speech = []
+            self._mono_ring.clear()
+            # also pause RViz updates
+            self._dir_vec = None
 
 
     # ---------------- RViz Marker helpers ----------------
@@ -465,11 +836,11 @@ class STTFasterWhisperNode(Node):
 
             is_speech = (
                 len(text) >= self.wg_min_chars and
-                avg_lp >= self.wg_min_avg_logprob and
-                max_nsp <= self.wg_max_no_speech
-            )
+                avg_lp >= self.wg_min_avg_logprob) # and
+                #max_nsp <= self.wg_max_no_speech
+            #)
 
-            
+            self.get_logger().info(f"BEFORE!!! {avg_lp} {max_nsp} {text} {is_speech}")            
 
             if is_speech:
                 # start or continue utterance
@@ -607,6 +978,11 @@ class STTFasterWhisperNode(Node):
         Parse PCM16LE interleaved bytes with TC channels and extract one lane (self.pick_lane).
         Feed mono bytes to VAD; submit utterances to worker with latest DoA.
         """
+        
+        if self._tts_busy:
+            return
+
+        
         b = bytes(msg.data)  # convert list[int] to bytes efficiently
         # combine with any leftover for full frames of all channels
         self._partial_bytes.extend(b)
@@ -636,7 +1012,7 @@ class STTFasterWhisperNode(Node):
         self.audio_time = Time(nanoseconds=(self.audio_time.nanoseconds + dt_ns))
 
 
-        mono = frames[:, self.pick_lane].astype(np.int16)
+        mono = self._select_mono(frames)
         mono_bytes = mono.tobytes()
 
         self._mono_ring.extend(mono.tolist())

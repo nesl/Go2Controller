@@ -171,7 +171,7 @@ class Go2NodeFactory:
                 ],
                 parameters=[{
                     'target_frame': 'base_link',
-                    'max_height': 0.5
+                    'max_height': 0.1
                 }],
                 output='screen',
             )
@@ -214,20 +214,6 @@ class Go2NodeFactory:
                     'height_filter_max': 3.0,
                     'downsample_rate': 5,
                     'publish_rate': 10.0
-                }],
-            ),
-            # TTS Node (new separate package)
-            Node(
-                package='speech_processor',
-                executable='tts_node',
-                name='tts_node',
-                parameters=[{
-                    'api_key': os.getenv('ELEVENLABS_API_KEY', 'sk_3780451df60d857a49338b33aed7f57c5b2f933ee5f4942f'),
-                    'provider': 'elevenlabs',
-                    'voice_name': 'XrExE9yKIg1WjnnlVkGX',
-                    'local_playback': False,
-                    'use_cache': True,
-                    'audio_quality': 'standard'
                 }],
             ),
         ]
