@@ -17,6 +17,13 @@ from functools import partial
 from tf2_ros import Buffer, TransformListener
 from action_msgs.msg import GoalStatus
 
+import os, sqlite3
+
+_NUMS_0_19 = ["zero","one","two","three","four","five","six","seven","eight","nine",
+              "ten","eleven","twelve","thirteen","fourteen","fifteen","sixteen",
+              "seventeen","eighteen","nineteen"]
+_TENS = ["", "", "twenty","thirty","forty","fifty","sixty","seventy","eighty","ninety"]
+
 DEIXIS = re.compile(r"\b(this|that|here|there)\b", re.IGNORECASE)
 
 def yaw_to_q(yaw: float) -> Quaternion:
@@ -62,6 +69,10 @@ class TaskReasoner(Node):
         self.declare_parameter("vlm_prompt_prefix",
             "What is the user indicating? Summarize visible devices/objects with brief locations.")
         self.declare_parameter("people_topic", "detected_objects")
+
+
+        self.declare_parameter("bt_db_path", os.path.expanduser("~/.bt_rssi_map.sqlite"))
+        self.bt_db_path = self.get_parameter("bt_db_path").get_parameter_value().string_value
 
         # ---------- Read params ----------
         self.trigger_words = [w.lower() for w in self.get_parameter("trigger_words").get_parameter_value().string_array_value]
@@ -178,6 +189,161 @@ class TaskReasoner(Node):
         self._search_active = False
         self._stop_turn(why or "stop-person-search")
 
+
+# --- Number → spoken words helpers ---
+
+
+
+    def _int_to_words(self, n: int) -> str:
+        """English words for -999..999 (good enough for RSSI/percents)."""
+        neg = n < 0
+        n = abs(n)
+        parts = []
+        if n >= 100:
+            parts.append(_NUMS_0_19[n // 100])
+            parts.append("hundred")
+            n %= 100
+            if n:
+                parts.append("and")
+        if n >= 20:
+            parts.append(_TENS[n // 10])
+            if n % 10:
+                parts.append(_NUMS_0_19[n % 10])
+        elif n > 0 or not parts:
+            parts.append(_NUMS_0_19[n])
+        spoken = " ".join(parts)
+        return f"minus {spoken}" if neg else spoken
+
+    def _decimal_to_words(self, x: float, digits: int = 1) -> str:
+        """
+        Speak a small decimal like 83.4 → 'eighty three point four'.
+        Rounds to 'digits' places (default 1).
+        """
+        sign = "minus " if x < 0 else ""
+        x = abs(x)
+        fmt = f"{{:.{digits}f}}".format(x)  # e.g., "83.4"
+        if "." not in fmt:
+            return sign + self._int_to_words(int(fmt))
+        i, d = fmt.split(".")
+        # drop trailing zeros in decimals for nicer speech
+        d = d.rstrip("0")
+        if not d:
+            return sign + self._int_to_words(int(i))
+        dec_digits = " ".join(_NUMS_0_19[int(ch)] for ch in d)  # each digit spoken
+        return f"{sign}{self._int_to_words(int(i))} point {dec_digits}"
+
+    def _rssi_to_words(self, rssi_val: int) -> str:
+        """e.g., -62 → 'minus sixty two d-B-m'."""
+        return f"{self._int_to_words(int(rssi_val))} decibels"
+
+    def _percent_to_words(self, p: float) -> str:
+        """
+        p can be 0..1 or 0..100. Speaks with one decimal if needed.
+        """
+        try:
+            p = float(p)
+        except Exception:
+            return ""
+        if p <= 1.0:
+            p *= 100.0
+        spoken = self._decimal_to_words(p, digits=1)
+        # tidy: 'eighty three point zero percent' → 'eighty three percent'
+        if spoken.endswith(" point zero"):
+            spoken = spoken[:-len(" point zero")]
+        return f"{spoken} percent"
+
+
+    def _say_top3_beacons_from_db(self, top_n: int = 3):
+        db = os.path.expanduser(self.bt_db_path)
+        if not os.path.exists(db):
+            self.say("I don’t have any beacon data yet.")
+            return
+
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro&cache=shared", uri=True, timeout=0.5)
+            cur = conn.cursor()
+            cur.execute("""
+                WITH best AS (
+                  SELECT
+                    om.object_id,
+                    COALESCE(
+                      (SELECT rssi FROM obj_measurements WHERE object_id=om.object_id AND slot='current' LIMIT 1),
+                      (SELECT rssi FROM obj_measurements WHERE object_id=om.object_id AND slot='min' LIMIT 1)
+                    ) AS rssi,
+                    COALESCE(
+                      (SELECT contaminated FROM obj_measurements WHERE object_id=om.object_id AND slot='current' LIMIT 1),
+                      (SELECT contaminated FROM obj_measurements WHERE object_id=om.object_id AND slot='min' LIMIT 1)
+                    ) AS contaminated_local,
+                    COALESCE(
+                      (SELECT probability FROM obj_measurements WHERE object_id=om.object_id AND slot='current' LIMIT 1),
+                      (SELECT probability FROM obj_measurements WHERE object_id=om.object_id AND slot='min' LIMIT 1)
+                    ) AS probability_local,
+                    COALESCE(
+                      (SELECT phone_id FROM obj_measurements WHERE object_id=om.object_id AND slot='current' LIMIT 1),
+                      (SELECT phone_id FROM obj_measurements WHERE object_id=om.object_id AND slot='min' LIMIT 1)
+                    ) AS phone_id
+                  FROM obj_measurements om
+                  GROUP BY om.object_id
+                ),
+                merged AS (
+                  SELECT
+                    b.object_id,
+                    b.rssi,
+                    COALESCE(b.contaminated_local, cr.contaminated) AS contaminated,
+                    COALESCE(b.probability_local,  cr.probability)  AS probability
+                  FROM best b
+                  LEFT JOIN contamination_records cr
+                    ON cr.object_id = b.object_id AND cr.phone_id = b.phone_id
+                )
+                SELECT object_id, rssi, contaminated, probability
+                FROM merged
+                ORDER BY rssi DESC
+                LIMIT ?;
+            """, (int(top_n),))
+            rows = cur.fetchall()
+            conn.close()
+        except Exception as e:
+            self.get_logger().warn(f"DB read failed: {e}")
+            self.say("I couldn’t read the beacon map.")
+            return
+
+        if not rows:
+            self.say("I don’t have any beacons detected yet.")
+            return
+
+        items_spoken = []
+        for object_id, rssi, contaminated, probability in rows:
+            # RSSI → words
+            try:
+                rssi_i = int(rssi)
+            except Exception:
+                rssi_i = -999
+            rssi_words = self._rssi_to_words(rssi_i)
+
+            # Contamination → words (optional)
+            contam_words = ""
+            if contaminated is not None:
+                contam_words = " contaminated" if int(contaminated) == 1 else " clean"
+                if probability is not None:
+                    pct_words = self._percent_to_words(probability)
+                    if pct_words:
+                        contam_words += f" at {pct_words}"
+
+            node_id = self._int_to_words(int(object_id.split("CNode")[1]))
+            phrase = f"node {node_id}: {rssi_words}"
+            if contam_words:
+                phrase += f", {contam_words.strip()}"
+            items_spoken.append(phrase)
+
+        # Build natural utterance
+        if len(items_spoken) == 1:
+            self.say(f"The strongest signal is {items_spoken[0]}.")
+        else:
+            if len(items_spoken) > 2:
+                spoken = ", ".join(items_spoken[:-1]) + ", and " + items_spoken[-1]
+            else:
+                spoken = " and ".join(items_spoken)
+            self.say(f"The top {min(top_n, len(items_spoken))} signals are {spoken}.")
 
 
     # ---------- Orientation helpers (ported) ----------
@@ -529,7 +695,7 @@ class TaskReasoner(Node):
         top = sorted(best.items(), key=lambda kv: kv[1].get("rssi", -999), reverse=True)[:5]
         parts = [f"{dev} with {d['rssi']} dBm, {d['contaminated']} with {d['probability']}% probability" for dev, d in top]
         self.say("Here are the strongest signals: " + "; ".join(parts))
-        self._publish_status("query_results", {"top": top})
+        #self._publish_status("query_results", {"top": top})
 
     def dispatch_command(self, cmd: dict):
         intent = cmd.get("intent")
@@ -564,7 +730,7 @@ class TaskReasoner(Node):
         if intent == "query_results":
             self.say("Let me check the beacon map.")
             self._publish_status("query_results", {"status": "requesting"})
-            self._query_best_sites_async()
+            self._say_top3_beacons_from_db(top_n=3)
             return
 
         # ---------- sense_area ----------

@@ -27,6 +27,8 @@ from visualization_msgs.msg import Marker
 import bisect
 import math
 
+from rcl_interfaces.msg import SetParametersResult
+
 def now_to_msg(clock):
     return clock.now().to_msg()
 
@@ -118,18 +120,24 @@ class HFWhisperWorker(threading.Thread):
             except queue.Empty:
                 continue
             try:
+                t0 = time.perf_counter()
                 audio_f32 = (audio_int16.astype(np.float32) / 32768.0)
                 result = self.asr(audio_f32, generate_kwargs=self.gen_kwargs)
+                lat_ms = (time.perf_counter() - t0) * 1000.0
+
                 text = (result.get("text") or "").strip()
                 self.out_q.put({
+                    "kind": "final_asr",
                     "text": text,
                     "language": self.gen_kwargs.get("language"),
                     "duration": None,
                     "azimuth_deg": az,
                     "stamp": {"sec": stamp.sec, "nanosec": stamp.nanosec},
+                    "lat_ms": lat_ms
                 })
             except Exception as e:
                 self.log.warn(f"Transcribe error: {e}")
+
 
     def stop(self): self.running = False
 
@@ -306,6 +314,8 @@ class TorchWhisperGateWorker(threading.Thread):
                     audio, sampling_rate=self.sample_rate, return_tensors="pt"
                 ).to(self.device)
                 inputs["input_features"] = inputs["input_features"].to(self.model.dtype)
+                
+                t0 = time.perf_counter()
                 with torch.inference_mode():
                     out = self.model.generate(
                         **inputs,
@@ -316,7 +326,8 @@ class TorchWhisperGateWorker(threading.Thread):
                         num_beams=1,           # keep fast/greedy for the gate
                         temperature=0.0,
                     )
-
+                lat_ms = (time.perf_counter() - t0) * 1000.0
+                
                 # Decode text
                 seq = out.sequences[0]                   # (seq_len,)
                 text = self.processor.batch_decode([seq], skip_special_tokens=True)[0].strip()
@@ -336,69 +347,21 @@ class TorchWhisperGateWorker(threading.Thread):
                 # cr = self._compression_ratio(text)
 
                 self.out_q.put({
+                    "kind": "gate_window",
                     "t_start_ns": int(item["t_start_ns"]),
                     "t_end_ns":   int(item["t_end_ns"]),
                     "text": text,
                     "avg_logprob": float(avg_lp),
                     "max_no_speech": max_no_speech,
-                    "segments": seg_cnt
+                    "segments": seg_cnt,
+                    "lat_ms": float(lat_ms),
                 })
 
             except Exception as e:
                 self.log.warn(f"TorchWhisperGate window error: {e}")
 
 
-class WhisperGateWorker(threading.Thread):
-    def __init__(self, model: WhisperModel, language, translate, out_q, logger):
-        super().__init__(daemon=True)
-        self.model = model
-        self.language = language
-        self.translate = translate
-        self.q = queue.Queue()
-        self.out_q = out_q
-        self.log = logger
-        self.running = True
 
-    def submit(self, item: dict):
-        self.q.put(item)
-
-    def stop(self):
-        self.running = False
-
-    def run(self):
-        while self.running:
-            try:
-                item = self.q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            try:
-                task = "translate" if self.translate else "transcribe"
-                segments, info = self.model.transcribe(
-                    item["audio_f32"],
-                    language=self.language, task=task,
-                    vad_filter=True,  # FW VAD on for the gate
-                    beam_size=5, best_of=5
-                )
-                text_parts, seg_cnt, sum_lp, max_nsp = [], 0, 0.0, 0.0
-                for seg in segments:
-                    seg_cnt += 1
-                    text_parts.append(seg.text)
-                    if hasattr(seg, "avg_logprob") and seg.avg_logprob is not None:
-                        sum_lp += float(seg.avg_logprob)
-                    if hasattr(seg, "no_speech_prob") and seg.no_speech_prob is not None:
-                        max_nsp = max(max_nsp, float(seg.no_speech_prob))
-                text = "".join(text_parts).strip()
-                avg_lp = (sum_lp / max(seg_cnt, 1)) if seg_cnt else -99.0
-                self.out_q.put({
-                    "t_start_ns": item["t_start_ns"],
-                    "t_end_ns": item["t_end_ns"],
-                    "text": text,
-                    "avg_logprob": avg_lp,
-                    "max_no_speech": max_nsp,
-                    "segments": seg_cnt
-                })
-            except Exception as e:
-                self.log.warn(f"WhisperGate window error: {e}")
 class STTFasterWhisperNode(Node):
     """
     Subscribes:
@@ -453,6 +416,35 @@ class STTFasterWhisperNode(Node):
         self.declare_parameter("color_rgba", [0.1, 0.8, 0.1, 0.9])
         self.declare_parameter("marker_ttl_sec", 1.5)
         self.declare_parameter("prefer_vector_for_marker", True)
+        
+        
+        # --- Runtime toggles ---
+        self.declare_parameter("enable_stt", True)   # final ASR (HF pipeline)
+        self.declare_parameter("enable_gate", True)  # gate/endpointing (Torch Whisper)
+
+        self.enable_stt  = bool(self.get_parameter("enable_stt").value)
+        self.enable_gate = bool(self.get_parameter("enable_gate").value)
+
+        # --- Services to toggle at runtime ---
+        from std_srvs.srv import SetBool
+        self.create_service(SetBool, "/toggle_stt",  self._srv_toggle_stt)
+        self.create_service(SetBool, "/toggle_gate", self._srv_toggle_gate)
+
+        # --- Metrics publisher ---
+        
+        self.perf_pub = self.create_publisher(String, "/stt_perf", 10)
+
+        # --- Metrics state ---
+        self._ema_alpha = 0.2
+        self.lat_gate_ms_ema = None
+        self.lat_asr_ms_ema  = None
+        self.lat_e2e_ms_ema  = None
+        self.windows_processed = 0
+        self.utterances_finalized = 0
+        self._last_perf_publish = time.time()
+        self._perf_publish_period = 2.0  # seconds
+
+        
 
         self.wg_window_ms = int(self.get_parameter("wg_window_ms").value)
         self.wg_hop_ms = int(self.get_parameter("wg_hop_ms").value)
@@ -524,6 +516,7 @@ class STTFasterWhisperNode(Node):
         # Publishers
         self.pub_text = self.create_publisher(String, "/audio/stt_text", 10)
         self.pub_json = self.create_publisher(String, "/audio/stt_doa_json", 10)
+        self.pub_partial = self.create_publisher(String, "/audio/stt_partial_json", 10)
 
         audio_qos = QoSProfile(
             depth=10,
@@ -601,6 +594,9 @@ class STTFasterWhisperNode(Node):
         
         self.wg.start()
         
+        
+        self.add_on_set_parameters_callback(self._on_param_update)
+        
         # Marker params
         self.marker_enabled = bool(self.get_parameter("marker_enabled").value)
         self.marker_topic = str(self.get_parameter("marker_topic").value)
@@ -633,6 +629,205 @@ class STTFasterWhisperNode(Node):
             f"STT node: lane={self.pick_lane} fs={self.fs} TC={self.TC} "
           
         )
+
+    def _rebuild_asr(self, model_size=None, device=None, chunk_s=None, batch=None, language=None, translate=None):
+        """Recreate the HF pipeline worker safely."""
+        try:
+            if model_size is not None:
+                self.stt_hf_id = _resolve_hf_id(str(model_size))
+            if device is not None:
+                self.stt_device = str(device)
+            if chunk_s is not None:
+                self.stt_chunk_s = float(chunk_s)
+            if batch is not None:
+                self.stt_batch = int(batch)
+            if language is not None:
+                self.language = (str(language).strip() or None)
+            if translate is not None:
+                self.translate = bool(translate)
+
+            # stop old worker
+            if hasattr(self, "worker"):
+                try: self.worker.stop()
+                except: pass
+
+            # rebuild pipeline + worker
+            self.worker_asr, self.worker_gen = _build_hf_asr(
+                self.stt_hf_id, self.language, self.stt_device, self.stt_chunk_s, self.stt_batch
+            )
+            self.worker = HFWhisperWorker(
+                self.worker_asr, self.worker_gen, self.translate, self.language, self.out_q, self.get_logger()
+            )
+            self.worker.start()
+            self.get_logger().info(f"[params] ASR rebuilt: model={self.stt_hf_id} device={self.stt_device} chunk={self.stt_chunk_s}s batch={self.stt_batch}")
+        except Exception as e:
+            self.get_logger().error(f"[params] Rebuild ASR failed: {e}")
+            raise
+
+    def _rebuild_gate(self, model_size=None, device=None, window_ms=None, hop_ms=None,
+                      min_chars=None, min_avg_logprob=None, max_no_speech=None, language=None, translate=None):
+        """Recreate the Torch gate worker safely."""
+        try:
+            if model_size is not None:
+                self.wg_hf_id = _resolve_hf_id(str(model_size))
+            if device is not None:
+                self.wg_device = str(device)
+            if window_ms is not None:
+                self.wg_window_ms = int(window_ms)
+            if hop_ms is not None:
+                self.wg_hop_ms = int(hop_ms)
+            if min_chars is not None:
+                self.wg_min_chars = int(min_chars)
+            if min_avg_logprob is not None:
+                self.wg_min_avg_logprob = float(min_avg_logprob)
+            if max_no_speech is not None:
+                self.wg_max_no_speech = float(max_no_speech)
+            if language is not None:
+                self.language = (str(language).strip() or None)
+            if translate is not None:
+                self.translate = bool(translate)
+
+            # stop old gate
+            if hasattr(self, "wg"):
+                try: self.wg.stop()
+                except: pass
+
+            # rebuild processor/model/forced_ids + worker
+            self.gate_processor, self.gate_model, self.gate_forced_ids, self.gate_device = _build_torch_whisper_gate(
+                self.wg_hf_id, self.wg_device, self.language, self.translate
+            )
+            self.wg = TorchWhisperGateWorker(
+                self.gate_processor, self.gate_model, self.gate_forced_ids, self.gate_device,
+                self.language, self.translate, self._win_out, self.get_logger(), sample_rate=self.fs
+            )
+            self.wg.parent_vad_ratio = self._vad_voiced_ratio
+            self.wg.start()
+            self.get_logger().info(f"[params] Gate rebuilt: model={self.wg_hf_id} device={self.wg_device} win={self.wg_window_ms}ms hop={self.wg_hop_ms}ms")
+        except Exception as e:
+            self.get_logger().error(f"[params] Rebuild Gate failed: {e}")
+            raise
+
+    def _on_param_update(self, params):
+        """Hot-apply parameter changes: enable flags, model sizes, devices, language,
+           and gate/ASR tuning. Rebuilds workers only when needed.
+        """
+        resp = SetParametersResult(successful=True)
+        # Track whether to rebuild each worker and the desired deltas
+        asr_kwargs = {}
+        gate_kwargs = {}
+        do_rebuild_asr = False
+        do_rebuild_gate = False
+
+        try:
+            for p in params:
+                name, val = p.name, p.value
+
+                # Toggles (services still supported)
+                if name == "enable_stt":
+                    self.enable_stt = bool(val)
+                elif name == "enable_gate":
+                    self.enable_gate = bool(val)
+
+                # Language/task
+                elif name == "language":
+                    asr_kwargs["language"] = val
+                    gate_kwargs["language"] = val
+                    do_rebuild_asr = True
+                    do_rebuild_gate = True
+                elif name == "translate":
+                    asr_kwargs["translate"] = bool(val)
+                    gate_kwargs["translate"] = bool(val)
+                    do_rebuild_asr = True
+                    do_rebuild_gate = True
+
+                # ASR model/device/tuning
+                elif name == "stt_model_size":
+                    asr_kwargs["model_size"] = val; do_rebuild_asr = True
+                elif name == "stt_device":
+                    asr_kwargs["device"] = val; do_rebuild_asr = True
+                elif name == "stt_chunk_s":
+                    asr_kwargs["chunk_s"] = val; do_rebuild_asr = True
+                elif name == "stt_batch":
+                    asr_kwargs["batch"] = val; do_rebuild_asr = True
+
+                # Gate model/device/tuning
+                elif name == "wg_model_size":
+                    gate_kwargs["model_size"] = val; do_rebuild_gate = True
+                elif name == "wg_device":
+                    gate_kwargs["device"] = val; do_rebuild_gate = True
+                elif name == "wg_window_ms":
+                    gate_kwargs["window_ms"] = val; do_rebuild_gate = True
+                elif name == "wg_hop_ms":
+                    gate_kwargs["hop_ms"] = val; do_rebuild_gate = True
+                elif name == "wg_min_chars":
+                    gate_kwargs["min_chars"] = val; do_rebuild_gate = True
+                elif name == "wg_min_avg_logprob":
+                    gate_kwargs["min_avg_logprob"] = val; do_rebuild_gate = True
+                elif name == "wg_max_no_speech":
+                    gate_kwargs["max_no_speech"] = val; do_rebuild_gate = True
+
+                # Mic selection / mixing (no rebuild needed)
+                elif name == "ref_ch":
+                    self.ref_ch = int(val)
+                    self.pick_lane = self.mic_lanes[self.ref_ch]
+                elif name == "mix_strategy":
+                    self.mix_strategy = str(val).strip().lower()
+
+            # Apply rebuilds (stop old threads first inside helpers)
+            if do_rebuild_asr:
+                self._rebuild_asr(**asr_kwargs)
+            if do_rebuild_gate:
+                self._rebuild_gate(**gate_kwargs)
+
+        except Exception as e:
+            resp.successful = False
+            resp.reason = f"param update failed: {e}"
+            self.get_logger().error(resp.reason)
+        return resp
+
+
+    def _ema(self, ema_val, x, alpha=0.2):
+        if x is None:
+            return ema_val
+        if ema_val is None:
+            return x
+        return (1.0 - alpha) * ema_val + alpha * x
+
+    def _srv_toggle_stt(self, req, resp):
+        self.enable_stt = bool(req.data)
+        resp.success = True
+        resp.message = f"STT final ASR {'ENABLED' if self.enable_stt else 'DISABLED'}"
+        self.get_logger().info(resp.message)
+        return resp
+
+    def _srv_toggle_gate(self, req, resp):
+        self.enable_gate = bool(req.data)
+        resp.success = True
+        resp.message = f"Gate/endpointing {'ENABLED' if self.enable_gate else 'DISABLED'}"
+        self.get_logger().info(resp.message)
+        return resp
+
+    def _maybe_publish_perf(self, extra=None):
+        now = time.time()
+        if (now - self._last_perf_publish) < self._perf_publish_period:
+            return
+        self._last_perf_publish = now
+        payload = {
+            "stamp_wall": now,
+            "enable": {"stt": self.enable_stt, "gate": self.enable_gate},
+            "lat_ms_ema": {
+                "gate": self.lat_gate_ms_ema,
+                "asr":  self.lat_asr_ms_ema,
+                "e2e":  self.lat_e2e_ms_ema
+            },
+            "counters": {
+                "windows_processed": self.windows_processed,
+                "utterances_finalized": self.utterances_finalized
+            }
+        }
+        if isinstance(extra, dict):
+            payload.update(extra)
+        self.perf_pub.publish(String(data=json.dumps(payload)))
 
 
     def _vad_voiced_ratio(self, audio_f32: np.ndarray, sr: int) -> float:
@@ -789,8 +984,10 @@ class STTFasterWhisperNode(Node):
         az = math.radians(latest_angle[0][0])                   # NEW
 
         
-        # hand to your existing worker (high-quality transcription)
-        self.worker.submit(audio_i16, stamp_msg, latest_angle[0][0])
+        if self.enable_stt:
+            self.worker.submit(audio_i16, stamp_msg, latest_angle[0][0])
+        else:
+            self.get_logger().info("STT disabled: dropping finalized utterance audio")
         
         # reset
         self._utt_active = False
@@ -798,9 +995,18 @@ class STTFasterWhisperNode(Node):
         self._utt_samples = []
         self.doa_hist_speech = []
         self._last_speech_time_ns = None
+        self.utterances_finalized += 1
+        self._maybe_publish_perf()
 
 
     def _wg_tick(self):
+    
+        if not self.enable_gate:
+            # still advance next window schedule so we don't backlog
+            self._next_window_at_ns = self.get_clock().now().nanoseconds + int(self.wg_hop_ms * 1e6)
+            return
+
+    
         now_ns = self.get_clock().now().nanoseconds
         # 8.1 Launch a new window if due
         if now_ns >= self._next_window_at_ns:
@@ -827,6 +1033,11 @@ class STTFasterWhisperNode(Node):
             except queue.Empty:
                 break
 
+            lat_gate_ms = float(res.get("lat_ms", 0.0))
+            self.lat_gate_ms_ema = self._ema(self.lat_gate_ms_ema, lat_gate_ms, self._ema_alpha)
+            self.windows_processed += 1
+            self._maybe_publish_perf({"last_gate_lat_ms": lat_gate_ms})
+
             text = (res["text"] or "").strip()
             avg_lp = float(res.get("avg_logprob", -99.0))
             max_nsp = float(res.get("max_no_speech", 1.0))
@@ -843,6 +1054,27 @@ class STTFasterWhisperNode(Node):
             self.get_logger().info(f"BEFORE!!! {avg_lp} {max_nsp} {text} {is_speech}")            
 
             if is_speech:
+            
+                # NEW: summarize angle "so far" and publish a partial item
+                mode_deg, mean_deg, top_list = self._doa_summary()
+                partial_payload = {
+                    "kind": "partial_gate",
+                    "t_start_ns": t_start_ns,
+                    "t_end_ns":   t_end_ns,
+                    "duration_ms": dur_ms,
+                    "text": text,                    # may be empty if model produced nothing this window
+                    "avg_logprob": avg_lp,
+                    "max_no_speech": max_nsp,
+                    "lat_ms": lat_gate_ms,
+                    "doa": {
+                        "angle_mode_deg": mode_deg,
+                        "angle_mean_deg": mean_deg,
+                        "top_angles": top_list
+                    }
+                }
+                self.pub_partial.publish(String(data=json.dumps(partial_payload, ensure_ascii=False)))
+            
+            
                 # start or continue utterance
                 angles_only = [dh[1] for dh in self.doa_hist]
                 counter_doa = Counter(angles_only)
@@ -948,7 +1180,24 @@ class STTFasterWhisperNode(Node):
         t0, a0 = self.doa_hist[i-1]
         t1, a1 = self.doa_hist[i]
         return a0 if (t_target_sec - t0) <= (t1 - t_target_sec) else a1
-        
+ 
+ 
+    def _doa_summary(self):
+        """
+        Returns (mode_deg, mean_deg, top_list) from self.doa_hist ([(t, az_deg), ...]).
+        If empty, returns (0.0, 0.0, []).
+        """
+        if not self.doa_hist:
+            return 0.0, 0.0, []
+        angles_only = [float(az) for (_, az) in self.doa_hist]
+        counts = Counter(int(round(a)) for a in angles_only)  # 1° binning for stability
+        mode_deg = float(counts.most_common(1)[0][0]) if counts else 0.0
+        mean_deg = float(sum(angles_only) / max(len(angles_only), 1))
+        top5 = counts.most_common(5)
+        # e.g., [[angle_deg, count], ...]
+        top_list = [[float(k), int(v)] for (k, v) in top5]
+        return mode_deg, mean_deg, top_list
+       
         
     # ---- handlers ----
     def on_azimuth(self, msg: Float32):
@@ -1055,6 +1304,22 @@ class STTFasterWhisperNode(Node):
                 item = self.out_q.get_nowait()
             except queue.Empty:
                 break
+            
+            now_wall = time.time()
+            # Default stamp to current time if missing
+            sec = int(item.get("stamp", {}).get("sec", 0))
+            nsec = int(item.get("stamp", {}).get("nanosec", 0))
+            t_end = sec + 1e-9 * nsec
+            e2e_ms = max(0.0, (now_wall - t_end) * 1000.0) if (sec or nsec) else 0.0
+
+            kind = item.get("kind", "final_asr")
+            if kind == "final_asr":
+                lat_asr_ms = float(item.get("lat_ms", 0.0))
+                self.lat_asr_ms_ema = self._ema(self.lat_asr_ms_ema, lat_asr_ms, self._ema_alpha)
+                self.lat_e2e_ms_ema = self._ema(self.lat_e2e_ms_ema, e2e_ms, self._ema_alpha)
+                self._maybe_publish_perf({"last_asr_lat_ms": lat_asr_ms, "last_e2e_ms": e2e_ms})
+
+                
             text = (item.get("text") or "").strip()
             az = float(item.get("azimuth_deg", 0.0))
             stamp = item.get("stamp", {"sec": 0, "nanosec": 0})

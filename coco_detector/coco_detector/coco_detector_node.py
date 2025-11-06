@@ -1,37 +1,34 @@
 #!/usr/bin/env python3
 """
-YOLO + CameraInfo + PointCloud2 → map-frame human positions.
+YOLO/YOLO-Pose + CameraInfo + PointCloud2 → map-frame 3D positions for ANY class.
+Optional YOLO-Pose is executed ON DEMAND (service) and only when at least one person is detected.
 
-Subscribes:
-- /robot0/front_cam/rgb            (sensor_msgs/Image)
-- /robot0/point_cloud2             (sensor_msgs/PointCloud2)
-- /robot0/camera_info              (sensor_msgs/CameraInfo)
-- TF frames for cloud->camera and camera->map
+Services:
+- /toggle_yolo       (std_srvs/SetBool)  -> enable/disable normal YOLO
+- /toggle_yolo_pose  (std_srvs/SetBool)  -> enable/disable YOLO-Pose (gated on person present)
 
 Publishes:
-- detected_objects                 (vision_msgs/Detection2DArray) — with pose for persons in map
-- annotated_image                  (sensor_msgs/Image)            — optional
-- visualization_marker_array       (visualization_msgs/MarkerArray) — spheres + labels in map
-
-Key steps:
-1) Transform cloud to camera frame and rasterize a per-pixel depth (Z-buffer).
-2) YOLO detections → pick (u,v) at bottom-center; sample depth; back-project to 3D (camera).
-3) Transform to map; fill Detection2D pose + emit RViz markers.
+- detected_objects               (vision_msgs/Detection2DArray)
+- annotated_image                (sensor_msgs/Image) [optional]
+- visualization_marker_array     (visualization_msgs/MarkerArray)
+- yolo_perf                      (std_msgs/String)   [JSON: latencies, fps, counts]
+- yolo_pose_json                 (std_msgs/String)   [JSON: keypoints for persons if pose enabled]
 """
 
-import collections
+import collections, json, math, time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2
 from vision_msgs.msg import BoundingBox2D, ObjectHypothesis, ObjectHypothesisWithPose
 from vision_msgs.msg import Detection2D, Detection2DArray
-
 from visualization_msgs.msg import MarkerArray, Marker
 from geometry_msgs.msg import PointStamped
+from std_msgs.msg import String as StringMsg
+
+from std_srvs.srv import SetBool
 
 from cv_bridge import CvBridge
 from ultralytics import YOLO
@@ -42,17 +39,24 @@ from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from tf2_geometry_msgs import do_transform_point
-from std_msgs.msg import String
-
 import cv2
-#import tf_transformations as tft
-import pdb
+
+from rcl_interfaces.msg import SetParametersResult
 
 Detection = collections.namedtuple("Detection", "label, bbox, score")  # bbox: [x1,y1,x2,y2], label: int
 
+# COCO-17 keypoint edges (ultralytics order)
+COCO_EDGES = [
+    (5, 7), (7, 9),      # left arm
+    (6, 8), (8, 10),     # right arm
+    (11, 13), (13, 15),  # left leg
+    (12, 14), (14, 16),  # right leg
+    (5, 6), (5, 11), (6, 12), (11, 12),  # shoulders/hips
+    (5, 1), (6, 2), (1, 3), (2, 4), (1, 0), (2, 0)  # head/eyes/nose
+]
+
+
 def quat_to_mat44(x, y, z, w, tx, ty, tz):
-    """Minimal quaternion (x,y,z,w) + translation → 4x4 homogeneous matrix."""
-    # normalized quaternion assumed from TF
     xx, yy, zz = x*x, y*y, z*z
     xy, xz, yz = x*y, x*z, y*z
     wx, wy, wz = w*x, w*y, w*z
@@ -65,7 +69,7 @@ def quat_to_mat44(x, y, z, w, tx, ty, tz):
     T[:3, :3] = R
     T[0, 3] = tx; T[1, 3] = ty; T[2, 3] = tz
     return T
-    
+
 class CocoDetectorNode(Node):
     def __init__(self):
         super().__init__("coco_detector_node")
@@ -74,24 +78,33 @@ class CocoDetectorNode(Node):
         # Parameters
         # --------------------
         self.declare_parameter('device', 'cuda')                       # 'cuda' or 'cpu'
-        self.declare_parameter('detection_threshold', 0.25)            # YOLO conf threshold
-        self.declare_parameter('publish_annotated_image', True)
+        self.declare_parameter('detection_threshold', 0.25)
+        self.declare_parameter('publish_annotated_image', False)
+
         self.declare_parameter('image_topic', '/camera/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/camera_info')
         self.declare_parameter('pointcloud_topic', '/point_cloud2')
 
-        # Frames (adapt to your tree)
-        self.declare_parameter('camera_frame', 'front_camera')  # camera *optical* frame preferred
-        self.declare_parameter('target_frame', 'map')                  # RViz fixed frame or map frame
+        self.declare_parameter('camera_frame', 'front_camera')
+        self.declare_parameter('target_frame', 'map')
 
-        # Depth rasterization settings
-        self.declare_parameter('min_depth', 0.05)      # meters
-        self.declare_parameter('search_win', 5)        # +/- pixels to search when depth is missing
+        self.declare_parameter('min_depth', 0.05)
+        self.declare_parameter('search_win', 5)
 
+        # Model paths (adjust to your local weights)
+        self.declare_parameter('yolo_weights', 'yolo11x.pt')
+        self.declare_parameter('yolo_pose_weights', 'yolo11x-pose.pt')
+
+        # Default toggles
+        self.declare_parameter('enable_yolo', True)
+        self.declare_parameter('enable_yolo_pose', True)
+
+        # --------------------
         # Read params
-        self.device = self.get_parameter('device').value
-        self.det_thresh = float(self.get_parameter('detection_threshold').value)
-        self.pub_annot = bool(self.get_parameter('publish_annotated_image').value)
+        # --------------------
+        self.device      = self.get_parameter('device').value
+        self.det_thresh  = float(self.get_parameter('detection_threshold').value)
+        self.pub_annot   = bool(self.get_parameter('publish_annotated_image').value)
 
         self.image_topic = self.get_parameter('image_topic').value
         self.caminfo_topic = self.get_parameter('camera_info_topic').value
@@ -100,11 +113,17 @@ class CocoDetectorNode(Node):
         self.camera_frame = self.get_parameter('camera_frame').value
         self.target_frame = self.get_parameter('target_frame').value
 
-        self.min_depth = float(self.get_parameter('min_depth').value)
+        self.min_depth  = float(self.get_parameter('min_depth').value)
         self.search_win = int(self.get_parameter('search_win').value)
 
+        self.yolo_weights = self.get_parameter('yolo_weights').value
+        self.pose_weights = self.get_parameter('yolo_pose_weights').value
+
+        self.enable_yolo = bool(self.get_parameter('enable_yolo').value)
+        self.enable_pose = bool(self.get_parameter('enable_yolo_pose').value)
+
         # --------------------
-        # QoS for camera/pointcloud (best effort typical)
+        # QoS
         # --------------------
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -117,10 +136,10 @@ class CocoDetectorNode(Node):
         # Publishers
         # --------------------
         self.detected_objects_pub = self.create_publisher(Detection2DArray, "detected_objects", 10)
-        self.annotated_image_pub = None
-        if self.pub_annot:
-            self.annotated_image_pub = self.create_publisher(Image, "annotated_image", 10)
+        self.annotated_image_pub = self.create_publisher(Image, "annotated_image", 10) if self.pub_annot else None
         self.marker_pub = self.create_publisher(MarkerArray, "visualization_marker_array", 10)
+        self.perf_pub   = self.create_publisher(StringMsg, "yolo_perf", 10)
+        self.pose_json_pub = self.create_publisher(StringMsg, "yolo_pose_json", 10)
 
         # --------------------
         # Subscribers
@@ -130,26 +149,138 @@ class CocoDetectorNode(Node):
         self.create_subscription(Image, self.image_topic, self.image_callback, qos_profile)
 
         # --------------------
-        # TF
+        # Services
+        # --------------------
+        self.create_service(SetBool, "toggle_yolo", self._srv_toggle_yolo)
+        self.create_service(SetBool, "toggle_yolo_pose", self._srv_toggle_pose)
+
+        # --------------------
+        # TF and utils
         # --------------------
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # --------------------
-        # Utilities
-        # --------------------
         self.bridge = CvBridge()
-        self.cam = None                            # image_geometry.PinholeCameraModel
-        self.latest_cloud = None                   # PointCloud2
+        self.cam = None
+        self.latest_cloud = None
         self.latest_cloud_stamp = None
 
-        # YOLO model (expects weights available locally)
-        self.model = YOLO("yolo11x.pt")     # change path if needed
-        self.class_labels = None                   # set per-result from YOLO
+        # --------------------
+        # Models
+        # --------------------
+        self.model = YOLO(self.yolo_weights)
+        self.pose_model = YOLO(self.pose_weights)  # loaded upfront to avoid first-use spike
 
 
+        self.add_on_set_parameters_callback(self._on_param_update)
+        self.class_labels = None
 
-        self.get_logger().info("CocoDetectorNode started. Publishing map-frame human positions & markers.")
+        # --------------------
+        # Metrics
+        # --------------------
+        self._ema_alpha = 0.2
+        self.fps_ema = None
+        self.last_frame_t = None
+        self.count_frames = 0
+
+        self.lat_det_ms_ema  = None
+        self.lat_pose_ms_ema = None
+        self.lat_total_ms_ema = None
+
+        self.timer_log = self.create_timer(5.0, self._periodic_log)
+
+        self.get_logger().info(f"CocoDetectorNode started. YOLO={self.enable_yolo}, YOLO-Pose={self.enable_pose}.")
+
+    # --------------------
+    # Service handlers
+    # --------------------
+    def _srv_toggle_yolo(self, req, resp):
+        self.enable_yolo = bool(req.data)
+        resp.success = True
+        resp.message = f"YOLO {'ENABLED' if self.enable_yolo else 'DISABLED'}"
+        self.get_logger().info(resp.message)
+        return resp
+
+    def _srv_toggle_pose(self, req, resp):
+        self.enable_pose = bool(req.data)
+        resp.success = True
+        resp.message = f"YOLO-Pose {'ENABLED' if self.enable_pose else 'DISABLED'}"
+        self.get_logger().info(resp.message)
+        return resp
+
+    # ---------------------------------
+    # Runtime param update / model swap
+    # ---------------------------------
+    def _on_param_update(self, params):
+        """Handle dynamic changes from rcl_interfaces/SetParameters:
+           - yolo_weights          : reload detector
+           - yolo_pose_weights     : reload pose model
+           - detection_threshold   : update threshold
+           - publish_annotated_image: (re)create/destroy publisher
+           - enable_yolo / enable_yolo_pose: flip gates (alt to services)
+           - device                : just store; we pass it on each .predict()
+        """
+        new_det_w = None
+        new_pose_w = None
+        resp = SetParametersResult(successful=True)
+
+        try:
+            for p in params:
+                if p.name == "yolo_weights":
+                    if p.value and p.value != self.yolo_weights:
+                        new_det_w = str(p.value)
+
+                elif p.name == "yolo_pose_weights":
+                    if p.value and p.value != self.pose_weights:
+                        new_pose_w = str(p.value)
+
+                elif p.name == "detection_threshold":
+                    self.det_thresh = float(p.value)
+
+                elif p.name == "publish_annotated_image":
+                    want = bool(p.value)
+                    if want and self.annotated_image_pub is None:
+                        self.annotated_image_pub = self.create_publisher(Image, "annotated_image", 10)
+                    elif (not want) and self.annotated_image_pub is not None:
+                        # stop publishing overlay
+                        self.destroy_publisher(self.annotated_image_pub)
+                        self.annotated_image_pub = None
+
+                elif p.name == "enable_yolo":
+                    self.enable_yolo = bool(p.value)
+
+                elif p.name == "enable_yolo_pose":
+                    self.enable_pose = bool(p.value)
+
+                elif p.name == "device":
+                    # No rebuild required; we pass `device` into predict()
+                    self.device = str(p.value)
+
+            # Reload detector if requested
+            if new_det_w is not None:
+                self.get_logger().info(f"[params] Reloading YOLO detector: {new_det_w}")
+                t0 = time.perf_counter()
+                new_model = YOLO(new_det_w)
+                self.model = new_model
+                self.yolo_weights = new_det_w
+                self.get_logger().info(f"[params] Detector ready in {(time.perf_counter()-t0)*1000:.1f} ms")
+
+            # Reload pose model if requested
+            if new_pose_w is not None:
+                self.get_logger().info(f"[params] Reloading YOLO-Pose: {new_pose_w}")
+                t0 = time.perf_counter()
+                new_pose_model = YOLO(new_pose_w)
+                self.pose_model = new_pose_model
+                self.pose_weights = new_pose_w
+                self.get_logger().info(f"[params] Pose ready in {(time.perf_counter()-t0)*1000:.1f} ms")
+
+        except Exception as e:
+            msg = f"Parameter update failed: {e}"
+            self.get_logger().error(msg)
+            resp.successful = False
+            resp.reason = msg
+        return resp
+
 
     # --------------------
     # Callbacks
@@ -169,21 +300,19 @@ class CocoDetectorNode(Node):
                 target, source, rclpy.time.Time.from_msg(stamp),
                 rclpy.duration.Duration(seconds=timeout_sec)
             )
-        except TransformException as e:
-            '''
-            self.get_logger().warn(
-                f"TF @stamp failed ({e}). Falling back to latest (time=0)."
-            )
-            '''
+        except TransformException:
             return self.tf_buffer.lookup_transform(
-                target, source, rclpy.time.Time(),  # latest available
+                target, source, rclpy.time.Time(),
                 rclpy.duration.Duration(seconds=timeout_sec)
             )
-            
+
     def image_callback(self, msg: Image):
-        # Need intrinsics and a cloud frame to compute a depth map
+        if not self.enable_yolo:
+            return
         if self.cam is None or self.latest_cloud is None:
             return
+
+        t0_total = time.perf_counter()
 
         # --- TFs for this timestamp ---
         try:
@@ -191,7 +320,6 @@ class CocoDetectorNode(Node):
             stamp = self.latest_cloud.header.stamp
             tf_cloud_to_cam = self._lookup_tf_with_fallback(self.camera_frame, cloud_frame, stamp)
             tf_cam_to_map   = self._lookup_tf_with_fallback(self.target_frame, self.camera_frame, stamp)
-
         except TransformException as ex:
             self.get_logger().warn(f"TF lookup failed: {ex}")
             return
@@ -206,23 +334,25 @@ class CocoDetectorNode(Node):
         except Exception:
             cv_img_rect = cv_img_raw
 
-
-        # --- YOLO inference ---
+        # --- YOLO inference (objects) ---
+        t0_det = time.perf_counter()
         results = self.model.predict(cv_img_rect, verbose=False, device=self.device)
+        det_ms = (time.perf_counter() - t0_det) * 1000.0
+        self.lat_det_ms_ema = self._ema(self.lat_det_ms_ema, det_ms, self._ema_alpha)
+
         dets: list[Detection] = []
-        annot_img_bgr = cv_img_rect.copy()[:, :, ::-1]  # fallback if result.plot not called
+        any_person = False
 
         for result in results:
-            # names is dict: id->name
             self.class_labels = result.names
-            # Plot gives BGR image
-            annot_img_bgr = result.plot()
-            # xyxy: tensor N x 4; cls: N; conf: N
             for cls_id, box, conf in zip(result.boxes.cls, result.boxes.xyxy, result.boxes.conf):
                 conf_f = float(conf)
                 if conf_f < self.det_thresh:
                     continue
-                dets.append(Detection(int(cls_id), box.cpu().numpy(), conf_f))
+                cls_int = int(cls_id)
+                dets.append(Detection(cls_int, box.cpu().numpy(), conf_f))
+                if self._label_str(cls_int) == "person":
+                    any_person = True
 
         # --- Depth Z-buffer from cloud in camera frame ---
         vals = pc2.read_points_numpy(self.latest_cloud, field_names=('x', 'y', 'z'))
@@ -230,95 +360,219 @@ class CocoDetectorNode(Node):
             return
         pts_cam = self._transform_points(T_cloud_cam, vals)  # (N,3) camera frame
 
-        W, H = self.cam.fullResolution()  # returns (width, height)
+        W, H = self.cam.fullResolution()  # (width, height)
         fx, fy, cx, cy = self.cam.fx(), self.cam.fy(), self.cam.cx(), self.cam.cy()
         depth_img = self._build_depth_image(pts_cam, int(W), int(H), fx, fy, cx, cy)
 
-        # --- Build Detection2DArray and fill person 3D poses in map ---
+        # --- Build Detection2DArray + 3D for ALL classes ---
         det_array = Detection2DArray()
         det_array.header = msg.header
 
         marker_array = MarkerArray()
         marker_id = 0
 
+        # 3D estimation heuristic: use bottom-center (feet/contact) for all classes
+        # (works well for grounded objects; consider center for aerial classes if needed)
         for d in dets:
             detection2d = self._yolo_to_detection2d(d, msg.header)
 
-            label = self._label_str(d.label)
-            if label == "person":
-                x1, y1, x2, y2 = [float(v) for v in d.bbox]
-                u = 0.5 * (x1 + x2)
-                v = y2  # bottom of bbox ~ feet
+            x1, y1, x2, y2 = [float(v) for v in d.bbox]
+            u = 0.5 * (x1 + x2)
+            v = y2
 
-                Z = self._depth_at(depth_img, u, v, win=self.search_win)
-                if np.isfinite(Z) and Z > self.min_depth:
-                    ray = np.array(self.cam.projectPixelTo3dRay((u, v)), dtype=np.float32)  # unit vector
-                    p_cam = ray * float(Z)  # (X,Y,Z) in camera frame
+            Z = self._depth_at(depth_img, u, v, win=self.search_win)
+            if np.isfinite(Z) and Z > self.min_depth:
+                ray = np.array(self.cam.projectPixelTo3dRay((u, v)), dtype=np.float32)
+                p_cam = ray * float(Z)
 
-                    ps_cam = PointStamped()
-                    ps_cam.header.stamp = msg.header.stamp
-                    ps_cam.header.frame_id = self.camera_frame
-                    ps_cam.point.x, ps_cam.point.y, ps_cam.point.z = float(p_cam[0]), float(p_cam[1]), float(p_cam[2])
+                ps_cam = PointStamped()
+                ps_cam.header.stamp = msg.header.stamp
+                ps_cam.header.frame_id = self.camera_frame
+                ps_cam.point.x, ps_cam.point.y, ps_cam.point.z = float(p_cam[0]), float(p_cam[1]), float(p_cam[2])
 
-                    try:
-                        ps_map = do_transform_point(ps_cam, tf_cam_to_map)
-                        # Write pose in map into results[0]
-                        if not detection2d.results:
-                            oh = ObjectHypothesisWithPose()
-                            oh.hypothesis.class_id = label
-                            oh.hypothesis.score = d.score
-                            detection2d.results.append(oh)
-                        detection2d.results[0].pose.pose.position.x = ps_map.point.x
-                        detection2d.results[0].pose.pose.position.y = ps_map.point.y
-                        detection2d.results[0].pose.pose.position.z = ps_map.point.z
-                        detection2d.header.frame_id = self.target_frame
+                try:
+                    ps_map = do_transform_point(ps_cam, tf_cam_to_map)
+                    if not detection2d.results:
+                        oh = ObjectHypothesisWithPose()
+                        oh.hypothesis.class_id = self._label_str(d.label)
+                        oh.hypothesis.score = d.score
+                        detection2d.results.append(oh)
+                    detection2d.results[0].pose.pose.position.x = ps_map.point.x
+                    detection2d.results[0].pose.pose.position.y = ps_map.point.y
+                    detection2d.results[0].pose.pose.position.z = ps_map.point.z
+                    detection2d.header.frame_id = self.target_frame
 
-                        # RViz markers
-                        m = Marker()
-                        m.header.frame_id = self.target_frame
-                        m.header.stamp = msg.header.stamp
-                        m.ns = "humans"
-                        m.id = marker_id; marker_id += 1
-                        m.type = Marker.SPHERE
-                        m.action = Marker.ADD
-                        m.pose.position.x = ps_map.point.x
-                        m.pose.position.y = ps_map.point.y
-                        m.pose.position.z = ps_map.point.z
-                        m.scale.x = m.scale.y = m.scale.z = 0.25
-                        m.color.a = 0.9; m.color.r = 1.0; m.color.g = 0.0; m.color.b = 0.0
-                        marker_array.markers.append(m)
+                    # RViz marker (color hashed by class id)
+                    r, g, b = self._hash_color(d.label)
+                    m = Marker()
+                    m.header.frame_id = self.target_frame
+                    m.header.stamp = msg.header.stamp
+                    m.ns = f"det_{self._label_str(d.label)}"
+                    m.id = marker_id; marker_id += 1
+                    m.type = Marker.SPHERE
+                    m.action = Marker.ADD
+                    m.pose.position.x = ps_map.point.x
+                    m.pose.position.y = ps_map.point.y
+                    m.pose.position.z = ps_map.point.z
+                    m.scale.x = m.scale.y = m.scale.z = 0.25
+                    m.color.a = 0.95; m.color.r, m.color.g, m.color.b = r, g, b
+                    marker_array.markers.append(m)
 
-                        t = Marker()
-                        t.header.frame_id = self.target_frame
-                        t.header.stamp = msg.header.stamp
-                        t.ns = "humans_text"
-                        t.id = marker_id; marker_id += 1
-                        t.type = Marker.TEXT_VIEW_FACING
-                        t.action = Marker.ADD
-                        t.pose.position.x = ps_map.point.x
-                        t.pose.position.y = ps_map.point.y
-                        t.pose.position.z = ps_map.point.z + 0.5
-                        t.scale.z = 0.25
-                        t.color.a = 1.0; t.color.r = 1.0; t.color.g = 1.0; t.color.b = 1.0
-                        t.text = f"person ({d.score:.2f})"
-                        marker_array.markers.append(t)
+                    t = Marker()
+                    t.header.frame_id = self.target_frame
+                    t.header.stamp = msg.header.stamp
+                    t.ns = f"det_text_{self._label_str(d.label)}"
+                    t.id = marker_id; marker_id += 1
+                    t.type = Marker.TEXT_VIEW_FACING
+                    t.action = Marker.ADD
+                    t.pose.position.x = ps_map.point.x
+                    t.pose.position.y = ps_map.point.y
+                    t.pose.position.z = ps_map.point.z + 0.5
+                    t.scale.z = 0.25
+                    t.color.a = 1.0; t.color.r = t.color.g = t.color.b = 1.0
+                    t.text = f"{self._label_str(d.label)} ({d.score:.2f})"
+                    marker_array.markers.append(t)
 
-                    except Exception as e:
-                        self.get_logger().warn(f"camera->map transform failed: {e}")
+                except Exception as e:
+                    self.get_logger().warn(f"camera->map transform failed: {e}")
 
             det_array.detections.append(detection2d)
 
-        # --- Publish ---
-        self.detected_objects_pub.publish(det_array)
+        # --- Optional: YOLO Pose (only if enabled and any person found) ---
+        pose_ms = 0.0
+        pose_json = None
+        if self.enable_pose and any_person:
+            t0_pose = time.perf_counter()
+            # Run on full rectified image (simpler + avoids ROI stitching)
+            pose_results = self.pose_model.predict(cv_img_rect, verbose=False, device=self.device)
+            pose_ms = (time.perf_counter() - t0_pose) * 1000.0
+            self.lat_pose_ms_ema = self._ema(self.lat_pose_ms_ema, pose_ms, self._ema_alpha)
 
+            # Overlay on annotated image if available
+            if len(pose_results) > 0:
+                # Draw only keypoints of persons to keep coherent visuals
+
+                # Export minimal JSON of keypoints for persons
+                # Each item: {"bbox":[x1,y1,x2,y2],"score":p,"keypoints":[[x,y,conf],...]}
+                pose_json = []
+                r0 = pose_results[0]
+                kpts = getattr(r0, "keypoints", None)
+                if kpts is not None and r0.boxes is not None:
+                    # Shapes: kpts.xy (N, num_kpts, 2), kpts.conf (N, num_kpts) possibly None
+                    kxy = getattr(kpts, "xy", None)
+                    kcf = getattr(kpts, "conf", None)
+                    if kxy is not None and r0.boxes.xyxy is not None:
+                        for i in range(kxy.shape[0]):
+                            # best effort: assume matched to person class by Ultralytics pose head
+                            xy = kxy[i].cpu().numpy().tolist()
+                            confs = kcf[i].cpu().numpy().tolist() if kcf is not None else [None]*len(xy)
+                            kp = [[float(x), float(y), (float(c) if c is not None else None)] for (x,y), c in zip(xy, confs)]
+                            box = r0.boxes.xyxy[i].cpu().numpy().tolist()
+                            score = float(r0.boxes.conf[i].cpu().numpy()) if r0.boxes.conf is not None else None
+                            pose_json.append({"bbox": [float(v) for v in box],
+                                              "score": score,
+                                              "keypoints": kp})
+
+
+        # --- Unified 2D overlay: draw boxes + skeleton on the same image ---
+        # Work in BGR (OpenCV default), then convert back to RGB for ROS.
+        annot_bgr = cv2.cvtColor(cv_img_rect, cv2.COLOR_RGB2BGR)
+
+        # 1) Draw YOLO boxes (all classes)
+        for d in dets:
+            x1, y1, x2, y2 = [int(v) for v in d.bbox]
+            # use hashed color per-class (convert 0..1 → 0..255)
+            r, g, b = self._hash_color(d.label)
+            color = (int(b * 255), int(g * 255), int(r * 255))
+            cv2.rectangle(annot_bgr, (x1, y1), (x2, y2), color, 2)
+            label = f"{self._label_str(d.label)} {d.score:.2f}"
+            # label background for readability
+            (tw, th), bl = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(annot_bgr, (x1, max(0, y1 - th - 6)), (x1 + tw + 4, y1), color, -1)
+            cv2.putText(annot_bgr, label, (x1 + 2, y1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+        # 2) Draw skeletons (if pose_json exists this frame)
+        if pose_json:
+            # joints styling
+            joint_radius = 3
+            joint_color = (0, 0, 255)     # red
+            bone_color  = (255, 255, 255) # white
+            conf_gate = 0.30
+
+            for person in pose_json:
+                kps = person.get("keypoints", [])  # list of [x, y, conf]
+
+                # draw joints
+                for kp in kps:
+                    if kp is None or len(kp) < 2:
+                        continue
+                    x, y = kp[0], kp[1]
+                    c = kp[2] if len(kp) > 2 else None
+                    if c is not None and c < conf_gate:
+                        continue
+                    cv2.circle(annot_bgr, (int(x), int(y)), joint_radius, joint_color, -1, lineType=cv2.LINE_AA)
+
+                # draw bones
+                for i, j in COCO_EDGES:
+                    if i < len(kps) and j < len(kps):
+                        kpi, kpj = kps[i], kps[j]
+                        if kpi is None or kpj is None:
+                            continue
+                        if len(kpi) < 2 or len(kpj) < 2:
+                            continue
+                        xi, yi = int(kpi[0]), int(kpi[1])
+                        xj, yj = int(kpj[0]), int(kpj[1])
+                        ci = kpi[2] if len(kpi) > 2 else None
+                        cj = kpj[2] if len(kpj) > 2 else None
+                        if (ci is None or ci >= conf_gate) and (cj is None or cj >= conf_gate):
+                            cv2.line(annot_bgr, (xi, yi), (xj, yj), bone_color, 2, lineType=cv2.LINE_AA)
+
+        # 3) Publish the combined overlay
         if self.annotated_image_pub is not None:
-            # result.plot() returns BGR; convert to RGB for 'rgb8'
-            annot_rgb = cv2.cvtColor(annot_img_bgr, cv2.COLOR_BGR2RGB)
+            annot_rgb = cv2.cvtColor(annot_bgr, cv2.COLOR_BGR2RGB)
             ros_img = self.bridge.cv2_to_imgmsg(annot_rgb, encoding="rgb8")
             ros_img.header = msg.header
             self.annotated_image_pub.publish(ros_img)
 
+        # --- Publish outputs ---
+        self.detected_objects_pub.publish(det_array)
+
         self.marker_pub.publish(marker_array)
+
+        if pose_json is not None:
+            self.pose_json_pub.publish(StringMsg(data=json.dumps({"stamp": self._stamp_to_float(msg.header.stamp),
+                                                                  "persons": pose_json})))
+
+        # --- Metrics / Perf ---
+        total_ms = (time.perf_counter() - t0_total) * 1000.0
+        self.lat_total_ms_ema = self._ema(self.lat_total_ms_ema, total_ms, self._ema_alpha)
+
+        now_t = time.perf_counter()
+        if self.last_frame_t is not None:
+            inst_fps = 1.0 / max(1e-6, (now_t - self.last_frame_t))
+            self.fps_ema = self._ema(self.fps_ema, inst_fps, self._ema_alpha)
+        self.last_frame_t = now_t
+        self.count_frames += 1
+
+        metrics = {
+            "stamp": self._stamp_to_float(msg.header.stamp),
+            "enabled": {"yolo": self.enable_yolo, "pose": self.enable_pose},
+            "latency_ms": {
+                "det": det_ms,
+                "pose": pose_ms if self.enable_pose and any_person else 0.0,
+                "total": total_ms
+            },
+            "latency_ms_ema": {
+                "det": self.lat_det_ms_ema,
+                "pose": self.lat_pose_ms_ema,
+                "total": self.lat_total_ms_ema
+            },
+            "fps_ema": self.fps_ema,
+            "num_dets": len(dets),
+            "any_person": any_person
+        }
+        self.perf_pub.publish(StringMsg(data=json.dumps(metrics)))
 
     # --------------------
     # Helpers
@@ -366,7 +620,6 @@ class CocoDetectorNode(Node):
         return out[:, :3]
 
     def _build_depth_image(self, pts_cam, W, H, fx, fy, cx, cy):
-        """Rasterize a Z-buffer depth image (meters) from points in camera frame."""
         X, Y, Z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
         valid = Z > self.min_depth
         X = X[valid]; Y = Y[valid]; Z = Z[valid]
@@ -381,13 +634,12 @@ class CocoDetectorNode(Node):
         if Z.size == 0:
             return depth
 
-        # For duplicates, keep the nearest Z (classic Z-buffer)
-        # Use flat indexing + segment-wise minimum
         flat = v * W + u
         order = np.argsort(flat)
         flat_sorted = flat[order]
         Z_sorted = Z[order]
 
+        # segment-wise minimum (z-buffer)
         seg_start = np.ones_like(flat_sorted, dtype=bool)
         seg_start[1:] = flat_sorted[1:] != flat_sorted[:-1]
 
@@ -416,8 +668,30 @@ class CocoDetectorNode(Node):
             return float(np.nanmin(patch))
         return float('nan')
 
+    def _hash_color(self, cls_id: int):
+        # deterministic pastel-ish hash → RGB in [0,1]
+        rnd = (cls_id * 2654435761) & 0xFFFFFFFF
+        r = ((rnd >>  0) & 0xFF) / 255.0
+        g = ((rnd >>  8) & 0xFF) / 255.0
+        b = ((rnd >> 16) & 0xFF) / 255.0
+        return r, g, b
 
-    
+    def _stamp_to_float(self, stamp):
+        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+    def _ema(self, ema_val, x, alpha):
+        if x is None:
+            return ema_val
+        if ema_val is None:
+            return x
+        return (1.0 - alpha) * ema_val + alpha * x
+
+    def _periodic_log(self):
+        self.get_logger().info(
+            f"[perf] EMA fps={self.fps_ema:.2f} | det={self.lat_det_ms_ema:.1f}ms "
+            f"| pose={0.0 if self.lat_pose_ms_ema is None else self.lat_pose_ms_ema:.1f}ms "
+            f"| total={self.lat_total_ms_ema:.1f}ms | frames={self.count_frames}"
+        )
 
 def main():
     rclpy.init()
@@ -428,6 +702,6 @@ def main():
         node.destroy_node()
         rclpy.shutdown()
 
-
 if __name__ == "__main__":
     main()
+

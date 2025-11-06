@@ -1,0 +1,161 @@
+version: 1
+meta:
+  project: robot-perception
+  units:
+    latency_ms: "ms (mean/EMA)"
+    throughput_fps: "frames/s at stated resolution"
+    memory_mb: "approx resident"
+  notes: "Tasks declare outputs; models implement task with metrics/params."
+
+tasks:
+
+  object_detection:
+    description: "2D objects; optionally your node adds 3D map poses via depth/TF."
+    node: "/coco_detector"             # <— ROS node name that runs this task
+    outputs:
+      - id: detection.2d
+        ros: { msg: vision_msgs/Detection2DArray, topic: "/detected_objects" }
+        fields: ["class","score","bbox","pose_3d?","frame_id"]
+      - id: image.annotated
+        ros: { msg: sensor_msgs/Image, topic: "/annotated_image" }
+      - id: markers
+        ros: { msg: visualization_msgs/MarkerArray, topic: "/visualization_marker_array" }
+      - id: perf.json
+        ros: { msg: std_msgs/String, topic: "/yolo_perf" }
+        schema_hint: '{"latency_ms":{"det":num,"pose":num,"total":num},"fps_ema":num}'
+    services:
+      enable:                                # std_srvs/SetBool to gate inference
+        name: "/toggle_yolo"
+        type: "std_srvs/SetBool"
+      set_model:                             # rcl_interfaces/SetParameters to switch weights
+        param_service: "/coco_detector/set_parameters"
+        param_name: "yolo_weights"
+        type: "rcl_interfaces/SetParameters"
+      # optional 'reload' poke after changing params (if your node needs it)
+      # reload:
+      #   name: "/toggle_yolo"
+      #   type: "std_srvs/SetBool"
+
+    models:
+      - id: yolo11n
+        version: "11n"
+        description: "Nano detector (very low latency)."
+        metrics:
+          latency_ms: { det_mean: 8.0 }       # example at 640p
+          throughput_fps: { rgb_640: 60.0 }
+          accuracy: { coco_map_50_95: 0.38 }
+        resources: { device_pref: ["cuda","cpu"], memory_mb: 600, vram_mb: 500 }
+        parameters:
+          detection_threshold: { default: 0.30 }
+          device: { default: "cuda" }
+          weights: "yolo11n.pt"
+
+      - id: yolo11x
+        version: "11x"
+        description: "High-accuracy detector."
+        metrics:
+          latency_ms: { det_mean: 22.0 }
+          throughput_fps: { rgb_640: 30.0 }
+          accuracy: { coco_map_50_95: 0.53 }
+        resources: { device_pref: ["cuda","cpu"], memory_mb: 2600, vram_mb: 2400 }
+        parameters:
+          detection_threshold: { default: 0.25 }
+          device: { default: "cuda" }
+          weights: "yolo11x.pt"
+
+  pose_detection:
+    description: "Human keypoints (COCO-17), on-demand."
+    node: "/coco_detector"              # same node publishes pose JSON
+    outputs:
+      - id: pose.json
+        ros: { msg: std_msgs/String, topic: "/yolo_pose_json" }
+        schema_hint: '{"persons":[{"bbox":[x1,y1,x2,y2],"score":p,"keypoints":[[x,y,conf],...]}]}'
+      - id: image.annotated
+        ros: { msg: sensor_msgs/Image, topic: "/annotated_image" }
+      - id: perf.json
+        ros: { msg: std_msgs/String, topic: "/yolo_perf" }
+        schema_hint: '{"latency_ms":{"pose":num}}'
+    services:
+      enable:
+        name: "/toggle_yolo_pose"
+        type: "std_srvs/SetBool"
+      set_model:
+        param_service: "/coco_detector/set_parameters"
+        param_name: "yolo_pose_weights"
+        type: "rcl_interfaces/SetParameters"
+
+    models:
+      - id: yolo11n-pose
+        version: "11n-pose"
+        metrics:
+          latency_ms: { pose_mean: 14.0 }
+          throughput_fps: { rgb_640: 55.0 }
+          accuracy: { keypoint_AP_50_95: 0.50 }
+        resources: { device_pref: ["cuda","cpu"], memory_mb: 800, vram_mb: 700 }
+        parameters: { device: { default: "cuda" }, weights: "yolo11n-pose.pt" }
+
+      - id: yolo11x-pose
+        version: "11x-pose"
+        metrics:
+          latency_ms: { pose_mean: 35.0 }
+          throughput_fps: { rgb_640: 22.0 }
+          accuracy: { keypoint_AP_50_95: 0.63 }
+        resources: { device_pref: ["cuda","cpu"], memory_mb: 2800, vram_mb: 2500 }
+        parameters: { device: { default: "cuda" }, weights: "yolo11x-pose.pt" }
+
+  audio_gating:
+    description: "Low-latency gate; partial text and DoA summary per window."
+    node: "/stt_angle"
+    outputs:
+      - id: text.partial
+        ros: { msg: std_msgs/String, topic: "/audio/stt_partial_json" }
+        schema_hint: '{"kind":"partial_gate","text":str,"avg_logprob":num,"lat_ms":num,"doa":{"angle_mode_deg":num,"angle_mean_deg":num}}'
+      - id: perf.json
+        ros: { msg: std_msgs/String, topic: "/stt_perf" }
+    services:
+      enable:
+        name: "/toggle_gate"
+        type: "std_srvs/SetBool"
+      set_model:
+        param_service: "/stt_angle/set_parameters"
+        param_name: "wg_model_size"
+        type: "rcl_interfaces/SetParameters"
+
+    models:
+      - id: whisper
+        version: "large-v3"
+        metrics: { latency_ms: { window_infer_mean: 25.0 } }
+        resources: { device_pref: ["cuda","cpu"], memory_mb: 2200, vram_mb: 1600 }
+        parameters:
+          wg_window_ms: { default: 3000 }
+          wg_hop_ms: { default: 1000 }
+
+  audio_asr:
+    description: "Final, higher-quality utterance transcription."
+    node: "/stt_angle"
+    outputs:
+      - id: text.final
+        ros: { msg: std_msgs/String, topic: "/audio/stt_text" }
+        schema_hint: '{"text": str}'
+      - id: json.final
+        ros: { msg: std_msgs/String, topic: "/audio/stt_doa_json" }
+        schema_hint: '{"text":str,"azimuth_deg":num,"stamp":{...}}'
+      - id: perf.json
+        ros: { msg: std_msgs/String, topic: "/stt_perf" }
+    services:
+      enable:
+        name: "/toggle_stt"
+        type: "std_srvs/SetBool"
+      set_model:
+        param_service: "/stt_angle/set_parameters"
+        param_name: "stt_model_size"
+        type: "rcl_interfaces/SetParameters"
+
+    models:
+      - id: whisper
+        version: "hf-medium"
+        metrics: { latency_ms: { utter_infer_mean: 160.0 } }
+        resources: { device_pref: ["cuda","cpu"], memory_mb: 3200, vram_mb: 2400 }
+        parameters:
+          stt_model_size: { default: "medium", enum: ["tiny","base","small","medium","large-v3"] }
+          stt_chunk_s: { default: 30.0 }

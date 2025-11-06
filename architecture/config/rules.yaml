@@ -1,0 +1,31 @@
+version: 1
+defaults:
+  window_ms: 3000
+  composite_window_ms: 2000
+
+rules:
+  - id: pose_present_precise
+    enabled: true
+    task: pose_detection
+    output: pose.json
+    model_id: "yolo11x-pose"
+    expr: "persons >= 1"
+
+  - id: speech_keyword
+    enabled: true
+    task: audio_gating
+    output: text.partial
+    model_id: "whisper"                           # Whisper gate size
+    expr: "text and any(x in text.lower() for x in ['hello','help'])"
+
+  - id: speech_final_any
+    enabled: true
+    task: audio_asr
+    output: text.final
+    model_id: "whisper"                          # Whisper ASR size
+    expr: "text and len(text) >= 3"
+
+  - id: greet_with_presence
+    enabled: true
+    type: composite
+    expr: "exists('pose_present_precise', 2500) and exists('speech_keyword', 2500)"
