@@ -16,5 +16,14 @@ def generate_launch_description():
                 'rules_path':    os.path.join(pkg_share, 'config', 'rules.yaml'),
                 'enabled': True,
             }]
+        ),
+        Node(
+            package='architecture',
+            executable='skills_node',
+            name='skills_node',
+            output='screen',
+            parameters=[{
+                'skills_path': os.path.join(pkg_share, 'config', 'skills.yaml'),
+            }]
         )
     ])

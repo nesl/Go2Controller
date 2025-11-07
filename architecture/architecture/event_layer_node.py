@@ -15,6 +15,10 @@ from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from std_srvs.srv import SetBool
 
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Quaternion
+import math
+
 # --- add this helper near the top ---
 def _norm_ros_type(s: str) -> str:
     if not s: return s
@@ -26,7 +30,15 @@ MSG_CLASS = {
     "std_msgs/msg/String": StringMsg,
     "vision_msgs/Detection2DArray": Detection2DArray,
     "vision_msgs/msg/Detection2DArray": Detection2DArray,
+    "nav_msgs/Odometry": Odometry,
+    "nav_msgs/msg/Odometry": Odometry,
 }
+
+def quat_to_yaw(q: Quaternion) -> float:
+    # simple yaw extraction
+    siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 def load_yaml(p: str): return yaml.safe_load(Path(p).read_text())
 
@@ -383,6 +395,8 @@ class EventLayerNode(Node):
     def _make_cb(self, topic: str, msgstr: str):
         if msgstr == "vision_msgs/Detection2DArray":
             return self._cb_detection
+        if msgstr == "nav_msgs/Odometry":
+            return self._cb_odom
         if topic == "/yolo_pose_json":
             return self._cb_pose_json
         if topic in ("/audio/stt_partial_json", "/audio/stt_doa_json"):
@@ -456,6 +470,31 @@ class EventLayerNode(Node):
             }
             ctx = {"cls": cls, "score": score, "bbox": bbox, "ts": ts}
             self._eval_for_rules("object_detection", "detection.2d", ctx)
+
+    def _cb_odom(self, msg: Odometry):
+        ts = self._now()
+        pos = msg.pose.pose.position
+        yaw = quat_to_yaw(msg.pose.pose.orientation)
+        ctx = {"x": pos.x, "y": pos.y, "yaw": yaw, "ts": ts}
+
+        # Compute deltas if we have a previous pose
+        if hasattr(self, "_last_odom"):
+            dx = pos.x - self._last_odom["x"]
+            dy = pos.y - self._last_odom["y"]
+            dyaw = yaw - self._last_odom["yaw"]
+
+            # Normalize rotation to [-pi, pi]
+            while dyaw > math.pi: dyaw -= 2*math.pi
+            while dyaw < -math.pi: dyaw += 2*math.pi
+
+            ctx["dxy"] = math.sqrt(dx*dx + dy*dy)
+            ctx["dyaw_deg"] = abs(math.degrees(dyaw))
+
+            # Evaluate distance/turn rules
+            self._eval_for_rules("odometry_tracking", "odom", ctx)
+
+        self._last_odom = ctx
+
 
     # --- pose.json
     def _cb_pose_json(self, msg: StringMsg):

@@ -9,6 +9,15 @@ meta:
 
 tasks:
 
+  odometry_tracking:
+      description: "Track robot base pose for distance and rotation changes"
+      node: ""   # Not required unless you dynamically enable something
+      outputs:
+        - id: "odom"
+          ros:
+            topic: "/odom"
+            msg: "nav_msgs/Odometry"
+
   object_detection:
     description: "2D objects; optionally your node adds 3D map poses via depth/TF."
     node: "/coco_detector"             # <— ROS node name that runs this task

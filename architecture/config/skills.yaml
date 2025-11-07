@@ -1,0 +1,242 @@
+# skills.v2.yaml
+# Composite- and step-level `when` / `until` supported.
+# No base.search_person or new base primitives.
+# turn_search built from small relative movements (nav.move_relative).
+
+version: 2
+
+defaults:
+  window_ms: 3000
+
+skills:
+  # ─────────────────────────────
+  # PRIMITIVES
+  # ─────────────────────────────
+
+  - name: tts.say
+    kind: primitive
+    action: tts
+    params:
+      text: "{{ctx.text | default:'OK'}}"
+
+  - name: gesture.greet
+    kind: primitive
+    action: gesture
+    params:
+      kind: "greet"
+
+  - name: nav.move_relative
+    kind: primitive
+    action: move_relative
+    params:
+      azimuth_deg: "{{ctx.azimuth_deg | default:0}}"
+      dist_m: "{{ctx.dist_m | default:0.6}}"
+
+  - name: nav.move_absolute
+    kind: primitive
+    action: move_absolute
+    params:
+      frame: "{{ctx.frame | default:'map'}}"
+      x: "{{ctx.x | default:0}}"
+      y: "{{ctx.y | default:0}}"
+      yaw: "{{ctx.yaw | default:0}}"
+
+  - name: db.query_top_beacons
+    kind: primitive
+    action: query_beacons
+    params:
+      top_n: "{{ctx.top_n | default:3}}"
+
+  # ─────────────────────────────
+  # COMPOSITES
+  # ─────────────────────────────
+
+  # Turn search: rotate incrementally left and right using nav.move_relative
+  # until either a presence is detected or the user interrupts (speech_final_any).
+  - name: base.turn_search
+    kind: composite
+    when:
+      any:
+        - exists: speech_keyword
+          within_ms: 5000
+        - exists: speech_final_any
+          within_ms: 5000
+    until:
+      any:
+        - exists: pose_present_precise
+          within_ms: 300
+        - exists: speech_final_any
+          within_ms: 1
+    steps:
+      - use: nav.move_relative
+        with: { azimuth_deg: 45.0, dist_m: 0.0 }
+        when: {}
+        until:
+          any:
+            - exists: pose_present_precise
+              within_ms: 300
+            - exists: speech_final_any
+              within_ms: 1
+      - use: nav.move_relative
+        with: { azimuth_deg: -90.0, dist_m: 0.0 }
+        when: {}
+        until:
+          any:
+            - exists: pose_present_precise
+              within_ms: 300
+            - exists: speech_final_any
+              within_ms: 1
+      - use: nav.move_relative
+        with: { azimuth_deg: 45.0, dist_m: 0.0 }
+        when: {}
+        until:
+          any:
+            - exists: pose_present_precise
+              within_ms: 300
+            - exists: speech_final_any
+              within_ms: 1
+
+  # Greet with presence; stop if user starts talking.
+  - name: greet.with_presence
+    kind: composite
+    when:
+      all:
+        - exists: pose_present_precise
+          within_ms: 2500
+        - exists: speech_keyword
+          within_ms: 2500
+    until:
+      exists: speech_final_any
+      within_ms: 1
+    steps:
+      - use: gesture.greet
+        when: {}
+        until:
+          exists: speech_final_any
+          within_ms: 1
+      - use: tts.say
+        with: { text: "Hi! How can I help?" }
+        when:
+          any:
+            - exists: speech_final_any
+              within_ms: 3000
+            - exists: speech_keyword
+              within_ms: 3000
+        until:
+          exists: speech_final_any
+          within_ms: 1
+
+  # Sense here: quick search, step closer, then announce.
+  - name: sense.here
+    kind: composite
+    when: {}
+    until:
+      exists: speech_final_any
+      within_ms: 1
+    steps:
+      - use: base.turn_search
+        when:
+          any:
+            - exists: pose_present_precise
+              within_ms: 3000
+            - exists: speech_final_any
+              within_ms: 3000
+        until:
+          any:
+            - exists: pose_present_precise
+              within_ms: 300
+            - exists: speech_final_any
+              within_ms: 1
+      - use: nav.move_relative
+        with: { dist_m: 0.6 }
+        when:
+          exists: pose_present_precise
+          within_ms: 3000
+        until:
+          exists: speech_final_any
+          within_ms: 1
+      - use: tts.say
+        with: { text: "Scanning this area." }
+        when:
+          any:
+            - exists: pose_present_precise
+              within_ms: 3000
+            - exists: speech_final_any
+              within_ms: 3000
+        until:
+          exists: speech_final_any
+          within_ms: 1
+
+  # Beacon report: query DB then speak summary.
+  - name: beacons.report_top3
+    kind: composite
+    when:
+      any:
+        - exists: speech_keyword
+          within_ms: 5000
+        - exists: speech_final_any
+          within_ms: 5000
+    until:
+      exists: speech_final_any
+      within_ms: 1
+    steps:
+      - use: db.query_top_beacons
+        with: { top_n: 3 }
+        when: {}
+        until:
+          exists: speech_final_any
+          within_ms: 1
+      - use: tts.say
+        with:
+          text: "{{ctx.last_query_beacons_speech | default:'Beacon report complete.'}}"
+        when: {}
+        until:
+          exists: speech_final_any
+          within_ms: 1
+
+  # Navigate absolute goal
+  - name: nav.go_absolute
+    kind: composite
+    when: {}
+    until:
+      exists: speech_final_any
+      within_ms: 1
+    steps:
+      - use: nav.move_absolute
+        when: {}
+        until:
+          exists: speech_final_any
+          within_ms: 1
+
+  # Approach speaker via DoA
+  - name: nav.approach_speaker
+    kind: composite
+    when:
+      exists: speech_keyword
+      within_ms: 4000
+    until:
+      exists: speech_final_any
+      within_ms: 1
+    steps:
+      - use: nav.move_relative
+        with: { dist_m: "{{ctx.dist_m | default:0.8}}" }
+        when: {}
+        until:
+          exists: speech_final_any
+          within_ms: 1
+
+  # Simple acknowledgment
+  - name: tts.ack
+    kind: composite
+    when: {}
+    until:
+      exists: speech_final_any
+      within_ms: 1
+    steps:
+      - use: tts.say
+        with: { text: "{{ctx.text | default:'Okay.'}}" }
+        when: {}
+        until:
+          exists: speech_final_any
+          within_ms: 1
+

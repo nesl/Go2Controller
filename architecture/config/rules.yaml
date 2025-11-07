@@ -29,3 +29,20 @@ rules:
     enabled: true
     type: composite
     expr: "exists('pose_present_precise', 2500) and exists('speech_keyword', 2500)"
+    
+    # --- Odometry deltas as basic events ---
+    - id: odom_rot_delta
+      enabled: true
+      task: odometry_tracking
+      output: odom
+      # fire on every >= 3° change; payload carries dyaw_deg
+      expr: "dyaw_deg >= 3"
+
+    - id: odom_dist_delta
+      enabled: true
+      task: odometry_tracking
+      output: odom
+      # fire on every >= 0.05 m change; payload carries dxy
+      expr: "dxy >= 0.05"
+
+
