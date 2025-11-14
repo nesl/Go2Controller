@@ -290,7 +290,7 @@ def _cond_pass(cond: dict, rules: RulesView, defaults_window_ms: int) -> bool:
 
 class SkillEngineV2:
     """Executes composite skills with step-level `when` using a RulesView."""
-    def __init__(self, bindings: Dict[str, callable], rules_view: RulesView, defaults_window_ms: int = 3000, logger=None):
+    def __init__(self, bindings: Dict[str, callable], rules_view: RulesView, defaults_window_ms: int = 3000, logger=None, event_cb=None):
         self.bindings = dict(bindings or {})
         self.rules = rules_view
         self.defaults_window_ms = int(defaults_window_ms)
@@ -298,7 +298,25 @@ class SkillEngineV2:
         self._loaded_path: Optional[str] = None
         self.logger = logger
         self._active: List[SkillInstance] = []   # ← active/armed skills live here
+        self.event_cb = event_cb   # ← NEW
         
+        
+    def _emit_event(self, kind: str, inst: SkillInstance, extra: dict | None = None):
+        if not self.event_cb:
+            return
+        payload = {
+            "kind": kind,
+            "skill": inst.name,
+            "step_idx": inst.step_idx,
+            "ctx": inst.ctx,
+            "started_ms": inst.started_ms,
+            "activated": inst.activated,
+            "done": inst.done,
+        }
+        if extra:
+            payload.update(extra)
+        self.event_cb(payload)
+
         
     def _exec_primitive_get_handle(self, action: str, params: dict, ctx: dict) -> StepHandle:
         """
@@ -432,6 +450,7 @@ class SkillEngineV2:
                     inst.activated = True
                     if self.logger:
                         self.logger.info(f"[SkillEngine] Activating '{inst.name}' (when=true)")
+                    self._emit_event("skill_started", inst, {})
                 else:
                     continue
 
@@ -440,6 +459,7 @@ class SkillEngineV2:
                 inst.done = True
                 if self.logger:
                     self.logger.info(f"[SkillEngine] Finished '{inst.name}' (composite until=true before step)")
+                self._emit_event("skill_finished", inst, {"reason": "composite_until"})
                 continue
 
             # Launch steps (one per tick at most)
@@ -471,6 +491,7 @@ class SkillEngineV2:
                 if self.logger:
                     self.logger.info(f"[SkillEngine] → Step {inst.step_idx} executing '{ref}'")
 
+                self._emit_event("step_started", inst, {"primitive": ref})
                 inst.handle = self._exec_primitive_get_handle(base['action'], params, inst.ctx)
 
                 # If primitive finished instantly (sync), advance now
@@ -484,7 +505,7 @@ class SkillEngineV2:
                 if self.logger:
                     self.logger.info(f"[SkillEngine] Finished '{inst.name}' (all steps)")
 
-
+                self._emit_event("skill_finished", inst, {"reason": "all_steps"})
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -569,7 +590,8 @@ class SkillsAgent(Node):
         self.declare_parameter("name_max_ang_speed", 1.0)
 
         # skills library config
-        self.declare_parameter("skills_path", "")
+        self.declare_parameter("skills_base_path", "")
+        self.declare_parameter("skills_composite_path", "")
         self.declare_parameter("skills_rescan_period_s", 1.0)
 
         self.declare_parameter("turn_speed_rad_s", 0.6)  # was 0.25
@@ -586,9 +608,12 @@ class SkillsAgent(Node):
         self.alpha           = float(self.get_parameter("smoothing_alpha").value)
         self.name_max_w      = float(self.get_parameter("name_max_ang_speed").value)
 
-        self.skills_path     = self.get_parameter("skills_path").get_parameter_value().string_value
+        # NEW: paths + mtimes
+        self.skills_base_path      = self.get_parameter("skills_base_path").get_parameter_value().string_value
+        self.skills_composite_path = self.get_parameter("skills_composite_path").get_parameter_value().string_value
         self._skills_rescan  = float(self.get_parameter("skills_rescan_period_s").value)
-        self._skills_mtime: Optional[float] = None
+        self._skills_base_mtime: Optional[float] = None
+        self._skills_comp_mtime: Optional[float] = None
 
         # ── ROS I/O for basic actions ─────────────────────────────────────────
         self.tts_pub     = self.create_publisher(StringMsg, "tts", 10)
@@ -615,7 +640,7 @@ class SkillsAgent(Node):
 
         # ── Rules + Engine + Orchestrator ─────────────────────────────────────
         self.rules_view = RulesViewROS(self, window_ms=3000)
-        self.skill_engine = SkillEngineV2(self._make_bindings_for_self(), self.rules_view, logger=self.get_logger())
+        self.skill_engine = SkillEngineV2(self._make_bindings_for_self(), self.rules_view, logger=self.get_logger(), event_cb=self._on_skill_event)
 
         self._load_skills_initial()
 
@@ -640,10 +665,105 @@ class SkillsAgent(Node):
         # Hot-reload timer
         #self.create_timer(self._skills_rescan, self._maybe_reload_skills)
 
+        self.skill_status_pub = self.create_publisher(StringMsg, "/skills/status", 10)
+
         self.get_logger().info("SkillsAgent ready.")
 
         # call engine.tick() ~10–20 Hz, lightweight
         self.create_timer(0.05, self._tick_engine)
+
+    # ───────────────────────────── Skills loading (base + composite) ─────────
+    
+    def _on_skill_event(self, event: dict):
+        """
+        Event from SkillEngineV2: publish to /skills/status as JSON.
+        Typical payload:
+          {
+            "kind": "skill_started"|"skill_finished"|"step_started",
+            "skill": "sense.here",
+            "step_idx": 0,
+            "reason": "all_steps" | "composite_until" | ...,
+            "ctx": {...},
+            "started_ms": ...,
+            "activated": true,
+            "done": true/false
+          }
+        """
+        try:
+            msg = StringMsg()
+            msg.data = json.dumps(event, ensure_ascii=False)
+            self.skill_status_pub.publish(msg)
+        except Exception as e:
+            self.get_logger().warn(f"Failed to publish skill status: {e}")
+
+    
+    def _read_yaml_if_exists(self, path: str) -> Optional[dict]:
+        if not path:
+            return None
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r") as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            self.get_logger().error(f"Failed to read skills YAML '{path}': {e}")
+            return None
+
+    def _merged_skills_doc(self) -> dict:
+        """
+        Merge base + composite libraries into a single doc for SkillEngineV2.
+        Base is treated as immutable; composite adds more skills on top.
+        """
+        base_doc = self._read_yaml_if_exists(self.skills_base_path) or {}
+        comp_doc = self._read_yaml_if_exists(self.skills_composite_path) or {}
+
+        merged = {
+            "version": base_doc.get("version", 2),
+            "defaults": base_doc.get("defaults", {"window_ms": 3000}),
+            "skills": []
+        }
+
+        # merge base skills
+        base_skills = base_doc.get("skills") or []
+        if isinstance(base_skills, list):
+            merged["skills"].extend(base_skills)
+
+        # merge composite skills (append)
+        comp_skills = comp_doc.get("skills") or []
+        if isinstance(comp_skills, list):
+            merged["skills"].extend(comp_skills)
+
+        return merged
+
+    def _load_skills_merged(self):
+        """
+        Load merged skills into the engine (base + composite).
+        If base path is missing or invalid, falls back to DEFAULT_SKILLS_V2.
+        """
+        if self.skills_base_path:
+            try:
+                merged = self._merged_skills_doc()
+                yaml_text = yaml.safe_dump(merged)
+                self.skill_engine.load_from_string(yaml_text)
+
+                # update mtimes
+                self._skills_base_mtime = os.path.getmtime(self.skills_base_path) if os.path.isfile(self.skills_base_path) else None
+                self._skills_comp_mtime = os.path.getmtime(self.skills_composite_path) if os.path.isfile(self.skills_composite_path) else None
+
+                self.get_logger().info(
+                    f"Loaded merged skills from base='{self.skills_base_path}', composite='{self.skills_composite_path}'"
+                )
+                return
+            except Exception as e:
+                self.get_logger().error(f"Failed to load merged skills: {e}")
+
+        # Fallback: no base file → inline default
+        self.skill_engine.load_from_string(DEFAULT_SKILLS_V2)
+        self._skills_base_mtime = None
+        self._skills_comp_mtime = None
+        self.get_logger().info("Loaded inline DEFAULT_SKILLS_V2 (no base skills file)")
+
+
 
     def _sum_rule_field_since(self, rule_id: str, field: str, since_ms: int) -> float:
         """Sum numeric payload[field] for hits of rule_id with ts >= since_ms."""
@@ -734,22 +854,16 @@ class SkillsAgent(Node):
     # Service: /skills/reload (Trigger)
     def _srv_reload_skills(self, req, resp):
         try:
-            if self.skills_path and os.path.isfile(self.skills_path):
-                self.skill_engine.load_from_path(self.skills_path)
-                self._skills_mtime = os.path.getmtime(self.skills_path)
-                msg = f"Reloaded skills from {self.skills_path}"
-            else:
-                self.skill_engine.load_from_string(DEFAULT_SKILLS_V2)
-                self._skills_mtime = None
-                msg = "Reloaded inline DEFAULT_SKILLS_V2"
+            self._load_skills_merged()
             resp.success = True
-            resp.message = msg
-            self.get_logger().info(msg)
+            resp.message = "Reloaded merged skills (base + composite)."
+            self.get_logger().info(resp.message)
         except Exception as e:
             resp.success = False
             resp.message = f"Reload failed: {e}"
             self.get_logger().error(resp.message)
         return resp
+
 
     # ───────────────────────────── Basic Actions ──────────────────────────────
     def say(self, text: str):
@@ -1269,30 +1383,32 @@ class SkillsAgent(Node):
 
     # ───────────────────────────── Hot Reload ─────────────────────────────────
     def _load_skills_initial(self):
-        if self.skills_path and os.path.isfile(self.skills_path):
-            try:
-                self.skill_engine.load_from_path(self.skills_path)
-                self._skills_mtime = os.path.getmtime(self.skills_path)
-                self.get_logger().info(f"Loaded skills from {self.skills_path}")
-                return
-            except Exception as e:
-                self.get_logger().error(f"Failed to load skills from {self.skills_path}: {e}")
-        self.skill_engine.load_from_string(DEFAULT_SKILLS_V2)
-        self._skills_mtime = None
-        self.get_logger().info("Loaded inline DEFAULT_SKILLS_V2")
-
+        self._load_skills_merged()
+        
     def _reload_skills_if_changed(self) -> bool:
-        if not (self.skills_path and os.path.isfile(self.skills_path)):
-            return False
+        """
+        Hot reload if either base or composite file changed on disk.
+        Base is *expected* to be immutable at runtime, but we still
+        allow reload if it did change for convenience.
+        """
+        changed = False
         try:
-            mtime = os.path.getmtime(self.skills_path)
-            if self._skills_mtime is None or mtime > self._skills_mtime:
-                self.skill_engine.load_from_path(self.skills_path)
-                self._skills_mtime = mtime
-                self.get_logger().info(f"Reloaded skills (mtime change): {self.skills_path}")
-                return True
+            if self.skills_base_path and os.path.isfile(self.skills_base_path):
+                m = os.path.getmtime(self.skills_base_path)
+                if self._skills_base_mtime is None or m > self._skills_base_mtime:
+                    changed = True
+
+            if self.skills_composite_path and os.path.isfile(self.skills_composite_path):
+                m = os.path.getmtime(self.skills_composite_path)
+                if self._skills_comp_mtime is None or m > self._skills_comp_mtime:
+                    changed = True
         except Exception as e:
             self.get_logger().warn(f"skills reload check failed: {e}")
+            return False
+
+        if changed:
+            self._load_skills_merged()
+            return True
         return False
 
     def _maybe_reload_skills(self):

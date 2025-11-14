@@ -10,7 +10,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/config', ['config/task_registry.yaml','config/rules.yaml', 'config/skills.yaml']),  # optional: drop your YAML here
+        ('share/' + package_name + '/config', ['config/task_registry.yaml','config/rules.yaml', 'config/skills.yaml', 'config/rules_init.yaml', 'config/skills_composite.yaml']),  # optional: drop your YAML here
         ('share/' + package_name + '/launch', ['launch/architecture.launch.py']),
     ],
     install_requires=['setuptools'],
@@ -27,7 +27,10 @@ setup(
     entry_points={
         'console_scripts': [
             'event_layer_node = architecture.event_layer_node:main',
-            'skills_node = architecture.skills_node:main'
+            'skills_node = architecture.skills_node:main',
+            'broker_node = architecture.broker_node:main',
+            'planner_node = architecture.planner_node:main',
+            'orchestrator_node = architecture.orchestrator_node:main'
         ],
     },
 )

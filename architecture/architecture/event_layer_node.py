@@ -19,6 +19,8 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion
 import math
 
+from bt_msgs.msg import BtReading  # NEW
+
 # --- add this helper near the top ---
 def _norm_ros_type(s: str) -> str:
     if not s: return s
@@ -32,6 +34,8 @@ MSG_CLASS = {
     "vision_msgs/msg/Detection2DArray": Detection2DArray,
     "nav_msgs/Odometry": Odometry,
     "nav_msgs/msg/Odometry": Odometry,
+    "bt_msgs/BtReading": BtReading,                     # NEW
+    "bt_msgs/msg/BtReading": BtReading,                 # NEW
 }
 
 def quat_to_yaw(q: Quaternion) -> float:
@@ -88,11 +92,15 @@ class EventLayerNode(Node):
         self.declare_parameter('rules_path', '')
         self.declare_parameter('rescan_period_s', 2.0)
         self.declare_parameter('enabled', True)
+        self.declare_parameter('rules_init_path', '')
+
 
         self.registry_path = self.get_parameter('registry_path').get_parameter_value().string_value
         self.rules_path    = self.get_parameter('rules_path').get_parameter_value().string_value
         self.rescan_period = float(self.get_parameter('rescan_period_s').value)
         self.enabled       = bool(self.get_parameter('enabled').value)
+        self.rules_init_path = self.get_parameter('rules_init_path').get_parameter_value().string_value
+
 
         if not self.registry_path or not self.rules_path:
             self.get_logger().fatal("Set both registry_path and rules_path.")
@@ -184,17 +192,44 @@ class EventLayerNode(Node):
 
     # ---------- rules ----------
     def _load_rules(self):
-        doc = load_yaml(self.rules_path)
-        defs = doc.get("defaults", {})
+        """
+        Load base rules from rules_init_path (read-only) and dynamic rules
+        from rules_path (writable). Both are merged into a single rules list.
+        """
+        base_doc = {}
+        if self.rules_init_path:
+            try:
+                base_doc = load_yaml(self.rules_init_path) or {}
+            except Exception as e:
+                self.get_logger().error(f"Failed to load rules_init: {e}")
+                base_doc = {}
+
+        dyn_doc = {}
+        try:
+            dyn_doc = load_yaml(self.rules_path) or {}
+        except Exception as e:
+            self.get_logger().warn(f"Failed to load dynamic rules: {e}")
+            dyn_doc = {}
+
+        # defaults: prefer base, but allow dynamic to override if present
+        defs_base = base_doc.get("defaults", {})
+        defs_dyn  = dyn_doc.get("defaults", {})
+        defs = dict(defs_base)
+        defs.update(defs_dyn)
+
         self.default_window_ms = int(defs.get("window_ms", 3000))
         self.default_comp_ms   = int(defs.get("composite_window_ms", 2000))
-        self.rules_all = doc.get("rules", [])
+
+        base_rules = base_doc.get("rules", []) or []
+        dyn_rules  = dyn_doc.get("rules", []) or []
+
+        self.rules_all = list(base_rules) + list(dyn_rules)
         self.rules_enabled = [r for r in self.rules_all if r.get("enabled", True)]
 
         # Build desired topics from basic rules (type not composite)
         self.desired_topics = {}
         for r in self.rules_enabled:
-            if r.get("type") == "composite":  # composites don't bind to topics
+            if r.get("type") == "composite":
                 continue
             task = r.get("task"); out_id = r.get("output")
             tdoc = self.tasks_doc.get(task, {})
@@ -403,6 +438,10 @@ class EventLayerNode(Node):
             return self._cb_text_partial
         if topic in ("/audio/stt_text",):
             return self._cb_text_final
+        if msgstr == "bt_msgs/BtReading":                   # NEW
+            return self._cb_bt_reading                      # NEW
+        if topic == "/skills/status":              # NEW
+            return self._cb_skill_status          # NEW
         # default String
         return self._cb_text_partial
 
@@ -458,7 +497,8 @@ class EventLayerNode(Node):
     def _cb_detection(self, msg: Detection2DArray):
         ts = self._now()
         for d in msg.detections:
-            if not d.results: continue
+            if not d.results: 
+                continue
             hyp = d.results[0].hypothesis
             cls = str(hyp.class_id)
             score = float(hyp.score)
@@ -468,8 +508,33 @@ class EventLayerNode(Node):
                 "w":  float(d.bbox.size_x),
                 "h":  float(d.bbox.size_y),
             }
-            ctx = {"cls": cls, "score": score, "bbox": bbox, "ts": ts}
+
+            # NEW: extract 3D map coords if detector provided them
+            map_x = map_y = map_z = None
+            try:
+                pose = d.results[0].pose.pose.position
+                map_x, map_y, map_z = float(pose.x), float(pose.y), float(pose.z)
+            except Exception:
+                pass
+
+            frame_id = getattr(d, "header", None).frame_id if hasattr(d, "header") and d.header else ""
+
+            ctx = {
+                "cls": cls,
+                "score": score,
+                "bbox": bbox,
+                "map_x": map_x, "map_y": map_y, "map_z": map_z,  # may be None
+                "frame_id": frame_id,                             # typically your target_frame (map)
+                "ts": ts
+            }
+
+            # Existing rule path for generic detections:
             self._eval_for_rules("object_detection", "detection.2d", ctx)
+
+            # NEW: human-3D convenience event (fires only when we have map coords)
+            if cls == "person" and map_x is not None and map_y is not None:
+                self._eval_for_rules("object_detection", "human3d", ctx)
+
 
     def _cb_odom(self, msg: Odometry):
         ts = self._now()
@@ -539,6 +604,57 @@ class EventLayerNode(Node):
             text = (msg.data or "").strip()
         ctx = {"text": text, "ts": ts}
         self._eval_for_rules("audio_asr", "text.final", ctx)
+
+    def _cb_bt_reading(self, msg: BtReading):
+        """
+        Build a lightweight context from BtReading and evaluate basic rules.
+        No DB, TF, or server lookups here — this layer only raises events.
+        """
+        ts = self._now()
+        # Normalize fields with safe fallbacks
+        ctx = {
+            "rssi": int(msg.rssi),
+            "device_id": (msg.device_id or "").strip(),
+            "object_id": (msg.device_name or "").strip(),     # often your CNode###
+            "phone_id": (msg.scanner_id or "Robot").strip(),
+            "frame_id": (msg.frame_id or "").strip(),
+            "ts": ts,
+        }
+        # Optional: expose simple strength bucket for rules (e.g., -60 = strong)
+        try:
+            ctx["strength_bucket"] = "strong" if msg.rssi >= -65 else ("medium" if msg.rssi >= -85 else "weak")
+        except Exception:
+            ctx["strength_bucket"] = "unknown"
+
+        # Evaluate rules for this task/output
+        self._eval_for_rules("bt_proximity", "bt.reading", ctx)
+
+
+    def _cb_skill_status(self, msg: StringMsg):
+        ts = self._now()
+        try:
+            obj = json.loads(msg.data)
+        except Exception:
+            self.get_logger().warn(f"Bad JSON on /skills/status: {msg.data}")
+            return
+
+        # Normalize context
+        ctx = {
+            "kind": obj.get("kind", ""),
+            "skill": obj.get("skill", ""),
+            "step_idx": int(obj.get("step_idx", 0)),
+            "reason": obj.get("reason", ""),
+            "activated": bool(obj.get("activated", False)),
+            "done": bool(obj.get("done", False)),
+            "ts": ts,
+        }
+        # you can pass ctx["ctx"] through if you really want:
+        inner_ctx = obj.get("ctx") or {}
+        if isinstance(inner_ctx, dict):
+            ctx["inner_ctx"] = inner_ctx
+
+        self._eval_for_rules("skill_status", "skill.status", ctx)
+
 
     # ---------- composites ----------
     def _tick(self):

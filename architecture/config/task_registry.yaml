@@ -168,3 +168,28 @@ tasks:
         parameters:
           stt_model_size: { default: "medium", enum: ["tiny","base","small","medium","large-v3"] }
           stt_chunk_s: { default: 30.0 }
+          
+
+  bt_proximity:
+    description: "Raw Bluetooth RSSI readings for objects (no TF/DB)."
+    node: ""   # no enable/disable service required for the event layer
+    outputs:
+      - id: "bt.reading"
+        ros:
+          topic: "/bt/readings"
+          msg: "bt_msgs/BtReading"
+        # Available fields in rule context (from the event layer):
+        # rssi:int, object_id:str, device_id:str, phone_id:str, frame_id:str, strength_bucket:str, ts:float
+        
+  skill_status:
+    description: "Skill execution status and completion events."
+    node: ""   # no enable/disable; published directly by SkillsAgent
+    outputs:
+      - id: "skill.status"
+        ros:
+          topic: "/skills/status"
+          msg: "std_msgs/String"
+        # schema_hint (conceptual):
+        # '{"skill":str,"status":str,"reason":str,"step_idx":int,"ctx":{...}}'
+
+
