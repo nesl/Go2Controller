@@ -368,6 +368,7 @@ class EventLayerNode(Node):
             self._reconcile_node_services()
             resp.success = True
             resp.message = "Rules reloaded"
+            self.get_logger().info(f"Rules reloaded")
         except Exception as e:
             resp.success = False
             resp.message = f"Reload failed: {e}"
@@ -382,7 +383,14 @@ class EventLayerNode(Node):
 
     # ---------- subscriptions ----------
     def _drop_all_subs(self):
+        for topic, sub in self._subs.items():
+            try:
+                self.destroy_subscription(sub)
+                self.get_logger().info(f"Dropped subscription on {topic}")
+            except Exception as e:
+                self.get_logger().warn(f"Error destroying subscription {topic}: {e}")
         self._subs.clear()
+
 
     def _resubscribe_if_needed(self):
         live = dict(self.get_topic_names_and_types())
@@ -463,35 +471,72 @@ class EventLayerNode(Node):
         })))
 
     def _eval_for_rules(self, task: str, output: str, ctx: dict):
-        """Evaluate all enabled basic rules that target (task, output)."""
         if not self.enabled:
             return
-        # helpers exposed to expr
+
         local_funcs = {
             "exists": lambda rid, ms: self._exists(str(rid), int(ms)),
             "now": self._now,
         }
         safe = SafeEval(extra_funcs={**local_funcs, "re_search": _re_search})
+
         for r in self.rules_enabled:
             if r.get("type") == "composite":
                 continue
             if r.get("task") != task or r.get("output") != output:
                 continue
+
             expr = r.get("expr", "")
             try:
                 ok = bool(safe.eval(expr, ctx))
             except Exception as e:
-                self.get_logger().warn(f"Rule {r.get('id')} expr error: {e}, context {ctx}, task {task}, output {output}")
+                self.get_logger().warn(
+                    f"Rule {r.get('id')} expr error: {e}, context {ctx}, task {task}, output {output}"
+                )
                 continue
-                
-            prev = self._rule_state.get(r["id"], False)
-            if ok and not prev:
-                payload = dict(ctx)  # include evaluated context (small)
-                payload["rule_id"] = r["id"]
-                self._emit_hit(r["id"], payload)
-                self._publish_basic(r["id"], payload)
-                self._last_emit_ts[r["id"]] = self._now()
-            self._rule_state[r["id"]] = ok
+
+            rid = r["id"]
+            prev = self._rule_state.get(rid, False)
+
+            mode = r.get("mode", "edge")          # "edge" or "level"
+            emit_off = bool(r.get("emit_off", False))
+
+            fire = False
+            active_flag = True  # True = ON event, False = OFF event
+
+            if mode == "edge":
+                if ok and not prev:
+                    # rising edge → ON event
+                    fire = True
+                    active_flag = True
+                elif emit_off and (not ok and prev):
+                    # falling edge → OFF event
+                    fire = True
+                    active_flag = False
+
+            elif mode == "level":
+                if ok:
+                    fire = True
+                    active_flag = True
+
+            else:
+                # unknown mode → default to edge rising
+                if ok and not prev:
+                    fire = True
+                    active_flag = True
+
+            # update state AFTER computing transitions
+            self._rule_state[rid] = ok
+
+            if fire:
+                payload = dict(ctx)
+                payload["rule_id"] = rid
+                payload["active"] = active_flag   # <--- NEW flag ON/OFF
+
+                self._emit_hit(rid, payload)
+                self._publish_basic(rid, payload)
+                self._last_emit_ts[rid] = self._now()
+
             
     # --- detection.2d
     def _cb_detection(self, msg: Detection2DArray):

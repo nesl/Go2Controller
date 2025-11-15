@@ -185,6 +185,7 @@ class BrokerNode(Node):
 
     def _publish_context_capsule(self):
         cap = self._context_capsule()
+        cap["schema_card"] = self._schema_card()
         self.pub_capsule.publish(StringMsg(data=json.dumps(cap)))
 
 
@@ -438,18 +439,14 @@ class BrokerNode(Node):
 
         # compact trace entry
         trace_entry = {"rule": rule, "ts": ts}
-        for k in ("node_id","object_id","area","bin","sensed_by"):
-            if k in data: trace_entry[k] = data[k]
+        if isinstance(data, dict):
+            trace_entry.update(data)
         self._event_trace.append(trace_entry)
 
         # trigger state (used by LLM prompt)
         trig_type = self.trigger_map.get(rule)
         if trig_type:
-            hints = {}
-            if "node_id" in data: hints["object_id"] = data["node_id"]
-            if "object_id" in data: hints["object_id"] = data["object_id"]
-            if "area" in data: hints["area"] = data["area"]
-            self._current_trigger = {"type": trig_type, "hints": hints, "ts": ts}
+            self._current_trigger = {"type": trig_type, "trigger_event": o, "ts": ts}
 
         # ingestion
         if rule == self.bt_rule_id:
@@ -485,12 +482,12 @@ class BrokerNode(Node):
 
         # map composite rule id → trigger (use the same trigger_map param)
         trig_type = self.trigger_map.get(rid, "composite_hit")
-        self._current_trigger = {"type": trig_type, "hints": {}, "ts": ts, "composite": True, "rid": rid}
+        self._current_trigger = {"type": trig_type, "ts": ts, "composite": True, "rid": rid}
 
         # (optional) proactive run
-        if trig_type in ("composite_hit","finish_or_fail","idle","human_command","new_object","presence"):
+        if trig_type:
             try:
-            
+                self._current_trigger["trigger_event"] = o
                 self._publish_context_capsule()
                 
                 pack = self._llm_sql_to_facts(proactive=True)
@@ -664,8 +661,7 @@ class BrokerNode(Node):
 
     def _exec_sql_safely(self, sql: str, params: dict, max_rows: int, max_bytes: int, timeout_ms: int):
         con = self.conn
-        try: con.execute("PRAGMA query_only=ON;")
-        except Exception: pass
+
 
         aborted = {"v": False}
         start = time.time()

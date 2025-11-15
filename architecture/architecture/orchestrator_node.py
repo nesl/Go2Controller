@@ -133,10 +133,10 @@ class OrchestratorNode(Node):
         self.declare_parameter("rules_init_path", "")
         self.declare_parameter("rules_path", "")
         self.declare_parameter("registry_path", "")
-        self.declare_parameter("dynamic_prefix", "plan.")
+        self.declare_parameter("dynamic_prefix", "")
         self.declare_parameter("max_dynamic_skills", 10)
         self.declare_parameter("max_dynamic_rules", 20)
-        self.declare_parameter("model", "gpt-5-nano")
+        self.declare_parameter("model", "gpt-5-mini")
         self.declare_parameter("temperature", 0.1)
 
         self.skills_base_path: str = (
@@ -163,6 +163,10 @@ class OrchestratorNode(Node):
             self.get_parameter("registry_path")
             .get_parameter_value()
             .string_value
+        )
+
+        self.cancel_skills_client = self.create_client(
+            Trigger, "/skills/cancel_all"
         )
 
         self.dynamic_prefix: str = (
@@ -296,6 +300,10 @@ class OrchestratorNode(Node):
         Keep at most max_dynamic_skills entries whose names start with dynamic_prefix.
         Only applied to the *composite* file.
         """
+        
+        if not self.dynamic_prefix:
+            return skills
+
         dynamic_indices = [
             i
             for i, s in enumerate(skills)
@@ -370,6 +378,11 @@ class OrchestratorNode(Node):
         Keep at most max_dynamic_rules entries whose ids start with dynamic_prefix.
         Only applied to the *dynamic* rules file.
         """
+        
+        if not self.dynamic_prefix:
+            return rules
+
+        
         dynamic_indices = [
             i
             for i, r in enumerate(rules)
@@ -618,8 +631,9 @@ class OrchestratorNode(Node):
 
             for c in new_composites:
                 name = str(c.get("name", ""))
-                if not name.startswith(self.dynamic_prefix):
-                    c["name"] = f"{self.dynamic_prefix}{name}"
+                #if not name.startswith(self.dynamic_prefix):
+                #    c["name"] = f"{self.dynamic_prefix}{name}"
+                c["name"] = name
                 skills.append(c)
                 self.get_logger().info(
                     f"orchestrator: planning to append composite '{c['name']}'"
@@ -679,8 +693,8 @@ class OrchestratorNode(Node):
 
     def _reload_all_and_execute(self, to_execute: List[Dict[str, Any]]):
         """
-        Fire reloads for event_layer rules and skills, then execute.
-        We don't strictly need to wait for both to succeed to arm skills.
+        Reload rules + skills, then cancel any currently active skills
+        and finally execute the new ones from this plan.
         """
 
         # fire-and-forget rules reload
@@ -688,32 +702,61 @@ class OrchestratorNode(Node):
             req_r = Trigger.Request()
             _ = self.reload_rules_client.call_async(req_r)
 
-        def _after_skills_reload(_future):
+        def _after_cancel(_future_cancel):
+            # ignore cancel result errors for now, just log
             try:
-                res = _future.result()
+                res = _future_cancel.result()
                 if not res.success:
-                    self.get_logger().warn(
-                        f"/skills/reload failed: {res.message}"
-                    )
+                    self.get_logger().warn(f"/skills/cancel_all failed: {res.message}")
                 else:
-                    self.get_logger().info(
-                        f"/skills/reload ok: {res.message}"
-                    )
+                    self.get_logger().info(f"/skills/cancel_all ok: {res.message}")
             except Exception as e:
-                self.get_logger().warn(
-                    f"/skills/reload call error: {e}"
-                )
+                self.get_logger().warn(f"/skills/cancel_all call error: {e}")
+
+            # now arm the new skills
             self._execute_skills(to_execute)
 
+        def _after_skills_reload(_future_reload):
+            try:
+                res = _future_reload.result()
+                if not res.success:
+                    self.get_logger().warn(f"/skills/reload failed: {res.message}")
+                else:
+                    self.get_logger().info(f"/skills/reload ok: {res.message}")
+            except Exception as e:
+                self.get_logger().warn(f"/skills/reload call error: {e}")
+
+            # after reload, cancel all active skills, then execute new plan
+            if self.cancel_skills_client.wait_for_service(timeout_sec=1.0):
+                req_c = Trigger.Request()
+                future_c = self.cancel_skills_client.call_async(req_c)
+                future_c.add_done_callback(_after_cancel)
+            else:
+                self.get_logger().warn(
+                    "/skills/cancel_all not available; executing skills without cancel."
+                )
+                self._execute_skills(to_execute)
+
+        # trigger skills reload, then chain cancel → execute
         if self.reload_skills_client.wait_for_service(timeout_sec=2.0):
             req_s = Trigger.Request()
-            future = self.reload_skills_client.call_async(req_s)
-            future.add_done_callback(_after_skills_reload)
+            future_s = self.reload_skills_client.call_async(req_s)
+            future_s.add_done_callback(_after_skills_reload)
         else:
             self.get_logger().warn(
                 "/skills/reload not available; executing skills without reload."
             )
-            self._execute_skills(to_execute)
+            # even if reload is missing, still try to cancel
+            if self.cancel_skills_client.wait_for_service(timeout_sec=1.0):
+                req_c = Trigger.Request()
+                future_c = self.cancel_skills_client.call_async(req_c)
+                future_c.add_done_callback(_after_cancel)
+            else:
+                self.get_logger().warn(
+                    "/skills/cancel_all not available; executing skills without cancel."
+                )
+                self._execute_skills(to_execute)
+
 
     def _execute_skills(self, to_execute: List[Dict[str, Any]]):
         for entry in to_execute:

@@ -209,42 +209,60 @@ class RulesView:
         return cand[0]['payload']
 
 def _render_scalar(expr: str, ctx: dict, rules: RulesView, defaults_window_ms: int) -> str:
-    # Supports:
-    #   {{rule.<id>.<field>}}   → payload binding
-    #   {{ctx.<path>}}          → explicit ctx fields
-    #   {{something | default:VALUE}} with rule.* or ctx.*
-    if expr.startswith('rule.'):
-        parts = expr.split('.')
-        if len(parts) >= 3:
-            rid = parts[1]
-            field = '.'.join(parts[2:])
-            payload = rules.latest_payload(rid, defaults_window_ms)
-            if payload is None:
-                return ''
-            val = _get_path(payload, field) if field else payload
-            return '' if val is None else str(val)
-        return ''
-    if expr.startswith('ctx.'):
-        val = _get_path({'ctx': ctx}, expr)
-        return '' if val is None else str(val)
-    if '| default:' in expr:
-        left, default_str = expr.split('| default:', 1)
+    # 1) Handle "| default:" first
+    if "| default:" in expr:
+        left, default_str = expr.split("| default:", 1)
         left = left.strip()
         default_str = default_str.strip()
+
+        # parse default value: allow numbers/booleans/etc via JSON, else treat as string
         try:
             default_val = json.loads(default_str)
         except Exception:
-            default_val = default_str.strip('\'"')
-        if left.startswith('rule.'):
-            parts = left.split('.'); rid = parts[1]; field = '.'.join(parts[2:])
-            payload = rules.latest_payload(rid, defaults_window_ms)
-            if payload is not None:
-                val = _get_path(payload, field)
-                if val is not None: return str(val)
+            default_val = default_str.strip("'\"")
+
+        # rule.<id>.<field>
+        if left.startswith("rule."):
+            parts = left.split(".")
+            if len(parts) >= 3:
+                rid = parts[1]
+                field = ".".join(parts[2:])
+                payload = rules.latest_payload(rid, defaults_window_ms)
+                if payload is not None:
+                    val = _get_path(payload, field)
+                    if val is not None:
+                        return str(val)
             return str(default_val)
-        val = _get_path({'ctx': ctx}, left)
+
+        # ctx.<path>
+        if left.startswith("ctx."):
+            val = _get_path({"ctx": ctx}, left)
+            return str(val if val is not None else default_val)
+
+        # bare key → interpret as ctx.<key>
+        val = _get_path({"ctx": ctx}, f"ctx.{left}")
         return str(val if val is not None else default_val)
-    return ''  # unknown reference
+
+    # 2) Legacy simple forms (no default)
+    if expr.startswith("rule."):
+        parts = expr.split(".")
+        if len(parts) >= 3:
+            rid = parts[1]
+            field = ".".join(parts[2:])
+            payload = rules.latest_payload(rid, defaults_window_ms)
+            if payload is None:
+                return ""
+            val = _get_path(payload, field) if field else payload
+            return "" if val is None else str(val)
+        return ""
+
+    if expr.startswith("ctx."):
+        val = _get_path({"ctx": ctx}, expr)
+        return "" if val is None else str(val)
+
+    # Unknown reference → empty
+    return ""
+
 
 def _render_any(value: Any, ctx: dict, rules: RulesView, defaults_window_ms: int) -> Any:
     if not isinstance(value, str):
@@ -275,9 +293,9 @@ def _render_params(params: dict, ctx: dict, rules: RulesView, defaults_window_ms
                 pass
     return out
 
-def _cond_pass(cond: dict, rules: RulesView, defaults_window_ms: int) -> bool:
+def _cond_pass(cond: dict, rules: RulesView, defaults_window_ms: int, empty_means=True) -> bool:
     if not cond:
-        return True
+        return empty_means
     if 'exists' in cond:
         rid = cond.get('exists')
         win = int(cond.get('within_ms') or defaults_window_ms)
@@ -414,7 +432,47 @@ class SkillEngineV2:
 
     def active_count(self) -> int:
         return sum(1 for i in self._active if not i.done)
+        
+    def _start_child_composite(self, parent_inst: SkillInstance, step: dict, composite: dict) -> StepHandle:
+        """
+        Treat a composite referenced in `use:` as a nested sub-skill.
+        We:
+          - build a child ctx from parent ctx + rendered step.with
+          - create a child SkillInstance and add it to _active
+          - return a StepHandle that becomes done() when the child finishes
+        """
+        ref_name = composite["name"]
 
+        # Render step.with into a ctx overlay, like params for primitives
+        with_overrides = _render_params(
+            step.get("with") or {},
+            parent_inst.ctx,
+            self.rules,
+            self.defaults_window_ms,
+        )
+        child_ctx = dict(parent_inst.ctx)
+        child_ctx.update(with_overrides)
+
+        child = SkillInstance(
+            name=ref_name,
+            ctx=child_ctx,
+            started_ms=int(time.time() * 1000),
+        )
+        self._active.append(child)
+
+        # Build a StepHandle that proxies to the child's done()
+        def _cancel_child():
+            child.done = True
+
+        h = StepHandle(cancel_fn=_cancel_child)
+
+        # override done() to reflect child.done
+        def _done_proxy(self_handle=h, child_inst=child):
+            return child_inst.done
+
+        h.done = _done_proxy  # monkey-patch method on this instance
+        return h
+        
     def tick(self):
         """Advance armed skills. Call this on a timer and/or on every /events/* message."""
         for inst in list(self._active):
@@ -429,7 +487,7 @@ class SkillEngineV2:
             # If a primitive is running, check completion or stop-early
             if inst.handle is not None:
                 # stop early if composite until is true
-                if _cond_pass(comp_until, self.rules, self.defaults_window_ms):
+                if _cond_pass(comp_until, self.rules, self.defaults_window_ms, empty_means=False):
                     if not inst.handle.done():
                         inst.handle.cancel()
                     inst.done = True
@@ -455,7 +513,7 @@ class SkillEngineV2:
                     continue
 
             # Composite-level until gate before starting a new step
-            if _cond_pass(comp_until, self.rules, self.defaults_window_ms):
+            if _cond_pass(comp_until, self.rules, self.defaults_window_ms, empty_means=False):
                 inst.done = True
                 if self.logger:
                     self.logger.info(f"[SkillEngine] Finished '{inst.name}' (composite until=true before step)")
@@ -469,7 +527,7 @@ class SkillEngineV2:
                 step_until = step.get('until') or {}
 
                 # step-level stop-before-start
-                if _cond_pass(step_until, self.rules, self.defaults_window_ms):
+                if _cond_pass(step_until, self.rules, self.defaults_window_ms, empty_means=False):
                     inst.done = True
                     if self.logger:
                         self.logger.info(f"[SkillEngine] Finished '{inst.name}' (step until=true pre-start idx={inst.step_idx})")
@@ -480,19 +538,39 @@ class SkillEngineV2:
                     continue
 
                 # launch the primitive and keep its handle
-                ref  = step.get('use')
+                ref = step.get("use")
                 base = self.registry.get(ref)
-                if not base or base.get('kind') != 'primitive':
-                    raise KeyError(f"Bad step '{ref}'")
+                if not base:
+                    raise KeyError(f"Unknown step target '{ref}'")
 
-                params = dict(base.get('params') or {})
-                params.update(step.get('with') or {})
+                kind = base.get("kind")
 
-                if self.logger:
-                    self.logger.info(f"[SkillEngine] → Step {inst.step_idx} executing '{ref}'")
+                if kind == "primitive":
+                    # existing behavior
+                    params = dict(base.get("params") or {})
+                    params.update(step.get("with") or {})
 
-                self._emit_event("step_started", inst, {"primitive": ref})
-                inst.handle = self._exec_primitive_get_handle(base['action'], params, inst.ctx)
+                    if self.logger:
+                        self.logger.info(f"[SkillEngine] → Step {inst.step_idx} executing primitive '{ref}'")
+
+                    self._emit_event("step_started", inst, {"primitive": ref})
+                    inst.handle = self._exec_primitive_get_handle(base["action"], params, inst.ctx)
+
+                elif kind == "composite":
+                    # NEW: nested composite behavior
+                    if self.logger:
+                        self.logger.info(f"[SkillEngine] → Step {inst.step_idx} spawning composite '{ref}'")
+
+                    self._emit_event("step_started", inst, {"composite": ref})
+                    # attach a handle that tracks the nested skill
+                    # (base must carry its own name for helper; if not, pass ref directly)
+                    base_with_name = dict(base)
+                    base_with_name["name"] = ref
+                    inst.handle = self._start_child_composite(inst, step, base_with_name)
+
+                else:
+                    raise KeyError(f"Bad step '{ref}' (unknown kind '{kind}')")
+
 
                 # If primitive finished instantly (sync), advance now
                 if inst.handle is not None and inst.handle.done():
@@ -507,7 +585,7 @@ class SkillEngineV2:
 
                 self._emit_event("skill_finished", inst, {"reason": "all_steps"})
 
-
+        self._active = [i for i in self._active if not i.done]
 # ───────────────────────────────────────────────────────────────────────────────
 #                          ROS RulesView + Orchestrator
 # ───────────────────────────────────────────────────────────────────────────────
@@ -662,6 +740,9 @@ class SkillsAgent(Node):
         self.create_service(Trigger, "/skills/plan", self._srv_plan)
         self.create_service(Trigger, "/skills/run_all_eligible", self._srv_run_all_eligible)
 
+        self.create_service(Trigger, "/skills/cancel_all", self._srv_cancel_all)
+
+
         # Hot-reload timer
         #self.create_timer(self._skills_rescan, self._maybe_reload_skills)
 
@@ -671,6 +752,32 @@ class SkillsAgent(Node):
 
         # call engine.tick() ~10–20 Hz, lightweight
         self.create_timer(0.05, self._tick_engine)
+
+    def _srv_cancel_all(self, req, resp):
+        """
+        Cancel all active skills: stop their current primitive (if any)
+        and mark them done / prune them from the active list.
+        """
+        canceled = 0
+        for inst in list(self.skill_engine._active):
+            if not inst.done:
+                # cancel running primitive if there is one
+                if inst.handle is not None and not inst.handle.done():
+                    try:
+                        inst.handle.cancel()
+                    except Exception as e:
+                        self.get_logger().warn(f"cancel_all: handle cancel error: {e}")
+                inst.done = True
+                canceled += 1
+
+        # prune finished instances
+        self.skill_engine._active = [i for i in self.skill_engine._active if not i.done]
+
+        resp.success = True
+        resp.message = f"Canceled {canceled} active skills."
+        self.get_logger().info(resp.message)
+        return resp
+
 
     # ───────────────────────────── Skills loading (base + composite) ─────────
     

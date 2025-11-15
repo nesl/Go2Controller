@@ -213,30 +213,18 @@ skills:
     kind: composite
     when:
       exists: speech_keyword
-      within_ms: 4000
-    until:
-      exists: speech_final_any
-      within_ms: 1
     steps:
       - use: nav.move_relative
         with: { dist_m: "{{ctx.dist_m | default:0.8}}" }
         when: {}
-        until:
-          exists: speech_final_any
-          within_ms: 1
+
 
   # Simple acknowledgment
   - name: tts.ack
     kind: composite
     when: {}
-    until:
-      exists: speech_final_any
-      within_ms: 1
     steps:
       - use: tts.say
         with: { text: "{{ctx.text | default:'Okay.'}}" }
         when: {}
-        until:
-          exists: speech_final_any
-          within_ms: 1
 

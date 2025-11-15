@@ -69,9 +69,11 @@ SYSTEM_PLAN = (
   "You are the HIGH-LEVEL PLANNER for a mobile robot collaborating with two humans across areas A/B.\n"
   "Objective: find all Bluetooth-tagged objects and place each into the correct bin (clean vs contaminated).\n"
   "Inputs:\n"
-  " • ContextCapsule (trigger, budgets, recent event trace, phase/goals)\n"
+  " • ContextCapsule (trigger, budgets, recent event trace, phase/goals, allowed DB objects and example rows the broker can query)\n"
   " • Profiles (digital-twin summaries for Human A / Human B)\n"
   " • Facts (compact SQL-derived tables from the broker)\n\n"
+  "When you mark something as OPEN in Evidence & Uncertainty, phrase it in terms of information\n"
+  "that could be obtained by SQL SELECTs over the objects in the SchemaCard, not arbitrary world knowledge.\n"
   "OUTPUT: STRICT JSON ONLY matching the schema.\n"
   "Inside plan_doc, write a short narrative (≤ 220 words) using THIS fixed section template and rules:\n"
   "  Situation: <what just happened, who’s present, basket state, backlog highlights>.\n"
@@ -82,7 +84,7 @@ SYSTEM_PLAN = (
   "  Hard Constraints: <capacity/bin access/time/safety>.\n"
   "Refer to entities with canonical tags inline, e.g., object_id=CNode12, area=A|B|H1_zone|H2_zone, bin=clean|contaminated.\n"
   "Keep it groundable, do not invent IDs; if unknown, mark OPEN.\n"
-  "Be proactive when idle; confirm when uncertainty is high; minimize travel; resolve label disagreements.\n"
+  "Be proactive when idle; confirm when uncertainty is high; minimize travel; resolve label disagreements. Check what the trigger event was to ground your decisions.\n"
 )
 
 EX_USER_PLAN = {
@@ -113,8 +115,14 @@ EX_ASSISTANT_PLAN = {
 SYSTEM_NEEDS = (
     "Given the same inputs, list the most critical OPEN information needs that, if answered, "
     "would materially improve the plan quality or safety. Keep the list small and specific. "
+    "You are given a SchemaCard describing the ONLY tables/views the broker can query. "
+    "Each information need MUST correspond to something that could reasonably be answered "
+    "by SELECT queries over those objects (for example, asking for rows/fields that might "
+    "exist there). Do NOT ask for information that cannot be derived from that schema "
+    "(e.g., physical facts not represented in any table). "
     "Output STRICT JSON ONLY matching the provided schema."
 )
+
 
 _TAG_RE = re.compile(r"(object_id=\w+|area=\w+|bin=(?:clean|contaminated)|OPEN:[^.\n]+)")
 def _extract_hints(plan_doc: str) -> dict:
@@ -139,7 +147,7 @@ class PlannerNode(Node):
         super().__init__("planner_node")
 
         # --- Parameters ---
-        self.declare_parameter("model", "gpt-5-nano")
+        self.declare_parameter("model", "gpt-5-mini")
         self.declare_parameter("temperature_plan", 0.2)
         self.declare_parameter("temperature_needs", 0.2)
         # Budgets for what we pass to the LLM (keep tokens in check)
@@ -281,11 +289,15 @@ class PlannerNode(Node):
             capsule = json.loads(msg.data)
         except Exception:
             return
-        # compact trace
-        trace = _bound_list((capsule.get("trace") or []), self.max_trace)
+
+        # accept event_trace or trace
+        raw_trace = capsule.get("event_trace") or capsule.get("trace") or []
+        trace = _bound_list(raw_trace, self.max_trace)
+
         cap = dict(capsule)
-        cap["trace"] = trace
+        cap["event_trace"] = trace
         self._capsule = cap
+
 
     def _on_profiles(self, msg: StringMsg):
         try:

@@ -9,12 +9,16 @@ rules:
     task: pose_detection
     output: pose.json
     model_id: "yolo11x-pose"
+    mode: "edge"
+    emit_off: true      # ALSO emit when it becomes false again
     expr: "persons >= 1"
 
   - id: human_detected_3d
     enabled: true
     task: object_detection
     output: human3d
+    mode: "edge"
+    emit_off: true      # ALSO emit when it becomes false again
     # Only when 3D available and confident enough (tune threshold)
     expr: "cls == 'person' and (map_x is not None) and (map_y is not None) and score >= 0.40"
 
@@ -23,14 +27,16 @@ rules:
     enabled: true
     task: audio_gating
     output: text.partial
-    model_id: "whisper"                           # Whisper gate size
+    model_id: "whisper" 
+    mode: "level"                          # Whisper gate size
     expr: "text and any(x in text.lower() for x in ['hello','help'])"
 
   - id: speech_final_any
     enabled: true
     task: audio_asr
     output: text.final
-    model_id: "whisper"                          # Whisper ASR size
+    model_id: "whisper"   
+    mode: "level"                       # Whisper ASR size
     expr: "text and len(text) >= 3"
 
   - id: greet_with_presence
@@ -43,6 +49,7 @@ rules:
     enabled: true
     task: odometry_tracking
     output: odom
+    mode: "level"
     # fire on every >= 3° change; payload carries dyaw_deg
     expr: "dyaw_deg >= 3"
 
@@ -50,6 +57,7 @@ rules:
     enabled: true
     task: odometry_tracking
     output: odom
+    mode: "level"
     # fire on every >= 0.05 m change; payload carries dxy
     expr: "dxy >= 0.05"
     
@@ -57,12 +65,14 @@ rules:
     enabled: true
     task: bt_proximity
     output: bt.reading
+    mode: "level"
     # Fire on any reasonably strong reading; tune threshold as you like:
-    expr: "rssi >= -90"
+    expr: "rssi >= -50"
 
   - id: skill_done_any
     enabled: true
     task: skill_status
     output: skill.status
+    mode: "level"
     expr: "kind == 'skill_finished' and done"
 
