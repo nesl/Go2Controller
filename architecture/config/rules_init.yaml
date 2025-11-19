@@ -16,7 +16,7 @@ rules:
   - id: human_detected_3d
     enabled: true
     task: object_detection
-    output: human3d
+    output: detection.2d
     mode: "edge"
     emit_off: true      # ALSO emit when it becomes false again
     # Only when 3D available and confident enough (tune threshold)
@@ -38,6 +38,14 @@ rules:
     model_id: "whisper"   
     mode: "level"                       # Whisper ASR size
     expr: "text and len(text) >= 3"
+
+  - id: trigger_speech_final
+    enabled: true
+    task: audio_asr
+    output: text.final
+    model_id: "whisper" 
+    mode: "level"                          # Whisper gate size
+    expr: "text and any(x in text.lower() for x in ['bob'])"
 
   - id: greet_with_presence
     enabled: true

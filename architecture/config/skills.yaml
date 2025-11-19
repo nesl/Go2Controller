@@ -63,7 +63,7 @@ skills:
           within_ms: 5000
     until:
       any:
-        - exists: pose_present_precise
+        - exists: human_detected_3d
           within_ms: 300
         - exists: speech_final_any
           within_ms: 1
@@ -73,7 +73,7 @@ skills:
         when: {}
         until:
           any:
-            - exists: pose_present_precise
+            - exists: human_detected_3d
               within_ms: 300
             - exists: speech_final_any
               within_ms: 1
@@ -82,7 +82,7 @@ skills:
         when: {}
         until:
           any:
-            - exists: pose_present_precise
+            - exists: human_detected_3d
               within_ms: 300
             - exists: speech_final_any
               within_ms: 1
@@ -91,7 +91,7 @@ skills:
         when: {}
         until:
           any:
-            - exists: pose_present_precise
+            - exists: human_detected_3d
               within_ms: 300
             - exists: speech_final_any
               within_ms: 1
@@ -126,46 +126,6 @@ skills:
           exists: speech_final_any
           within_ms: 1
 
-  # Sense here: quick search, step closer, then announce.
-  - name: sense.here
-    kind: composite
-    when: {}
-    until:
-      exists: speech_final_any
-      within_ms: 1
-    steps:
-      - use: base.turn_search
-        when:
-          any:
-            - exists: pose_present_precise
-              within_ms: 3000
-            - exists: speech_final_any
-              within_ms: 3000
-        until:
-          any:
-            - exists: pose_present_precise
-              within_ms: 300
-            - exists: speech_final_any
-              within_ms: 1
-      - use: nav.move_relative
-        with: { dist_m: 0.6 }
-        when:
-          exists: pose_present_precise
-          within_ms: 3000
-        until:
-          exists: speech_final_any
-          within_ms: 1
-      - use: tts.say
-        with: { text: "Scanning this area." }
-        when:
-          any:
-            - exists: pose_present_precise
-              within_ms: 3000
-            - exists: speech_final_any
-              within_ms: 3000
-        until:
-          exists: speech_final_any
-          within_ms: 1
 
   # Beacon report: query DB then speak summary.
   - name: beacons.report_top3
@@ -227,4 +187,28 @@ skills:
       - use: tts.say
         with: { text: "{{ctx.text | default:'Okay.'}}" }
         when: {}
+        
+        
+  # Turn to search for a human; if found, move toward them
+  - name: human.turn_and_approach
+    kind: composite
+    when: {}
+    steps:
+      # 1) Spin in place until a human is detected (or user interrupts)
+      - use: base.turn_search
+        when: {}
+
+      # 2) Once a recent human_detected_3d event exists, move forward
+      - use: nav.move_relative
+        with:
+          dist_m: "{{ctx.approach_dist_m | default:0.8}}"
+          azimuth_deg: 0.0
+        when:
+          exists: human_detected_3d
+          within_ms: 1000
+        until:
+          any:
+            - exists: speech_final_any
+              within_ms: 1
+
 

@@ -18,8 +18,15 @@ from std_srvs.srv import SetBool
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion
 import math
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 from bt_msgs.msg import BtReading  # NEW
+
+from geometry_msgs.msg import Quaternion, TransformStamped
+import tf2_ros
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
+
 
 # --- add this helper near the top ---
 def _norm_ros_type(s: str) -> str:
@@ -45,6 +52,11 @@ def quat_to_yaw(q: Quaternion) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 def load_yaml(p: str): return yaml.safe_load(Path(p).read_text())
+
+@dataclass
+class EdgeState:
+    active: bool = False            # currently considered "on"
+    last_true_ts: Optional[float] = None  # seconds
 
 # ---------- safe expression evaluator ----------
 
@@ -95,11 +107,19 @@ class EventLayerNode(Node):
         self.declare_parameter('rules_init_path', '')
 
 
+        # NEW: paths to skills YAML (same idea as SkillsAgent)
+        self.declare_parameter('skills_base_path', '')
+        self.declare_parameter('skills_composite_path', '')
+
         self.registry_path = self.get_parameter('registry_path').get_parameter_value().string_value
         self.rules_path    = self.get_parameter('rules_path').get_parameter_value().string_value
         self.rescan_period = float(self.get_parameter('rescan_period_s').value)
         self.enabled       = bool(self.get_parameter('enabled').value)
         self.rules_init_path = self.get_parameter('rules_init_path').get_parameter_value().string_value
+
+        # NEW: skills paths
+        self.skills_base_path = self.get_parameter('skills_base_path').get_parameter_value().string_value
+        self.skills_composite_path = self.get_parameter('skills_composite_path').get_parameter_value().string_value
 
 
         if not self.registry_path or not self.rules_path:
@@ -119,6 +139,12 @@ class EventLayerNode(Node):
         self.rules_enabled = []
         self._rule_state = {}     # rule_id -> bool (last satisfied)
         self._last_emit_ts = {}   # rule_id -> float (optional diag)
+        self._edge_states = {}     # <-- ADD THIS
+        
+        # NEW: maps for skill → rule deps etc.
+        self._skill_rule_deps = {}      # composite_name -> set(rule_ids)
+        self._primitive_rule_deps = {}  # primitive_name -> set(rule_ids)
+        self._rules_by_id = {}          # rule_id -> rule dict (for mode lookup)
         
         self.default_window_ms = 3000
         self.default_comp_ms = 2000
@@ -136,15 +162,98 @@ class EventLayerNode(Node):
         self.create_service(Trigger, '/event_layer/reload_rules', self._srv_reload_rules)
         self.create_service(SetBool, '/event_layer/enable', self._srv_enable)
 
+        # --- TF2 for map->base transforms (robot pose in map frame) ---
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # configurable frames if you want (or keep literals in helper)
+        self.map_frame = "map"
+        self.base_frame = "base_link"   # or "base_link" depending on your tree
+
+
         # timers
         #self.create_timer(self.rescan_period, self._resubscribe_if_needed)
         self.create_timer(0.1, self._tick)
 
         self._load_rules()
+        self._load_skills_deps()          # ← NEW
         self._resubscribe_if_needed()
+
+        # Always watch skill execution bus so we can reset edge rules per-skill
+        self.sub_skill_status = self.create_subscription(
+            StringMsg,
+            "/skills/status",
+            self._cb_skill_status,
+            10,
+        )
+      
+
         self.get_logger().info("event_layer_node (expr) up")
 
     # ---------- utils ----------
+
+    def _lookup_robot_pose_map(self):
+        """
+        Return (x, y, yaw, ts) of the robot in the map frame, or None on failure.
+        yaw is in radians.
+        """
+        try:
+            # time=0 → latest available transform
+            tf: TransformStamped = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.base_frame,
+                rclpy.time.Time()
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            # optional: comment out if too chatty
+            # self.get_logger().debug(f"TF lookup failed: {e}")
+            return None
+
+        t = tf.transform.translation
+        q = tf.transform.rotation
+        yaw = quat_to_yaw(q)
+
+        # stamp to seconds
+        stamp = tf.header.stamp
+        tf_ts = stamp.sec + stamp.nanosec * 1e-9
+
+        return float(t.x), float(t.y), float(yaw), tf_ts
+
+
+    def _reset_rules_for_ids(self, rule_ids: set[str] | list[str]):
+        """
+        Reset edge-related state (rule_hits, edge state, last emit) for the given rule ids,
+        but only if the rule is edge-based.
+        """
+        if not rule_ids:
+            return
+        now = self._now()
+        for rid in rule_ids:
+            sid = str(rid)
+            r = self._rules_by_id.get(sid)
+            if not r:
+                continue
+            mode = r.get("mode", "edge")
+            if mode != "edge":
+                # no need to reset level rules
+                continue
+
+            # Clear temporal state so the next true evaluation will fire a fresh edge
+            if sid in self.rule_hits:
+                self.rule_hits.pop(sid, None)
+            if sid in self._rule_state:
+                self._rule_state[sid] = False
+            if sid in self._edge_states:
+                st = self._edge_states[sid]
+                st.active = False
+                st.last_true_ts = None
+            if sid in self._last_emit_ts:
+                self._last_emit_ts.pop(sid, None)
+
+            # optional: debug log (comment out if too chatty)
+            # self.get_logger().info(f"EventLayer: reset edge state for rule '{sid}' at {now:.3f}")
+
+    
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
@@ -190,6 +299,130 @@ class EventLayerNode(Node):
             self.get_logger().warn(f"SetParameters {service_name} error: {e}")
 
 
+    # ---------- skills introspection (for edge resets) ----------
+
+    def _read_yaml_if_exists_local(self, path: str) -> Optional[dict]:
+        if not path:
+            return None
+        p = Path(path)
+        if not p.is_file():
+            return None
+        try:
+            return yaml.safe_load(p.read_text()) or {}
+        except Exception as e:
+            self.get_logger().warn(f"EventLayer: failed to read skills YAML '{path}': {e}")
+            return None
+
+    def _merged_skills_doc(self) -> dict:
+        """
+        Merge base + composite skills into a single doc:
+          {version, defaults, skills: [...]}
+        """
+        base_doc = self._read_yaml_if_exists_local(self.skills_base_path) or {}
+        comp_doc = self._read_yaml_if_exists_local(self.skills_composite_path) or {}
+
+        merged = {
+            "version": base_doc.get("version", 2),
+            "defaults": base_doc.get("defaults", {"window_ms": 3000}),
+            "skills": []
+        }
+
+        base_skills = base_doc.get("skills") or []
+        if isinstance(base_skills, list):
+            merged["skills"].extend(base_skills)
+
+        comp_skills = comp_doc.get("skills") or []
+        if isinstance(comp_skills, list):
+            merged["skills"].extend(comp_skills)
+
+        return merged
+
+    def _collect_exists_from_cond(self, cond: Any, acc: set):
+        """
+        Recursively collect rule_ids from 'exists' conditions:
+          - {exists: <rule_id>, within_ms: ...}
+          - {any: [...]} / {all: [...]}
+        """
+        if not cond:
+            return
+        if isinstance(cond, dict):
+            if "exists" in cond:
+                rid = cond.get("exists")
+                if rid:
+                    acc.add(str(rid))
+            if "any" in cond and isinstance(cond["any"], list):
+                for c in cond["any"]:
+                    self._collect_exists_from_cond(c, acc)
+            if "all" in cond and isinstance(cond["all"], list):
+                for c in cond["all"]:
+                    self._collect_exists_from_cond(c, acc)
+        elif isinstance(cond, list):
+            for c in cond:
+                self._collect_exists_from_cond(c, acc)
+
+    def _load_skills_deps(self):
+        """
+        Read skills YAMLs, compute:
+          - skill_name -> rule_ids it depends on
+          - primitive_name -> rule_ids of steps that use that primitive
+        using 'exists: rule_id' in when/until conditions.
+        """
+        self._skill_rule_deps = {}
+        self._primitive_rule_deps = {}
+
+        if not (self.skills_base_path or self.skills_composite_path):
+            self.get_logger().info("EventLayer: no skills paths provided; skipping skill deps.")
+            return
+
+        try:
+            merged = self._merged_skills_doc()
+        except Exception as e:
+            self.get_logger().warn(f"EventLayer: failed to merge skills docs: {e}")
+            return
+
+        skills = merged.get("skills") or []
+        if not isinstance(skills, list):
+            return
+
+        for s in skills:
+            if not isinstance(s, dict):
+                continue
+            name = str(s.get("name", ""))
+            kind = s.get("kind", "")
+            if not name:
+                continue
+
+            # Collect rule ids from composite-level when/until
+            rule_ids = set()
+            self._collect_exists_from_cond(s.get("when"), rule_ids)
+            self._collect_exists_from_cond(s.get("until"), rule_ids)
+
+            steps = s.get("steps") or []
+            if isinstance(steps, list):
+                for step in steps:
+                    self._collect_exists_from_cond(step.get("when"), rule_ids)
+                    self._collect_exists_from_cond(step.get("until"), rule_ids)
+
+                    # Map primitive -> rule_ids (for per-primitive reset)
+                    ref = step.get("use")
+                    if ref and isinstance(ref, str):
+                        # step-specific rule ids
+                        step_rule_ids = set()
+                        self._collect_exists_from_cond(step.get("when"), step_rule_ids)
+                        self._collect_exists_from_cond(step.get("until"), step_rule_ids)
+                        if step_rule_ids:
+                            d = self._primitive_rule_deps.setdefault(ref, set())
+                            d.update(step_rule_ids)
+
+            if rule_ids:
+                self._skill_rule_deps[name] = rule_ids
+
+        self.get_logger().info(
+            f"EventLayer: loaded skills deps for {len(self._skill_rule_deps)} skills, "
+            f"{len(self._primitive_rule_deps)} primitives."
+        )
+
+
     # ---------- rules ----------
     def _load_rules(self):
         """
@@ -226,6 +459,10 @@ class EventLayerNode(Node):
         self.rules_all = list(base_rules) + list(dyn_rules)
         self.rules_enabled = [r for r in self.rules_all if r.get("enabled", True)]
 
+        # NEW: fast lookup by id
+        self._rules_by_id = {str(r.get("id")): r for r in self.rules_all if "id" in r}
+
+
         # Build desired topics from basic rules (type not composite)
         self.desired_topics = {}
         for r in self.rules_enabled:
@@ -243,6 +480,10 @@ class EventLayerNode(Node):
         self.get_logger().info(f"Enabled rules: {[r['id'] for r in self.rules_enabled]}")
         self.get_logger().info(f"Desired topics: {list(self.desired_topics.keys())}")
         self._reconcile_node_services()
+        
+
+
+
 
     def _collect_required_nodes(self):
         """
@@ -448,8 +689,8 @@ class EventLayerNode(Node):
             return self._cb_text_final
         if msgstr == "bt_msgs/BtReading":                   # NEW
             return self._cb_bt_reading                      # NEW
-        if topic == "/skills/status":              # NEW
-            return self._cb_skill_status          # NEW
+        #if topic == "/skills/status":              # NEW
+        #    return self._cb_skill_status          # NEW
         # default String
         return self._cb_text_partial
 
@@ -474,6 +715,8 @@ class EventLayerNode(Node):
         if not self.enabled:
             return
 
+        now = self._now()
+
         local_funcs = {
             "exists": lambda rid, ms: self._exists(str(rid), int(ms)),
             "now": self._now,
@@ -497,45 +740,75 @@ class EventLayerNode(Node):
 
             rid = r["id"]
             prev = self._rule_state.get(rid, False)
+            state = self._edge_states.setdefault(rid, EdgeState(active=prev))
 
             mode = r.get("mode", "edge")          # "edge" or "level"
             emit_off = bool(r.get("emit_off", False))
 
+            # how long we must stay false before emitting OFF (ms)
+            off_delay_ms = int(r.get("edge_off_ms", self.default_window_ms))
+
             fire = False
-            active_flag = True  # True = ON event, False = OFF event
+            active_flag = True   # True = ON event, False = OFF event
+            new_state = prev
+
+            # Track last time the expr was true
+            if ok:
+                state.last_true_ts = now
 
             if mode == "edge":
+                # Rising edge: became true
                 if ok and not prev:
-                    # rising edge → ON event
                     fire = True
                     active_flag = True
+                    new_state = True
+
+                # Falling edge: became false, but only after persistence
                 elif emit_off and (not ok and prev):
-                    # falling edge → OFF event
-                    fire = True
-                    active_flag = False
+                    # Only allow OFF if we've been false long enough
+                    # i.e., time since last_true_ts >= off_delay_ms
+                    # If we never saw a true, treat as immediately off.
+                    if state.last_true_ts is None or (now - state.last_true_ts) * 1000.0 >= off_delay_ms:
+                        fire = True
+                        active_flag = False
+                        new_state = False
+                    else:
+                        # Too soon to declare OFF: keep state ON and skip emit
+                        new_state = True
+                        self._rule_state[rid] = new_state
+                        state.active = new_state
+                        continue
 
             elif mode == "level":
+                # Level mode: fire whenever expr is true
                 if ok:
                     fire = True
                     active_flag = True
+                new_state = ok
 
             else:
-                # unknown mode → default to edge rising
+                # unknown mode → default to simple rising edge
                 if ok and not prev:
                     fire = True
                     active_flag = True
+                    new_state = True
 
-            # update state AFTER computing transitions
-            self._rule_state[rid] = ok
+            # Commit debounced state
+            self._rule_state[rid] = new_state
+            state.active = new_state
 
             if fire:
                 payload = dict(ctx)
                 payload["rule_id"] = rid
-                payload["active"] = active_flag   # <--- NEW flag ON/OFF
+                payload["active"] = active_flag   # ON or OFF
 
-                self._emit_hit(rid, payload)
+                # Only ON edges count as "hits" for exists()
+                if active_flag:
+                    self._emit_hit(rid, payload)
+
                 self._publish_basic(rid, payload)
-                self._last_emit_ts[rid] = self._now()
+                self._last_emit_ts[rid] = now
+
 
             
     # --- detection.2d
@@ -576,9 +849,6 @@ class EventLayerNode(Node):
             # Existing rule path for generic detections:
             self._eval_for_rules("object_detection", "detection.2d", ctx)
 
-            # NEW: human-3D convenience event (fires only when we have map coords)
-            if cls == "person" and map_x is not None and map_y is not None:
-                self._eval_for_rules("object_detection", "human3d", ctx)
 
 
     def _cb_odom(self, msg: Odometry):
@@ -653,10 +923,11 @@ class EventLayerNode(Node):
     def _cb_bt_reading(self, msg: BtReading):
         """
         Build a lightweight context from BtReading and evaluate basic rules.
-        No DB, TF, or server lookups here — this layer only raises events.
+        Attach robot pose in the map frame (via TF2) if available.
         """
         ts = self._now()
-        # Normalize fields with safe fallbacks
+
+        # Start with the raw BT fields
         ctx = {
             "rssi": int(msg.rssi),
             "device_id": (msg.device_id or "").strip(),
@@ -665,11 +936,28 @@ class EventLayerNode(Node):
             "frame_id": (msg.frame_id or "").strip(),
             "ts": ts,
         }
-        # Optional: expose simple strength bucket for rules (e.g., -60 = strong)
+
+        # Optional: simple strength bucket
         try:
-            ctx["strength_bucket"] = "strong" if msg.rssi >= -65 else ("medium" if msg.rssi >= -85 else "weak")
+            ctx["strength_bucket"] = (
+                "strong" if msg.rssi >= -65
+                else ("medium" if msg.rssi >= -85 else "weak")
+            )
         except Exception:
             ctx["strength_bucket"] = "unknown"
+
+        # --- NEW: attach robot pose in map frame via TF ---
+        pose_map = self._lookup_robot_pose_map()
+        if pose_map is not None:
+            rx, ry, ryaw, rts = pose_map
+            ctx.update({
+                "robot_map_x": rx,
+                "robot_map_y": ry,
+                "robot_map_yaw": ryaw,    # radians
+                "robot_map_ts": rts,
+            })
+            # pose age relative to BT reading
+            ctx["robot_pose_age_ms"] = (ts - rts) * 1000.0
 
         # Evaluate rules for this task/output
         self._eval_for_rules("bt_proximity", "bt.reading", ctx)
@@ -683,17 +971,46 @@ class EventLayerNode(Node):
             self.get_logger().warn(f"Bad JSON on /skills/status: {msg.data}")
             return
 
-        # Normalize context
+        kind = obj.get("kind", "")
+        skill_name = obj.get("skill", "") or ""
+        step_idx = int(obj.get("step_idx", 0))
+        primitive_name = obj.get("primitive")  # present on step_started for primitives
+        nested_composite = obj.get("composite")  # present on step_started for nested composites
+
+        # --- NEW: reset edge-based rules based on skill events ---
+        # Per composite skill reset when it starts
+        if kind == "skill_started" and skill_name:
+            deps = self._skill_rule_deps.get(skill_name, set())
+            if deps:
+                self._reset_rules_for_ids(deps)
+
+        # Per primitive step reset when that primitive starts
+        if kind == "step_started":
+            # primitive dependency reset
+            if primitive_name:
+                deps_p = self._primitive_rule_deps.get(primitive_name, set())
+                # also include composite-level deps for this skill
+                deps_s = self._skill_rule_deps.get(skill_name, set())
+                deps = set(deps_p) | set(deps_s)
+                if deps:
+                    self._reset_rules_for_ids(deps)
+
+            # if the step launches a nested composite, you may also reset its deps
+            if nested_composite:
+                deps_c = self._skill_rule_deps.get(nested_composite, set())
+                if deps_c:
+                    self._reset_rules_for_ids(deps_c)
+
+        # --- Existing path: expose skill_status as a rule context if you want ---
         ctx = {
-            "kind": obj.get("kind", ""),
-            "skill": obj.get("skill", ""),
-            "step_idx": int(obj.get("step_idx", 0)),
+            "kind": kind,
+            "skill": skill_name,
+            "step_idx": step_idx,
             "reason": obj.get("reason", ""),
             "activated": bool(obj.get("activated", False)),
             "done": bool(obj.get("done", False)),
             "ts": ts,
         }
-        # you can pass ctx["ctx"] through if you really want:
         inner_ctx = obj.get("ctx") or {}
         if isinstance(inner_ctx, dict):
             ctx["inner_ctx"] = inner_ctx
@@ -701,11 +1018,14 @@ class EventLayerNode(Node):
         self._eval_for_rules("skill_status", "skill.status", ctx)
 
 
+
     # ---------- composites ----------
     def _tick(self):
-        if not self.enabled: return
+        if not self.enabled:
+            return
         now = self._now()
-        # Evaluate composite rules each tick
+
+        # 1) Composite rules (existing code)
         local_funcs = {
             "exists": lambda rid, ms: self._exists(str(rid), int(ms)),
             "now": self._now,
@@ -723,8 +1043,41 @@ class EventLayerNode(Node):
             if ok:
                 evt = {"type": "composite", "rule": r["id"], "expr": expr, "ts": now}
                 self.pub_comp.publish(StringMsg(data=json.dumps(evt)))
-                # light hysteresis: clear the oldest hit of each referenced rule id in expr
-                # (optional — left simple to avoid regex parsing)
+
+        # 2) Edge rule timeouts → synthesize OFF when no hit for window
+        for r in self.rules_enabled:
+            if r.get("type") == "composite":
+                continue
+            if r.get("mode", "edge") != "edge":
+                continue
+            if not r.get("emit_off", False):
+                continue
+
+            rid = str(r["id"])
+            state = self._edge_states.get(rid)
+            if not state or not state.active:
+                continue
+
+            last_true = state.last_true_ts
+            if last_true is None:
+                continue
+
+            off_delay_ms = int(r.get("edge_off_ms", self.default_window_ms))
+            if (now - last_true) * 1000.0 < off_delay_ms:
+                continue
+
+            # Time-based OFF
+            state.active = False
+            self._rule_state[rid] = False
+            self._last_emit_ts[rid] = now
+
+            payload = {
+                "rule_id": rid,
+                "active": False,
+                "ts": now,
+            }
+            self._publish_basic(rid, payload)
+
                 
                 
 def main():

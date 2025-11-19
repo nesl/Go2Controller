@@ -26,6 +26,11 @@ from sensor_msgs.msg import Image as RosImage
 from std_msgs.msg import String as RosString
 from std_srvs.srv import Trigger
 
+from std_srvs.srv import SetBool
+from rclpy.parameter import Parameter
+from rcl_interfaces.msg import SetParametersResult
+import time, json
+
 from PIL import Image
 import io
 import numpy as np
@@ -227,9 +232,19 @@ class QwenVLMServer(Node):
         self.declare_parameter("max_new_tokens", 256)
         self.declare_parameter("temperature", 0.1)
 
+        # Perf + enable
+        self.declare_parameter("perf_topic", "/vlm/perf")
+        self.declare_parameter("enabled", True)
+
         model_id = self.get_parameter("model_id").get_parameter_value().string_value
         int4 = self.get_parameter("int4").get_parameter_value().bool_value
         bf16 = self.get_parameter("bf16").get_parameter_value().bool_value
+
+        self.model_id = model_id
+        self.int4 = int4
+        self.bf16 = bf16
+        self.enabled = self.get_parameter("enabled").get_parameter_value().bool_value
+        self.perf_topic = self.get_parameter("perf_topic").get_parameter_value().string_value
 
         # Latest frame + prompt
         self.latest_pil = None
@@ -247,13 +262,73 @@ class QwenVLMServer(Node):
         self.ans_pub = self.create_publisher(RosString, "/vlm/answer", 10)
         self.srv = self.create_service(Trigger, "/vlm/run", self.on_run)
 
-        self.get_logger().info(f"Loading VLM model: {model_id} (int4={int4}, bf16={bf16}) …")
+        self.perf_pub = self.create_publisher(RosString, self.perf_topic, 10)
+        self.enable_srv = self.create_service(SetBool, "/vlm/enable", self.on_enable)
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
+        self._load_vlm()
+
+    def _load_vlm(self):
+        self.get_logger().info(
+            f"Loading VLM model: {self.model_id} (int4={self.int4}, bf16={self.bf16}) …"
+        )
         try:
-            self.vlm = VLM(model_id, int4=int4, bf16=bf16)
+            self.vlm = VLM(self.model_id, int4=self.int4, bf16=self.bf16)
             self.get_logger().info("VLM ready.")
         except Exception as e:
             self.get_logger().error(f"Failed to load VLM: {e}")
             raise
+
+    def on_enable(self, req, res):
+        self.enabled = bool(req.data)
+        res.success = True
+        res.message = f"VLM enabled={self.enabled}"
+        self.get_logger().info(res.message)
+        return res
+
+    def _publish_perf(self, *, lat_ms: int, ok: bool, phase: str,
+                      prompt_len: int, answer_len: int):
+        payload = {
+            "node": "vlm",
+            "task": "vlm_inference",
+            "model": self.model_id,
+            "lat_ms": int(lat_ms),
+            "ok": bool(ok),
+            "phase": phase,           # e.g., "run_service"
+            "prompt_len": int(prompt_len or 0),
+            "answer_len": int(answer_len or 0),
+            "ts": time.time(),
+        }
+        try:
+            self.perf_pub.publish(RosString(data=json.dumps(payload)))
+        except Exception as e:
+            self.get_logger().warn(f"[vlm] perf publish failed: {e}")
+
+    def _on_set_parameters(self, params):
+        reload_needed = False
+        for p in params:
+            if p.name == "model_id" and p.type_ == Parameter.Type.STRING:
+                self.model_id = p.value
+                reload_needed = True
+            elif p.name == "int4" and p.type_ == Parameter.Type.BOOL:
+                self.int4 = p.value
+                reload_needed = True
+            elif p.name == "bf16" and p.type_ == Parameter.Type.BOOL:
+                self.bf16 = p.value
+                reload_needed = True
+
+        if reload_needed:
+            try:
+                self._load_vlm()
+                self.get_logger().info(
+                    f"[vlm] reloaded model_id={self.model_id} int4={self.int4} bf16={self.bf16}"
+                )
+            except Exception as e:
+                self.get_logger().error(f"[vlm] failed to reload model: {e}")
+                return SetParametersResult(successful=False, reason=str(e))
+
+        return SetParametersResult(successful=True, reason="ok")
+
 
     def on_image(self, msg: RosImage):
         try:
@@ -266,6 +341,11 @@ class QwenVLMServer(Node):
         self.get_logger().info(f"Prompt updated: {self.current_prompt!r}")
 
     def on_run(self, req, res):
+        if not self.enabled:
+            res.success = False
+            res.message = "VLM is currently disabled."
+            return res
+
         if self.latest_pil is None:
             res.success = False
             res.message = "No image received yet on /camera/image_raw."
@@ -276,18 +356,36 @@ class QwenVLMServer(Node):
         temp = self.get_parameter("temperature").get_parameter_value().double_value
 
         self.get_logger().info("Running VLM inference…")
+        t0 = time.time()
+        ok = False
+        answer = ""
         try:
-            answer = self.vlm.infer(self.latest_pil, prompt, max_new_tokens=max_new, temperature=temp)
+            answer = self.vlm.infer(
+                self.latest_pil,
+                prompt,
+                max_new_tokens=max_new,
+                temperature=temp,
+            )
             # publish full text
             self.ans_pub.publish(RosString(data=answer))
             # truncate in service response
             trunc = (answer[:180] + "…") if len(answer) > 180 else answer
             res.success = True
             res.message = f"OK: {trunc}"
+            ok = True
         except Exception as e:
             self.get_logger().error(f"VLM error: {e}")
             res.success = False
             res.message = f"Error: {e}"
+        finally:
+            dt_ms = int((time.time() - t0) * 1000)
+            self._publish_perf(
+                lat_ms=dt_ms,
+                ok=ok,
+                phase="run_service",
+                prompt_len=len(prompt),
+                answer_len=len(answer),
+            )
         return res
 
 def main():

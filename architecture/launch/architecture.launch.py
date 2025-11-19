@@ -37,6 +37,8 @@ def generate_launch_description():
                 'registry_path': os.path.join(pkg_share, 'config', 'task_registry.yaml'),
                 'rules_path':    RULES_DYNAMIC_PATH,
                 'rules_init_path':    os.path.join(pkg_share, 'config', 'rules_init.yaml'),
+                'skills_base_path': os.path.join(pkg_share, 'config', 'skills.yaml'),
+                'skills_composite_path': SKILLS_COMPOSITE_PATH,
                 'enabled': True,
             }]
         ),

@@ -15,12 +15,21 @@
 #
 import json
 import os
+import time  # NEW
 from typing import Any, Dict, List, Optional
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter              # NEW
 from std_msgs.msg import String as StringMsg
 from std_srvs.srv import Trigger
+from rcl_interfaces.srv import SetParameters       # NEW
+from rcl_interfaces.msg import (                  # NEW
+    Parameter as ParamMsg,
+    ParameterValue,
+    SetParametersResult,
+    ParameterType
+)
 
 import yaml
 from openai import OpenAI
@@ -89,6 +98,11 @@ PLAN_PARSE_SCHEMA: Dict[str, Any] = {
                 "additionalProperties": True,
             },
         },
+        # NEW: optional LLM model choices per role ("broker", "planner", "orchestrator", etc.)
+        "llm_models": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
     },
     "additionalProperties": False,
 }
@@ -96,12 +110,19 @@ PLAN_PARSE_SCHEMA: Dict[str, Any] = {
 SYSTEM_PARSE = (
     "You are the ORCHESTRATOR for a mobile robot collaborating with humans.\n"
     "The planner has already produced a high-level plan (plan_header, plan_doc, _hints).\n"
-    "You also have a skills library with primitive and composite skills, and a rules library.\n\n"
+    "You also have a skills library with primitive and composite skills, and a rules library.\n"
+    "You additionally receive a ContextCapsule from the broker, which may contain performance\n"
+    "summaries for different LLM models (e.g., average latency, error counts) in a field such as\n"
+    "llm_perf or similar.\n\n"
     "Your job is to:\n"
     " 1) Decide which skills to activate next (existing primitives or composites),\n"
     " 2) Optionally define NEW composite skills that encode short sequences of existing primitives,\n"
-    " 3) Optionally define NEW rules (prefer composite rules using exists('rule_id', ms)),\n"
-    " 4) Return STRICT JSON ONLY following the provided schema.\n\n"
+    " 3) Optionally define NEW rules (prefer composite rules using exists('rule_id', ms), but do not ever use\n"
+    "    rules with the 'trigger_' prefix),\n"
+    " 4) Optionally RECOMMEND which LLM model each role (broker, planner, orchestrator, etc.) should use,\n"
+    "    based on the performance information in the ContextCapsule, by filling an object 'llm_models',\n"
+    "    e.g., {\"broker\": \"gpt-5-nano\", \"planner\": \"gpt-4o-mini\"}.\n"
+    " 5) Return STRICT JSON ONLY following the provided schema.\n\n"
     "Rules:\n"
     " - You CANNOT invent new primitive actions. You may only reference existing skill names.\n"
     " - New composite skills must use 'use: <skill_name>' where <skill_name> is in the skills list.\n"
@@ -115,6 +136,8 @@ SYSTEM_PARSE = (
     " - If the plan is mostly about sensing or scanning, prefer existing skills like sense.here, beacons.report_top3,\n"
     "   nav.go_absolute, tts.say, etc.\n"
     " - If you are unsure, default to a simple tts.say composite that describes what you intend to do.\n"
+    " - For 'llm_models': only change a role’s model if the performance data clearly suggests a better choice;\n"
+    "   otherwise it is fine to omit or leave the current model.\n"
 )
 
 class OrchestratorNode(Node):
@@ -122,6 +145,10 @@ class OrchestratorNode(Node):
     Bridges PlannerNode and SkillsAgent with an LLM-driven planner-to-skills+rules parser.
     Base skills/rules are read-only; dynamic composites and rules are appended to
     skills_composite.yaml and rules.yaml respectively.
+
+    LLM responsibilities now also include suggesting which LLM models should be used
+    by broker / planner / orchestrator based on the performance info in the
+    broker ContextCapsule (passed into the prompt).
     """
 
     def __init__(self):
@@ -138,6 +165,22 @@ class OrchestratorNode(Node):
         self.declare_parameter("max_dynamic_rules", 20)
         self.declare_parameter("model", "gpt-5-mini")
         self.declare_parameter("temperature", 0.1)
+
+        # NEW: where to listen for broker context (which includes perf DB)
+        self.declare_parameter("capsule_topic", "/broker/context_capsule")
+
+        # NEW: where to publish THIS node's LLM perf so broker can ingest it
+        self.declare_parameter("perf_topic", "/llm/orchestrator_perf")
+
+        # NEW: mapping from logical roles to (node, param) for remote model changes
+        self.declare_parameter(
+            "llm_targets_json",
+            json.dumps({
+                "broker": {"node": "broker_node", "param": "llm_model"},
+                "planner": {"node": "planner_node", "param": "model"},
+                "orchestrator": {"node": "orchestrator_node", "param": "model"},
+            }),
+        )
 
         self.skills_base_path: str = (
             self.get_parameter("skills_base_path")
@@ -165,10 +208,6 @@ class OrchestratorNode(Node):
             .string_value
         )
 
-        self.cancel_skills_client = self.create_client(
-            Trigger, "/skills/cancel_all"
-        )
-
         self.dynamic_prefix: str = (
             self.get_parameter("dynamic_prefix")
             .get_parameter_value()
@@ -187,6 +226,22 @@ class OrchestratorNode(Node):
             self.get_parameter("temperature").value
         )
 
+        self.capsule_topic: str = (
+            self.get_parameter("capsule_topic")
+            .get_parameter_value()
+            .string_value
+        )
+        self.perf_topic: str = (
+            self.get_parameter("perf_topic")
+            .get_parameter_value()
+            .string_value
+        )
+        self.llm_targets: Dict[str, Any] = json.loads(
+            self.get_parameter("llm_targets_json")
+            .get_parameter_value()
+            .string_value
+        )
+
         if not self.skills_composite_path:
             self.get_logger().warn(
                 "No skills_composite_path set; orchestrator cannot persist new composites."
@@ -199,13 +254,26 @@ class OrchestratorNode(Node):
         # ---------------- OpenAI client ----------------
         self.client = OpenAI()
 
+        # ---------------- State ----------------
+        self._capsule: Dict[str, Any] = {}  # NEW: last broker ContextCapsule
+
         # ---------------- ROS I/O ----------------
         self.sub_plan = self.create_subscription(
             StringMsg, "/planner/plan_out", self._on_plan, 10
         )
 
+        # NEW: subscribe to broker context (which contains perf summaries, etc.)
+        self.sub_capsule = self.create_subscription(
+            StringMsg, self.capsule_topic, self._on_capsule, 10
+        )
+
         self.pub_execute = self.create_publisher(
             StringMsg, "/skills/execute", 10
+        )
+
+        # NEW: publish orchestrator LLM perf so broker can ingest it
+        self.pub_perf = self.create_publisher(
+            StringMsg, self.perf_topic, 10
         )
 
         self.reload_skills_client = self.create_client(
@@ -215,12 +283,52 @@ class OrchestratorNode(Node):
             Trigger, "/event_layer/reload_rules"
         )
 
+        self.cancel_skills_client = self.create_client(
+            Trigger, "/skills/cancel_all"
+        )
+
+        # NEW: SetParameters clients for remote LLM model changes
+        self._param_clients: Dict[str, Any] = {}
+        for role, info in self.llm_targets.items():
+            node_name = info.get("node")
+            if not node_name:
+                continue
+            srv_name = f"/{node_name}/set_parameters"
+            self._param_clients[role] = self.create_client(
+                SetParameters, srv_name
+            )
+
+        # NEW: allow dynamic change of THIS node's own model / temperature
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
         self.get_logger().info(
             f"orchestrator_node up | base='{self.skills_base_path}' | "
             f"composite='{self.skills_composite_path}' | "
             f"rules_init='{self.rules_init_path}' | rules='{self.rules_path}' | "
-            f"model={self.model}"
+            f"model={self.model} | capsule_topic={self.capsule_topic} | perf_topic={self.perf_topic}"
         )
+
+
+    # =====================================================================
+    # Dynamic params for orchestrator itself (model / temperature)
+    # =====================================================================
+
+    def _on_set_parameters(self, params):
+        result = SetParametersResult()
+        result.successful = True
+        result.reason = "ok"
+        for p in params:
+            if p.name == "model" and p.type_ == Parameter.Type.STRING:
+                self.model = p.value
+                self.get_logger().info(f"[orchestrator] model changed to: {self.model}")
+            elif p.name == "temperature":
+                # Accept double or int
+                try:
+                    self.temperature = float(p.value)
+                    self.get_logger().info(f"[orchestrator] temperature -> {self.temperature}")
+                except Exception:
+                    pass
+        return result
 
     # =====================================================================
     # YAML helpers
@@ -300,7 +408,6 @@ class OrchestratorNode(Node):
         Keep at most max_dynamic_skills entries whose names start with dynamic_prefix.
         Only applied to the *composite* file.
         """
-        
         if not self.dynamic_prefix:
             return skills
 
@@ -378,11 +485,9 @@ class OrchestratorNode(Node):
         Keep at most max_dynamic_rules entries whose ids start with dynamic_prefix.
         Only applied to the *dynamic* rules file.
         """
-        
         if not self.dynamic_prefix:
             return rules
 
-        
         dynamic_indices = [
             i
             for i, r in enumerate(rules)
@@ -424,6 +529,32 @@ class OrchestratorNode(Node):
         return {"tasks": out}
 
     # =====================================================================
+    # Context & perf I/O
+    # =====================================================================
+
+    def _on_capsule(self, msg: StringMsg):
+        """Store latest broker ContextCapsule (which may include llm_perf, etc.)."""
+        try:
+            self._capsule = json.loads(msg.data)
+        except Exception:
+            # keep last capsule if this one is bad
+            return
+
+    def _publish_perf(self, lat_ms: float, ok: bool, phase: str = "parse_plan"):
+        """Publish orchestrator LLM latency so broker can record it in its perf DB."""
+        payload = {
+            "node": "orchestrator",
+            "model": self.model,
+            "lat_ms": float(lat_ms),
+            "ok": bool(ok),
+            "phase": phase,
+        }
+        try:
+            self.pub_perf.publish(StringMsg(data=json.dumps(payload)))
+        except Exception:
+            pass
+
+    # =====================================================================
     # OpenAI helper
     # =====================================================================
 
@@ -433,45 +564,64 @@ class OrchestratorNode(Node):
         schema: Dict[str, Any],
         temperature: float,
         retries: int = 1,
+        phase: str = "parse_plan",  # NEW: phase label for perf
     ) -> Dict[str, Any]:
-    
-        self.get_logger().info(
-            f"starting llm in orchestrator\n"
-        )
+
+        self.get_logger().info("starting llm in orchestrator")
+
+        last_error: Optional[Exception] = None
+
         for _ in range(retries + 1):
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "OrchestratorOutput",
-                        "schema": schema,
-                    },
-                },
-            )
-            content = resp.choices[0].message.content
-            self.get_logger().info(
-                f"=== ORCHESTRATOR LLM RAW RESPONSE ===\n{content}\n"
-            )
+            t0 = time.time()
             try:
-                obj = json.loads(content)
-                validate(instance=obj, schema=schema)
-                return obj
-            except (json.JSONDecodeError, ValidationError) as e:
-                self.get_logger().warn(
-                    f"orchestrator: LLM JSON/schema error: {e}"
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "OrchestratorOutput",
+                            "schema": schema,
+                        },
+                    },
                 )
-                messages = messages + [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Return ONLY valid JSON that passes the schema. "
-                            "No extra text."
-                        ),
-                    }
-                ]
-        raise ValueError("LLM did not return valid JSON for schema")
+                t1 = time.time()
+                lat_ms = (t1 - t0) * 1000.0
+                self._publish_perf(lat_ms=lat_ms, ok=True, phase=phase)
+
+                content = resp.choices[0].message.content
+                
+                self.get_logger().info("\n=== LLM PROMPT ===\n" + json.dumps(messages, indent=2))
+                
+                self.get_logger().info(
+                    f"=== ORCHESTRATOR LLM RAW RESPONSE ===\n{content}\n"
+                )
+                try:
+                    obj = json.loads(content)
+                    validate(instance=obj, schema=schema)
+                    return obj
+                except (json.JSONDecodeError, ValidationError) as e:
+                    self.get_logger().warn(
+                        f"orchestrator: LLM JSON/schema error: {e}"
+                    )
+                    last_error = e
+                    messages = messages + [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Return ONLY valid JSON that passes the schema. "
+                                "No extra text."
+                            ),
+                        }
+                    ]
+            except Exception as e:
+                t1 = time.time()
+                lat_ms = (t1 - t0) * 1000.0
+                self._publish_perf(lat_ms=lat_ms, ok=False, phase=phase)
+                self.get_logger().warn(f"orchestrator: LLM call failed: {e}")
+                last_error = e
+
+        raise ValueError(f"LLM did not return valid JSON for schema: {last_error}")
 
     # =====================================================================
     # Plan handling
@@ -511,6 +661,14 @@ class OrchestratorNode(Node):
                 "open_items": ["need stronger signal"],
             },
             "_meta": {"ws_id": 0},
+            # Example of context capsule presence (shape is illustrative)
+            "ContextCapsule": {
+                "trigger": {"type": "new_object"},
+                "llm_perf": {
+                    "broker": [{"model": "gpt-5-nano", "ema_ms": 120.0}],
+                    "planner": [{"model": "gpt-5-mini", "ema_ms": 180.0}],
+                },
+            },
         }
 
         example_assistant = {
@@ -549,6 +707,12 @@ class OrchestratorNode(Node):
                     },
                 }
             ],
+            # Example of the LLM choosing models based on perf
+            "llm_models": {
+                "broker": "gpt-5-nano",
+                "planner": "gpt-5-mini",
+                "orchestrator": "gpt-4o-mini",
+            },
         }
 
         payload = {
@@ -559,6 +723,8 @@ class OrchestratorNode(Node):
             "skills_inventory": skills_inventory,
             "rules_inventory": rules_inventory,
             "tasks_inventory": tasks_inventory,
+            # NEW: give orchestrator LLM access to broker context capsule, including perf DB
+            "ContextCapsule": self._capsule or {},
         }
 
         return [
@@ -603,7 +769,7 @@ class OrchestratorNode(Node):
         rules_inventory = self._build_rules_inventory()
         tasks_inventory = self._build_tasks_inventory()
 
-        # Call LLM to translate plan -> {new_composites, new_rules, to_execute}
+        # Call LLM to translate plan -> {new_composites, new_rules, to_execute, llm_models?}
         try:
             messages = self._build_llm_messages_for_plan(
                 plan, skills_inventory, rules_inventory, tasks_inventory
@@ -613,6 +779,7 @@ class OrchestratorNode(Node):
                 PLAN_PARSE_SCHEMA,
                 temperature=self.temperature,
                 retries=1,
+                phase="parse_plan",
             )
         except Exception as e:
             self.get_logger().error(
@@ -623,6 +790,13 @@ class OrchestratorNode(Node):
         new_composites = orchestrator_obj.get("new_composites") or []
         new_rules = orchestrator_obj.get("new_rules") or []
         to_execute = orchestrator_obj.get("to_execute") or []
+        llm_models = orchestrator_obj.get("llm_models") or {}
+
+        # --- Apply any LLM-chosen model changes first ---
+        if isinstance(llm_models, dict):
+            for role, model in llm_models.items():
+                if isinstance(model, str) and model:
+                    self._set_remote_model(role, model)
 
         # --- Update composite YAML only ---
         if new_composites and self.skills_composite_path:
@@ -631,8 +805,6 @@ class OrchestratorNode(Node):
 
             for c in new_composites:
                 name = str(c.get("name", ""))
-                #if not name.startswith(self.dynamic_prefix):
-                #    c["name"] = f"{self.dynamic_prefix}{name}"
                 c["name"] = name
                 skills.append(c)
                 self.get_logger().info(
@@ -659,7 +831,7 @@ class OrchestratorNode(Node):
 
             for r in new_rules:
                 rid = str(r.get("id", ""))
-                if not rid.startswith(self.dynamic_prefix):
+                if self.dynamic_prefix and not rid.startswith(self.dynamic_prefix):
                     r["id"] = f"{self.dynamic_prefix}{rid}"
                 # default type if missing
                 if "type" not in r:
@@ -686,6 +858,43 @@ class OrchestratorNode(Node):
 
         # Reload rules + skills, then execute
         self._reload_all_and_execute(to_execute)
+
+    # =====================================================================
+    # Remote LLM model changes
+    # =====================================================================
+
+    def _set_remote_model(self, role: str, model: str):
+        """Ask the target node to switch its LLM model param via SetParameters."""
+        info = self.llm_targets.get(role) or {}
+        node_name = info.get("node")
+        param_name = info.get("param", "model")
+        if not node_name:
+            self.get_logger().warn(f"no node mapping for role='{role}'")
+            return
+        client = self._param_clients.get(role)
+        if client is None:
+            self.get_logger().warn(f"no SetParameters client for role='{role}'")
+            return
+
+        if not client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn(
+                f"SetParameters service not available for role='{role}' (node={node_name})"
+            )
+            return
+
+        req = SetParameters.Request()
+        p = ParamMsg()
+        p.name = param_name
+        pv = ParameterValue()
+        pv.type = ParameterType.PARAMETER_STRING   
+        pv.string_value = str(model)
+        p.value = pv
+        req.parameters.append(p)
+
+        self.get_logger().info(
+            f"orchestrator: requesting LLM model change role='{role}' node='{node_name}' param='{param_name}' -> '{model}'"
+        )
+        _ = client.call_async(req)
 
     # =====================================================================
     # Reload + execute
@@ -756,7 +965,6 @@ class OrchestratorNode(Node):
                     "/skills/cancel_all not available; executing skills without cancel."
                 )
                 self._execute_skills(to_execute)
-
 
     def _execute_skills(self, to_execute: List[Dict[str, Any]]):
         for entry in to_execute:

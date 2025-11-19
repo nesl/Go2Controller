@@ -24,6 +24,8 @@ from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
 from tf2_ros import Buffer, TransformListener
+from go2_interfaces.msg import WebRtcReq
+
 
 from dataclasses import dataclass, field
 import time
@@ -37,6 +39,71 @@ class SkillInstance:
     activated: bool = False   # composite-level when satisfied
     done: bool = False
     handle: StepHandle | None = None  # ← active primitive handle
+    
+    
+# ───────────────────────────────────────────────────────────────────────────────
+#                          Number → words helpers (TTS)
+# ───────────────────────────────────────────────────────────────────────────────
+# Standalone integer tokens
+_NUM_TOKEN_RE = re.compile(r'(?<!\w)(-?\d+)(?!\w)')
+# CNode pattern like "CNode101" or "cnode7"
+_CNODE_RE    = re.compile(r'\bCNode(\d+)\b', re.IGNORECASE)
+
+
+def _num_to_words(n: int) -> str:
+    nums0_19 = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+        "seventeen", "eighteen", "nineteen"
+    ]
+    tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+    neg = n < 0
+    n = abs(n)
+    parts = []
+
+    if n >= 100:
+        parts.append(nums0_19[n // 100])
+        parts.append("hundred")
+        n %= 100
+        if n:
+            parts.append("and")
+
+    if n >= 20:
+        parts.append(tens[n // 10])
+        if n % 10:
+            parts.append(nums0_19[n % 10])
+    elif n > 0 or not parts:
+        parts.append(nums0_19[n])
+
+    spoken = " ".join(parts)
+    return f"minus {spoken}" if neg else spoken
+
+
+def _normalize_tts_text(text: str) -> str:
+    """
+    - Map 'CNode101' -> 'node one hundred and one'
+    - Then map bare integers '42' -> 'forty two'
+    """
+    def repl_cnode(m: re.Match) -> str:
+        nid = int(m.group(1))
+        # You can change this to `node number ...` if you prefer
+        return f"node {_num_to_words(nid)}"
+
+    def repl_num(m: re.Match) -> str:
+        s = m.group(0)
+        try:
+            n = int(s)
+        except ValueError:
+            return s
+        return _num_to_words(n)
+
+    # First: rewrite CNode### patterns
+    out = _CNODE_RE.sub(repl_cnode, text)
+    # Then: generic standalone integers
+    out = _NUM_TOKEN_RE.sub(repl_num, out)
+    return out
+
 # ───────────────────────────────────────────────────────────────────────────────
 #                               Skills YAML (inline fallback)
 # ───────────────────────────────────────────────────────────────────────────────
@@ -695,7 +762,7 @@ class SkillsAgent(Node):
 
         # ── ROS I/O for basic actions ─────────────────────────────────────────
         self.tts_pub     = self.create_publisher(StringMsg, "tts", 10)
-        self.gesture_pub = self.create_publisher(StringMsg, "/webrtc/gesture_req", 10)
+        self.webrtc_req_pub = self.create_publisher(WebRtcReq, "webrtc_req", 10)
         self.cmd_vel_pub = self.create_publisher(Twist, self.rotate_topic, 10)
         self.nav_client  = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
@@ -973,9 +1040,15 @@ class SkillsAgent(Node):
 
 
     # ───────────────────────────── Basic Actions ──────────────────────────────
+
     def say(self, text: str):
-        self.get_logger().info(f"[TTS] {text}")
-        self.tts_pub.publish(StringMsg(data=str(text)))
+        # Normalize to string
+        raw = str(text)
+        # Automatically convert numeric tokens to words
+        spoken = _normalize_tts_text(raw)
+        self.get_logger().info(f"[TTS] {spoken}")
+        self.tts_pub.publish(StringMsg(data=spoken))
+
 
     def _lp(self, prev: float, new: float) -> float:
         return (1.0 - self.alpha) * prev + self.alpha * new
@@ -1225,22 +1298,7 @@ class SkillsAgent(Node):
             self.say("I don’t have any beacons detected yet.")
             return
 
-        def _num_to_words(n: int) -> str:
-            nums0_19 = ["zero","one","two","three","four","five","six","seven","eight","nine",
-                        "ten","eleven","twelve","thirteen","fourteen","fifteen","sixteen",
-                        "seventeen","eighteen","nineteen"]
-            tens = ["", "", "twenty","thirty","forty","fifty","sixty","seventy","eighty","ninety"]
-            neg = n < 0; n = abs(n); parts = []
-            if n >= 100:
-                parts.append(nums0_19[n // 100]); parts.append("hundred"); n %= 100
-                if n: parts.append("and")
-            if n >= 20:
-                parts.append(tens[n // 10])
-                if n % 10: parts.append(nums0_19[n % 10])
-            elif n > 0 or not parts:
-                parts.append(nums0_19[n])
-            spoken = " ".join(parts)
-            return f"minus {spoken}" if neg else spoken
+
 
         items_spoken = []
         for object_id, rssi, contaminated, probability in rows:
@@ -1287,12 +1345,49 @@ class SkillsAgent(Node):
             return h
 
         def gesture(kind: str):
+            """
+            Map a logical gesture 'kind' to a Go2 sport API (api_id)
+            and publish a WebRtcReq on /webrtc_req, equivalent to:
+
+              ros2 topic pub /webrtc_req go2_interfaces/msg/WebRtcReq "
+                topic: 'rt/api/sport/request'
+                api_id: 1016
+                parameter: ''
+                id: 1" --once
+            """
             h = StepHandle()
             try:
-                self.gesture_pub.publish(StringMsg(data=str(kind)))
+                # Map high-level gesture names to the table’s API IDs
+                gesture_api_map = {
+                    "greet":        1016,  # Hello
+                    "hello":        1016,
+                    "dance1":       1022,
+                    "dance2":       1023,
+                    "finger_heart": 1036,
+                    "front_flip":   1030,
+                    "left_flip":    1042,
+                    "right_flip":   1043,
+                    "back_flip":    1044,
+                }
+
+                api_id = gesture_api_map.get(str(kind), 1016)  # default to Hello
+
+                msg = WebRtcReq()
+                msg.topic     = "rt/api/sport/request"
+                msg.api_id    = int(api_id)
+                msg.parameter = ""   # same as data: '' in the JS / CLI example
+
+                # Use a simple unique-ish ID; or hard-code 1 if you prefer
+                msg.id = int(time.time() * 1000) & 0x7FFFFFFF
+
+                self.get_logger().info(
+                    f"[gesture] kind='{kind}' -> api_id={msg.api_id}, topic='{msg.topic}', id={msg.id}"
+                )
+                self.webrtc_req_pub.publish(msg)
             finally:
                 h.mark_done()
             return h
+
 
         def move_relative(azimuth_deg: float, dist_m: float):
             # return a handle that completes when the chained timers finish

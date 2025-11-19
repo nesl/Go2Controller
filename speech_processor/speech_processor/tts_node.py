@@ -19,7 +19,10 @@ import numpy as np
 import soundfile as sf
 import librosa
 import torch
+import time, json
 
+from rclpy.parameter import Parameter
+from rcl_interfaces.msg import SetParametersResult
 
 # -------------------------- Config / Enums --------------------------
 
@@ -30,6 +33,7 @@ class AudioFormat(Enum):
 
 class TTSProvider(Enum):
     ELEVENLABS = "elevenlabs"
+    MMS = "mms"
 
 @dataclass
 class TTSConfig:
@@ -175,6 +179,16 @@ class EnhancedTTSNode(Node):
         self.declare_parameter("pad_tail_ms", 900)
         # Text chunking (reduce provider calls, but keep natural prosody)
         self.declare_parameter("max_chars", 220)
+        
+        self.declare_parameter("perf_topic", "/tts/perf")
+        self.perf_topic = self.get_parameter("perf_topic").get_parameter_value().string_value
+        self.pub_perf = self.create_publisher(String, self.perf_topic, 10)
+
+        self.declare_parameter("model_profile", "mms-eng")  # or "elevenlabs-turbo"
+        self.model_profile = (
+            self.get_parameter("model_profile").get_parameter_value().string_value
+        )
+
 
         # Config
         provider = TTSProvider(self.get_parameter("provider").get_parameter_value().string_value)
@@ -196,7 +210,7 @@ class EnhancedTTSNode(Node):
 
         # Components
         self.cache = AudioCache(self.cfg.cache_dir, self.cfg.use_cache)
-        self.provider = TTSProvider_MMS(model_id="facebook/mms-tts-eng")  #TTSProvider_ElevenLabs(self.cfg)
+        self.provider = self._build_provider()  #TTSProvider_ElevenLabs(self.cfg)
 
         # ROS I/O
         self.subscription = self.create_subscription(String, "/tts", self.tts_callback, 10)
@@ -206,10 +220,85 @@ class EnhancedTTSNode(Node):
         qos.history = QoSHistoryPolicy.KEEP_LAST
         self.wav_pub = self.create_publisher(UInt8MultiArray, self.wav_topic, qos)
 
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
         # Log
         st = self.cache.stats()
         self.get_logger().info("🎤 TTS ready → publishing WAV to %s" % self.wav_topic)
         self.get_logger().info(f"   Provider: {self.cfg.provider.value}, Voice: {self.cfg.voice_name}, Cache: {st}")
+
+
+    def _on_set_parameters(self, params):
+        for p in params:
+            # Switch provider/model profile on the fly
+            if p.name == "model_profile" and p.type_ == Parameter.Type.STRING:
+                self.model_profile = p.value
+                self.provider = self._build_provider()
+                self.get_logger().info(f"[tts_node] model_profile changed to: {self.model_profile}")
+
+            # Optionally allow direct provider/model_id changes too
+            if p.name == "provider" and p.type_ == Parameter.Type.STRING:
+                try:
+                    self.cfg.provider = TTSProvider(p.value)
+                    self.provider = self._build_provider()
+                    self.get_logger().info(f"[tts_node] provider changed to: {self.cfg.provider}")
+                except ValueError:
+                    self.get_logger().warn(f"[tts_node] invalid provider: {p.value}")
+
+            if p.name == "model_id" and p.type_ == Parameter.Type.STRING:
+                self.cfg.model_id = p.value
+                self.provider = self._build_provider()
+                self.get_logger().info(f"[tts_node] model_id changed to: {self.cfg.model_id}")
+
+        return SetParametersResult(successful=True, reason="ok")
+
+
+    def _build_provider(self):
+        # Configure cfg.provider from model_profile, if you like
+        if self.model_profile == "mms-eng":
+            self.cfg.provider = TTSProvider.MMS
+            self.cfg.model_id = "facebook/mms-tts-eng"
+            return TTSProvider_MMS(model_id=self.cfg.model_id)
+        elif self.model_profile == "elevenlabs-turbo":
+            self.cfg.provider = TTSProvider.ELEVENLABS
+            self.cfg.model_id = "eleven_turbo_v2_5"
+            return TTSProvider_ElevenLabs(self.cfg)
+        else:
+            self.get_logger().warn(f"Unknown TTS model_profile={self.model_profile}, defaulting to MMS")
+            self.cfg.provider = TTSProvider.MMS
+            self.cfg.model_id = "facebook/mms-tts-eng"
+            return TTSProvider_MMS(model_id=self.cfg.model_id)
+
+
+    # helper: identify current model string for perf records
+    def _tts_model_id(self) -> str:
+        try:
+            # If using ElevenLabs provider
+            if isinstance(self.provider, TTSProvider_ElevenLabs):
+                return f"elevenlabs:{self.cfg.model_id}"
+            # If using MMS provider
+            if isinstance(self.provider, TTSProvider_MMS):
+                return getattr(self.provider, "model", None).name_or_path if hasattr(self.provider, "model") else "facebook/mms-tts-eng"
+        except Exception:
+            pass
+        return "tts:unknown"
+
+    def _publish_perf(self, *, lat_ms: int, ok: bool, phase: str, n_chunks: int, n_bytes: int):
+        payload = {
+            "node": "tts",
+            "task": "audio_tts",
+            "model": self._tts_model_id(),
+            "lat_ms": int(lat_ms),
+            "ok": bool(ok),
+            "phase": phase,                      # e.g., "synthesize_total"
+            "n_chunks": int(n_chunks),
+            "n_bytes": int(n_bytes),
+            "ts": time.time(),
+        }
+        try:
+            self.pub_perf.publish(String(data=json.dumps(payload)))
+        except Exception as e:
+            self.get_logger().warn(f"TTS perf publish failed: {e}")
 
     # ---------- Text handling ----------
 
@@ -313,6 +402,10 @@ class EnhancedTTSNode(Node):
     # ---------- Callback ----------
 
     def tts_callback(self, msg: String) -> None:
+        t_start = time.time()
+        ok = False
+        total_bytes = 0
+        n_chunks = 0
         try:
             text = msg.data.strip()
             if not text:
@@ -320,21 +413,35 @@ class EnhancedTTSNode(Node):
                 return
 
             pieces = self._chunk_text(text, self.max_chars)
-            self.get_logger().info(f"🔊 Synthesizing {len(pieces)} piece(s)…")
+            n_chunks = len(pieces)
+            self.get_logger().info(f"🔊 Synthesizing {n_chunks} piece(s)…")
 
             clips = []
             for i, piece in enumerate(pieces, 1):
-                self.get_logger().info(f"  • chunk {i}/{len(pieces)}")
-                audio = self._synthesize_chunk_bytes(piece)   # see below
+                c0 = time.time()
+                self.get_logger().info(f"  • chunk {i}/{n_chunks}")
+                audio = self._synthesize_chunk_bytes(piece)
+                c_ms = int((time.time() - c0) * 1000)
+                # Optional per-chunk perf emission (comment out if too chatty):
+                self._publish_perf(lat_ms=c_ms, ok=True, phase="chunk", n_chunks=1, n_bytes=len(audio))
                 clips.append(audio)
 
             wav = self._concat_audio_chunks_to_wav(clips)
+            total_bytes = len(wav)
             self._publish_wav(wav)
+            ok = True
             self.get_logger().info("✅ TTS done.")
-
         except Exception as e:
             self.get_logger().error(f"❌ TTS error: {e}")
-
+        finally:
+            total_ms = int((time.time() - t_start) * 1000)
+            self._publish_perf(
+                lat_ms=total_ms,
+                ok=ok,
+                phase="synthesize_total",
+                n_chunks=n_chunks,
+                n_bytes=total_bytes,
+            )
 
 def main(args=None):
     rclpy.init(args=args)

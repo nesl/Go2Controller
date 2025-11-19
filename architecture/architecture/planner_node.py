@@ -11,6 +11,9 @@ from typing import List, Dict, Any, Optional
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter                      # NEW
+from rcl_interfaces.msg import SetParametersResult         # NEW
+
 from std_msgs.msg import String as StringMsg
 from std_srvs.srv import Trigger
 
@@ -66,38 +69,72 @@ NEEDS_SCHEMA = {
 
 # ---------- Prompt snippets ----------
 SYSTEM_PLAN = (
-  "You are the HIGH-LEVEL PLANNER for a mobile robot collaborating with two humans across areas A/B.\n"
-  "Objective: find all Bluetooth-tagged objects and place each into the correct bin (clean vs contaminated).\n"
-  "Inputs:\n"
-  " • ContextCapsule (trigger, budgets, recent event trace, phase/goals, allowed DB objects and example rows the broker can query)\n"
-  " • Profiles (digital-twin summaries for Human A / Human B)\n"
-  " • Facts (compact SQL-derived tables from the broker)\n\n"
-  "When you mark something as OPEN in Evidence & Uncertainty, phrase it in terms of information\n"
-  "that could be obtained by SQL SELECTs over the objects in the SchemaCard, not arbitrary world knowledge.\n"
-  "OUTPUT: STRICT JSON ONLY matching the schema.\n"
-  "Inside plan_doc, write a short narrative (≤ 220 words) using THIS fixed section template and rules:\n"
-  "  Situation: <what just happened, who’s present, basket state, backlog highlights>.\n"
-  "  Intent: <goal and subgoals in plain words>.\n"
-  "  Action Sketch: <2–5 step sketch using ONLY these verbs: approach, ask_scan, confirm, pick, carry, deliver, verify, handoff>.\n"
-  "  Evidence & Uncertainty: <cite key evidence; mark gaps as OPEN: ...>.\n"
-  "  Coordination & Tone: <how to speak/gesture to each human>.\n"
-  "  Hard Constraints: <capacity/bin access/time/safety>.\n"
-  "Refer to entities with canonical tags inline, e.g., object_id=CNode12, area=A|B|H1_zone|H2_zone, bin=clean|contaminated.\n"
-  "Keep it groundable, do not invent IDs; if unknown, mark OPEN.\n"
-  "Be proactive when idle; confirm when uncertainty is high; minimize travel; resolve label disagreements. Check what the trigger event was to ground your decisions.\n"
+"""
+You are the HIGH-LEVEL PLANNER for a mobile robot collaborating with two humans across areas A/B.
+Objective: find all Bluetooth-tagged objects and place each into the correct bin (clean vs contaminated).
+Inputs:
+ • ContextCapsule (trigger, budgets, recent event trace, phase/goals, allowed DB objects and example rows the broker can query)
+ • Profiles (digital-twin summaries for Human A / Human B)
+ • Facts (compact SQL-derived tables from the broker)
+
+TRIGGER-DRIVEN OBJECTIVE (CRITICAL):
+
+Always treat ContextCapsule.trigger as the PRIMARY objective for this plan.
+
+1. If ContextCapsule.trigger.type == "human_command":
+   - Your first job is to understand what problem the human wants solved.
+   - Read the command text (e.g., trigger_event.data.text or trigger.command_text).
+   - Your Intent MUST explicitly paraphrase the human’s request in plain words.
+   - Your Action Sketch MUST show a small sequence of steps that directly satisfy this request.
+
+2. Use event_trace, world, Facts, and schema_card ONLY to:
+   - Resolve vague references in the command (e.g., "here", "this one", "over there").
+   - Identify likely referents (e.g., which object the human might mean).
+   - Check constraints (capacity, safety, current load, bin locations).
+   - Confirm whether the requested action is feasible.
+
+3. You MUST NOT pursue unrelated backlog goals in this plan:
+   - Do NOT pick, scan, carry, or deliver other objects that the human did not ask about.
+   - Do NOT start binning work just because there is a to_pick backlog, unless the command itself mentions objects/bins/contamination.
+
+4. Special cases:
+   - Pure navigation/positioning commands (e.g., "come here", "come over", "follow me", "stop there"):
+       - Intent: move or position the robot as requested by the human.
+       - Action Sketch: use ONLY approach and verify steps (e.g., approach the speaker; verify arrival).
+       - You may mention backlog in Evidence & Uncertainty, but you may NOT act on it in this plan.
+   - Object-related commands (e.g., "scan this", "bring CNode101 to the contaminated bin"):
+       - You MAY combine the global binning objective with the command.
+       - Still, the human's request anchors the plan: Intent and Action Sketch should show how you satisfy the command first.
+
+5. It is an ERROR to propose picking, scanning, or delivering objects based solely on backlog when the latest trigger is a human_command that does not mention those objects.
+
+When you mark something as OPEN in Evidence & Uncertainty, phrase it in terms of information
+that could be obtained by SQL SELECTs over the objects in the SchemaCard, not arbitrary world knowledge.
+OUTPUT: STRICT JSON ONLY matching the schema.
+Inside plan_doc, write a short narrative (< 220 words) using THIS fixed section template and rules:
+  Situation: <what just happened, who’s present, basket state, backlog highlights>.
+  Intent: <goal and subgoals in plain words>.
+  Action Sketch: <2–5 step sketch: move, say, gesture, query, sense, analyze visual scene, carry (you cannot pick up objects, you need a human for that)>.
+  Evidence & Uncertainty: <cite key evidence; mark gaps as OPEN: ...>.
+  Coordination & Tone: <how to speak/gesture to each human>.
+  Hard Constraints: <capacity/bin access/time/safety>.
+Refer to entities with canonical tags inline, e.g., object_id=CNode12, area=A|B|H1_zone|H2_zone, bin=clean|contaminated.
+Keep it groundable, do not invent IDs; if unknown, mark OPEN.
+Be proactive when idle; confirm when uncertainty is high; minimize travel; resolve label disagreements. Check what the trigger event was to ground your decisions.
+"""
 )
 
 EX_USER_PLAN = {
   "ContextCapsule": {"trigger":{"type":"new_object","hints":{"object_id":"CNode12"}}},
   "Profiles": {"human_a":{"style":"concise"}, "human_b":{"style":"confirm"}},
-  "Facts": {"vw_object_sheet":[{"node_id":"CNode12","in_basket":0,"best_zone":"B",
-                               "robot_probability":0.63,"human_a_probability":0.76}]}
+  "Facts": {"packs":[{"vw_object_sheet":[{"node_id":"CNode12","in_basket":0,"best_zone":"B",
+                               "robot_probability":0.63,"human_a_probability":0.76}]}]}
 }
 EX_ASSISTANT_PLAN = {
   "plan_header":{
     "objective":"Bin all nodes correctly",
     "time_horizon":"short",
-    "priority":["resolve CNode12 disagreement","reduce travel B→A"],
+    "priority":["resolve CNode12 disagreement","reduce travel B to A"],
     "communication_policy":{"human_a":"proactive+brief","human_b":"reactive+confirm"},
     "risk_flags":["label_disagreement:CNode12"],
     "assumptions":["contaminated bin in H2_zone"]
@@ -105,7 +142,7 @@ EX_ASSISTANT_PLAN = {
   "plan_doc":
     "Situation: New item object_id=CNode12 scanned by Human A; robot in area=H1_zone; bin=contaminated is in area=H2_zone; basket 1/4 full.\n"
     "Intent: Confirm label for CNode12 and place it in the correct bin.\n"
-    "Action Sketch: approach H1; ask_scan CNode12 via NFC; confirm contamination; carry to bin=contaminated in area=H2_zone if p≥0.7; deliver; verify with Human B.\n"
+    "Action Sketch: approach H1; ask_scan CNode12 via NFC; confirm contamination; carry to bin=contaminated in area=H2_zone if p>0.7; deliver; verify with Human B.\n"
     "Evidence & Uncertainty: strongest RSSI in H1_zone; human_a p=0.76 vs robot p=0.63. OPEN: reconcile.\n"
     "Coordination & Tone: brief single-step prompts for Human A; confirmation question for Human B.\n"
     "Hard Constraints: capacity OK; cross-area travel allowed; keep path short via corridor C2."
@@ -158,14 +195,16 @@ class PlannerNode(Node):
         self.declare_parameter("facts_topic", "/broker/facts")
         self.declare_parameter("capsule_topic", "/broker/context_capsule")
         self.declare_parameter("profiles_topic", "/profiles/summary")
-        
+
+        # NEW: LLM perf topic (matches task_registry llm_planner perf.json)
+        self.declare_parameter("perf_topic", "/llm/planner_perf")   # NEW
+
         self.declare_parameter("max_open_iterations", 0)
         self.max_open_iters = int(self.get_parameter("max_open_iterations").value)
 
         self._waiting_for_info = False
         self._open_items = []        # last OPEN tags extracted from plan_doc
         self._open_iter = 0          # how many refine rounds we’ve done in this cycle
-
 
         self.model = self.get_parameter("model").get_parameter_value().string_value
         self.temp_plan = float(self.get_parameter("temperature_plan").value)
@@ -178,6 +217,8 @@ class PlannerNode(Node):
         self.capsule_topic = self.get_parameter("capsule_topic").get_parameter_value().string_value
         self.profiles_topic = self.get_parameter("profiles_topic").get_parameter_value().string_value
 
+        self.perf_topic = self.get_parameter("perf_topic").get_parameter_value().string_value  # NEW
+
         # --- State (working set) ---
         self._facts_buffer: List[Dict[str, Any]] = []   # list of fact packs
         self._capsule: Dict[str, Any] = {}              # last context capsule
@@ -189,32 +230,58 @@ class PlannerNode(Node):
 
         # --- ROS I/O ---
         self.sub_facts = self.create_subscription(StringMsg, self.facts_topic, self._on_facts, 40)
-        
+
         self.sub_facts_delta = self.create_subscription(
             StringMsg,
             "/broker/facts_delta",
             self._on_facts_delta,
             40
         )
-        
+
         self.sub_capsule = self.create_subscription(StringMsg, self.capsule_topic, self._on_capsule, 10)
         self.sub_profiles = self.create_subscription(StringMsg, self.profiles_topic, self._on_profiles, 10)
 
         self.sub_plan_req = self.create_subscription(StringMsg, "/planner/plan_req", self._on_plan_req, 10)
 
         self.pub_plan = self.create_publisher(StringMsg, "/planner/plan_out", 10)
-
-
-        self.srv_plan = self.create_service(Trigger, "/planner/plan", self._srv_plan)
         self.pub_needs = self.create_publisher(StringMsg, "/planner/needs", 10)
 
-        self.get_logger().info(f"planner_node up | model={self.model}")
+        # NEW: LLM perf publisher
+        self.pub_perf = self.create_publisher(StringMsg, self.perf_topic, 10)
+
+        self.srv_plan = self.create_service(Trigger, "/planner/plan", self._srv_plan)
+
+        # Optional needs service (you had a handler already; wiring it is harmless)
+        self.srv_needs = self.create_service(Trigger, "/planner/needs_srv", self._srv_needs)  # NEW name to avoid clash
+
+        # NEW: allow changing model via /planner_node/set_parameters
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
+        self.get_logger().info(f"planner_node up | model={self.model} perf_topic={self.perf_topic}")
+
+    # ---------- Dynamic parameters ----------
+    def _on_set_parameters(self, params):
+        """
+        Allow runtime changes such as:
+          ros2 param set /planner_node model gpt-4.1-mini
+        """
+        for p in params:
+            if p.name == "model" and p.type_ == Parameter.Type.STRING:
+                self.model = p.value
+                self.get_logger().info(f"[planner] model changed to: {self.model}")
+            elif p.name == "temperature_plan" and p.type_ in (Parameter.Type.DOUBLE, Parameter.Type.INTEGER):
+                self.temp_plan = float(p.value)
+                self.get_logger().info(f"[planner] temperature_plan -> {self.temp_plan}")
+            elif p.name == "temperature_needs" and p.type_ in (Parameter.Type.DOUBLE, Parameter.Type.INTEGER):
+                self.temp_needs = float(p.value)
+                self.get_logger().info(f"[planner] temperature_needs -> {self.temp_needs}")
+        return SetParametersResult(successful=True, reason="ok")
 
     # ---------- Subscribers ----------
     def _on_facts(self, msg: StringMsg):
-        
+
         self.get_logger().info(f'received facts: {msg}')
-    
+
         try:
             pack = json.loads(msg.data)
         except Exception:
@@ -250,6 +317,7 @@ class PlannerNode(Node):
 
     def _step_planning_cycle(self):
         # 1) Plan once given current facts/capsule/profiles
+        self.get_logger().info("step_planning_cycle")
         plan = self._plan_once()
         hints = plan.get("_hints") or {}
         open_items = hints.get("open_items") or []
@@ -268,7 +336,6 @@ class PlannerNode(Node):
             self.pub_needs.publish(StringMsg(data=json.dumps(needs, ensure_ascii=False)))
             self.get_logger().info(f"planner: requesting more info, iter={self._open_iter}, open={open_items}")
             # DO NOT publish the plan as 'final' yet; it's provisional.
-            # If you want, you can add plan["_meta"]["status"] = "draft".
             return
 
         # 3) We are done (no OPEN gaps or hit iteration cap)
@@ -283,7 +350,6 @@ class PlannerNode(Node):
         self.pub_plan.publish(StringMsg(data=json.dumps(plan, ensure_ascii=False)))
         self.get_logger().info(f"planner: published final plan (iterations={self._open_iter}, open_items={len(open_items)}): {plan}")
 
-
     def _on_capsule(self, msg: StringMsg):
         try:
             capsule = json.loads(msg.data)
@@ -296,8 +362,8 @@ class PlannerNode(Node):
 
         cap = dict(capsule)
         cap["event_trace"] = trace
+        # NOTE: any perf info that the broker put under cap["perf"] is preserved
         self._capsule = cap
-
 
     def _on_profiles(self, msg: StringMsg):
         try:
@@ -350,7 +416,7 @@ class PlannerNode(Node):
                 compact[k] = v
         return compact
 
-    def _build_llm_messages_plan(self) -> list[dict]:
+    def _build_llm_messages_plan(self) -> List[dict]:
         payload = {
             "ContextCapsule": self._capsule or {},
             "Profiles": self._profiles or {},
@@ -358,11 +424,10 @@ class PlannerNode(Node):
         }
         return [
             {"role":"system","content": SYSTEM_PLAN},
-            {"role":"user","content": json.dumps(EX_USER_PLAN, ensure_ascii=False)},
-            {"role":"assistant","content": json.dumps(EX_ASSISTANT_PLAN, ensure_ascii=False)},
+            #{"role":"user","content": json.dumps(EX_USER_PLAN, ensure_ascii=False)},
+            #{"role":"assistant","content": json.dumps(EX_ASSISTANT_PLAN, ensure_ascii=False)},
             {"role":"user","content": json.dumps(payload, ensure_ascii=False)}
         ]
-
 
     def _build_llm_messages_needs(self) -> List[Dict[str, str]]:
         ex_user = {
@@ -387,49 +452,98 @@ class PlannerNode(Node):
             {"role":"user","content": json.dumps(payload, ensure_ascii=False)}
         ]
 
-    def _chat_json(self, messages: List[Dict[str,str]],
+    def _publish_perf(self, phase: str, lat_ms: float, ok: bool):
+        """Publish a simple JSON perf record for this LLM call."""
+        payload = {
+            "node": "planner",
+            "model": self.model,
+            "lat_ms": float(lat_ms),
+            "ok": bool(ok),
+            "phase": phase
+        }
+        try:
+            self.pub_perf.publish(StringMsg(data=json.dumps(payload)))
+        except Exception as e:
+            self.get_logger().warn(f"[planner] failed to publish perf: {e}")
+
+    def _chat_json(self,
+                   messages: List[Dict[str,str]],
                    schema: Dict[str,Any],
                    temperature: float,
                    max_tokens: int = 700,
-                   retries: int = 1) -> Dict[str, Any]:
-        
-        self.get_logger().info("starting llm")            
-       
+                   retries: int = 1,
+                   phase: str = "plan") -> Dict[str, Any]:
+        """
+        Call the LLM, enforce JSON/schema, and measure latency.
+        phase ∈ {"plan","needs"} for perf tagging.
+        """
+
+        self.get_logger().info(f"starting llm phase={phase}")
+
+        last_exc: Optional[Exception] = None
         for _ in range(retries + 1):
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "PlannerOutput",
-                        "schema": schema     # ← your PLAN_SCHEMA or NEEDS_SCHEMA
-                    }
-                },
-            )
-
-            # DEBUG PRINT — raw prompt + raw assistant content
+            t0 = time.time()
+            ok = False
+            content = None
             try:
-                self.get_logger().info("\n=== LLM PROMPT ===\n" + json.dumps(messages, indent=2))
-            except Exception:
-                # occasionally messages may contain non-serializable fields
-                self.get_logger().info("=== LLM PROMPT (non-JSON-printable) ===")
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "PlannerOutput",
+                            "schema": schema     # ← your PLAN_SCHEMA or NEEDS_SCHEMA
+                        }
+                    },
+                )
+                t1 = time.time()
+                lat_ms = (t1 - t0) * 1000.0
+                ok = True
 
-            content = resp.choices[0].message.content
+                # DEBUG PRINT — raw prompt + raw assistant content
+                try:
+                    self.get_logger().info("\n=== LLM PROMPT ===\n" + json.dumps(messages, indent=2))
+                except Exception:
+                    # occasionally messages may contain non-serializable fields
+                    self.get_logger().info("=== LLM PROMPT (non-JSON-printable) ===")
 
-            self.get_logger().info(f"\n=== LLM RAW RESPONSE ===\n{content}\n")
+                content = resp.choices[0].message.content
+                self.get_logger().info(f"\n=== LLM RAW RESPONSE ===\n{content}\n")
 
-            try:
+                # Try to parse/validate
                 obj = json.loads(content)
                 validate(instance=obj, schema=schema)
+
+                # Publish perf only after successful call + parse
+                self._publish_perf(phase=phase, lat_ms=lat_ms, ok=True)
                 return obj
-            except (json.JSONDecodeError, ValidationError):
-                messages = messages + [{"role": "system", "content": "Return ONLY valid JSON per the schema. No prose."}]
-        raise ValueError("LLM did not return valid JSON for schema")
+
+            except Exception as e:
+                last_exc = e
+                # still record latency if we measured it
+                t1 = time.time()
+                lat_ms = (t1 - t0) * 1000.0
+                self._publish_perf(phase=phase, lat_ms=lat_ms, ok=False)
+
+                # tighten the instruction and try again
+                messages = messages + [{
+                    "role": "system",
+                    "content": "Return ONLY valid JSON per the schema. No prose."
+                }]
+
+        raise ValueError(f"LLM did not return valid JSON for schema: {last_exc}")
 
     def _plan_once(self) -> Dict[str, Any]:
         msgs = self._build_llm_messages_plan()
-        obj = self._chat_json(msgs, PLAN_SCHEMA, temperature=self.temp_plan, max_tokens=900, retries=1)
+        obj = self._chat_json(
+            msgs,
+            PLAN_SCHEMA,
+            temperature=self.temp_plan,
+            max_tokens=900,
+            retries=1,
+            phase="plan"
+        )
 
         # cap narrative length a bit (LLM should comply, but belt-and-suspenders)
         doc = obj.get("plan_doc","").strip()
@@ -440,15 +554,30 @@ class PlannerNode(Node):
 
         # quick hints for orchestrator (optional)
         obj["_hints"] = _extract_hints(doc)
-        obj["_meta"]  = {"ws_id": self._ws_id, "ts": time.time(), "packs_used": len(self._facts_buffer)}
+        obj["_meta"]  = {
+            "ws_id": self._ws_id,
+            "ts": time.time(),
+            "packs_used": len(self._facts_buffer),
+            "model": self.model
+        }
         self._ws_id += 1
         return obj
 
-
     def _needs_once(self) -> Dict[str, Any]:
         msgs = self._build_llm_messages_needs()
-        obj = self._chat_json(msgs, NEEDS_SCHEMA, temperature=self.temp_needs, max_tokens=500, retries=1)
-        obj["_meta"] = {"ws_id": self._ws_id, "ts": time.time()}
+        obj = self._chat_json(
+            msgs,
+            NEEDS_SCHEMA,
+            temperature=self.temp_needs,
+            max_tokens=500,
+            retries=1,
+            phase="needs"
+        )
+        obj["_meta"] = {
+            "ws_id": self._ws_id,
+            "ts": time.time(),
+            "model": self.model
+        }
         return obj
 
     # ---------- Shutdown ----------

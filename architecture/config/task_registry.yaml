@@ -192,4 +192,200 @@ tasks:
         # schema_hint (conceptual):
         # '{"skill":str,"status":str,"reason":str,"step_idx":int,"ctx":{...}}'
 
+  # ─────────────────────────────
+  # LLM tasks (broker, planner, orchestrator)
+  # ─────────────────────────────
+
+  llm_broker:
+    description: "LLM that turns event + world state into SQL queries and facts."
+    node: "/broker_node"
+    outputs:
+      - id: facts.json
+        ros:
+          topic: "/broker/facts"
+          msg: "std_msgs/String"
+      - id: facts_delta.json
+        ros:
+          topic: "/broker/facts_delta"
+          msg: "std_msgs/String"
+      - id: perf.json
+        kind: perf
+        ros:
+          topic: "/llm/broker_perf"
+          msg: "std_msgs/String"
+        schema_hint: '{"node":"broker","model":str,"lat_ms":num,"ok":bool,"phase":str}'
+    models:
+      - id: gpt-5-nano
+        version: "gpt-5.1-nano"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 40.0 }
+        resources:
+          device_pref: ["cloud"]
+      - id: gpt-4.1-mini
+        version: "gpt-4.1-mini"
+        role: "higher_quality"
+        metrics:
+          latency_ms: { typical: 120.0 }
+        resources:
+          device_pref: ["cloud"]
+
+  llm_planner:
+    description: "LLM that turns broker facts + goals into high-level task plans."
+    node: "/planner_node"
+    outputs:
+      - id: plan.json
+        ros:
+          topic: "/planner/plan"
+          msg: "std_msgs/String"
+      - id: needs.json
+        ros:
+          topic: "/planner/needs"
+          msg: "std_msgs/String"
+      - id: perf.json
+        kind: perf
+        ros:
+          topic: "/llm/planner_perf"
+          msg: "std_msgs/String"
+        schema_hint: '{"node":"planner","model":str,"lat_ms":num,"ok":bool,"phase":str}'
+    models:
+      - id: gpt-4.1-mini
+        version: "gpt-4.1-mini"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 150.0 }
+        resources:
+          device_pref: ["cloud"]
+      - id: gpt-4.1
+        version: "gpt-4.1"
+        role: "high_reasoning"
+        metrics:
+          latency_ms: { typical: 300.0 }
+        resources:
+          device_pref: ["cloud"]
+
+  llm_orchestrator:
+    description: "LLM that maps plans into executable skills and orchestrates execution."
+    node: "/orchestrator_node"
+    outputs:
+      - id: skills_to_run.json
+        ros:
+          topic: "/orchestrator/skills"
+          msg: "std_msgs/String"
+      - id: perf.json
+        kind: perf
+        ros:
+          topic: "/llm/orchestrator_perf"
+          msg: "std_msgs/String"
+        schema_hint: '{"node":"orchestrator","model":str,"lat_ms":num,"ok":bool,"phase":str}'
+    models:
+      - id: gpt-4.1-mini
+        version: "gpt-4.1-mini"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 120.0 }
+        resources:
+          device_pref: ["cloud"]
+      - id: gpt-5-nano
+        version: "gpt-5.1-nano"
+        role: "low_latency_fallback"
+        metrics:
+          latency_ms: { typical: 40.0 }
+        resources:
+          device_pref: ["cloud"]
+
+
+  audio_tts:
+    description: "Text-to-speech synthesis; publishes WAV bytes for playback and perf telemetry."
+    node: "/tts_node"
+    outputs:
+      - id: wav.bytes
+        ros: { msg: std_msgs/UInt8MultiArray, topic: "/tts_wav" }
+      - id: perf.json
+        kind: perf
+        ros:
+          msg: std_msgs/String
+          topic: "/tts/perf"
+        schema_hint: >
+          {"node":"tts","task":"audio_tts","model":str,"lat_ms":num,"ok":bool,
+           "phase":str,"n_chunks":int,"n_bytes":int,"ts":num}
+           
+    services:
+      set_model:
+        param_service: "/tts_node/set_parameters"
+        param_name: "model_profile"
+        type: "rcl_interfaces/SetParameters"
+           
+    models:
+      - id: mms-eng
+        version: "facebook/mms-tts-eng"
+        description: "Open VITS-based English TTS (HF)."
+        metrics:
+          latency_ms: { synth_total_typical: 250.0 }   # ballpark; updated by runtime EMA
+          throughput_fps: { n/a: 0.0 }
+        resources: { device_pref: ["cuda","cpu"], memory_mb: 900, vram_mb: 800 }
+        parameters:
+          target_sr: { default: 16000 }
+          use_half: { default: false }
+      - id: elevenlabs-turbo
+        version: "eleven_turbo_v2_5"
+        description: "Cloud TTS (fast, expressive)."
+        metrics:
+          latency_ms: { synth_total_typical: 180.0 }
+        resources: { device_pref: ["cloud"] }
+        parameters:
+          voice_name: { default: "XrExE9yKIg1WjnnlVkGX" }
+          stability: { default: 0.50 }
+          similarity_boost: { default: 0.50 }
+
+  vlm_inference:
+    description: "Vision-language model answering prompts about the latest camera frame."
+    node: "/qwen_vlm_server"
+    outputs:
+      - id: answer.text
+        ros:
+          msg: std_msgs/String
+          topic: "/vlm/answer"
+      - id: perf.json
+        kind: perf
+        ros:
+          msg: std_msgs/String
+          topic: "/vlm/perf"
+        schema_hint: >
+          {"node":"vlm","task":"vlm_inference","model":str,"lat_ms":num,
+           "ok":bool,"phase":str,"prompt_len":int,"answer_len":int,"ts":num}
+    services:
+      enable:
+        name: "/vlm/enable"
+        type: "std_srvs/SetBool"
+      set_model:
+        param_service: "/qwen_vlm_server/set_parameters"
+        param_name: "model_id"
+        type: "rcl_interfaces/SetParameters"
+    models:
+      - id: qwen2.5-vl-7b-int4
+        version: "Qwen/Qwen2.5-VL-7B-Instruct"
+        description: "7B Qwen VLM, int4 quantized."
+        metrics:
+          latency_ms: { run_trigger_typical: 800.0 }   # rough; will be refined by EMA
+        resources:
+          device_pref: ["cuda","cpu"]
+          memory_mb: 16000
+          vram_mb: 12000
+        parameters:
+          int4: { default: true }
+          bf16: { default: true }
+      - id: qwen2.5-vl-7b-bf16
+        version: "Qwen/Qwen2.5-VL-7B-Instruct"
+        description: "7B Qwen VLM, full bf16."
+        metrics:
+          latency_ms: { run_trigger_typical: 1200.0 }
+        resources:
+          device_pref: ["cuda"]
+          memory_mb: 20000
+          vram_mb: 16000
+        parameters:
+          int4: { default: false }
+          bf16: { default: true }
+
 

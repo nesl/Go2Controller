@@ -17,6 +17,11 @@ import requests
 from openai import OpenAI
 from jsonschema import validate, ValidationError
 
+import yaml  # NEW
+from rclpy.parameter import Parameter          # NEW
+from rcl_interfaces.msg import SetParametersResult  # NEW
+
+
 # LLM reply must be STRICT JSON like: {"sql":"SELECT ...", "params": {...}, "purpose":"..."}
 LLM_SQL_SCHEMA = {
   "type": "object",
@@ -58,7 +63,7 @@ class BrokerNode(Node):
 
         # Event → trigger mapping (basic/composite rule id → semantic trigger)
         self.declare_parameter('trigger_map_json', json.dumps({
-            "speech_final_any": "human_command",
+            "trigger_speech_final": "human_command",
         }))
 
         # Contamination fetch policy (broker owns it)
@@ -92,6 +97,41 @@ class BrokerNode(Node):
         self.declare_parameter("llm_model", "gpt-5-nano")
         self.client = OpenAI()
         self.llm_model = self.get_parameter("llm_model").get_parameter_value().string_value
+
+        self.declare_parameter("llm_perf_topic", "/llm/broker_perf")
+        self.llm_perf_topic = (
+            self.get_parameter("llm_perf_topic")
+            .get_parameter_value()
+            .string_value
+        )
+        
+        # NEW: task registry path so we can subscribe to perf topics
+        self.declare_parameter(
+            "task_registry_path",
+            os.path.expanduser("~/.task_registry.yaml")
+        )
+        
+        self.declare_parameter("human_agent_id", "human_a")  # or whatever label you use
+        self.human_agent_id = (
+            self.get_parameter("human_agent_id")
+            .get_parameter_value()
+            .string_value
+        )
+        
+        self.task_registry_path = (
+            self.get_parameter("task_registry_path")
+            .get_parameter_value()
+            .string_value
+        )
+
+        # simple EMA of broker LLM latency (ms)
+        self._llm_lat_ema_ms: Optional[float] = None
+        self._llm_lat_alpha: float = 0.3
+
+        self.pub_llm_perf = self.create_publisher(
+            StringMsg, self.llm_perf_topic, 10
+        )
+
 
         # Parameters → members
         self.db_path       = self.get_parameter('db_path').get_parameter_value().string_value
@@ -143,11 +183,23 @@ class BrokerNode(Node):
         self._current_trigger = None               # {"type": "...", "hints": {...}}
         self._ws = {}                               # ws_id -> {"hashes": set(), "iters": int}
 
+        # NEW: runtime perf database (EMA per task/model)
+        # key: (task_id, model_id or "default")
+        # val: {"lat_ms_ema": float, "n": int, "last_ts": float}
+        self._perf_ema = {}
+        self._perf_lock = threading.Lock()
+
+        # Subscribe to all perf topics from task_registry
+        self._perf_subscriptions = []
+        self._load_task_registry_and_subscribe_perf()
+
         # ------------ ROS I/O ------------
         # Events
         self.sub_basic = self.create_subscription(StringMsg, self.bus_topic, self._on_basic_event, 1000)
         self.sub_comp  = self.create_subscription(StringMsg, "/events/composite", self._on_comp_event, 500)
 
+        # Allow changing llm_model via /broker_node/set_parameters
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         # Planner needs (reactive loop)
         self.sub_needs = self.create_subscription(StringMsg, "/planner/needs", self._on_planner_needs, 20)
@@ -181,6 +233,196 @@ class BrokerNode(Node):
             f"target_frame={self.target_frame} zone_split_x={self.zone_split_x} server={self.server_url} "
             f"enable_server={self.enable_server}"
         )
+
+    # ------------------------------ Perf topic discovery ------------------------------
+    def _load_task_registry_and_subscribe_perf(self):
+        """
+        Read task_registry.yaml, find all outputs with kind: perf,
+        and subscribe to their topics as std_msgs/String.
+
+        Expected structure (per your registry):
+          tasks:
+            task_id:
+              outputs:
+                - id: perf.json
+                  kind: perf
+                  ros:
+                    topic: "/yolo_perf"
+                    msg: "std_msgs/String"
+        """
+        path = self.task_registry_path
+        if not path or not os.path.isfile(path):
+            self.get_logger().warn(f"[broker] task_registry_path not found: {path}")
+            return
+
+        try:
+            with open(path, "r") as f:
+                doc = yaml.safe_load(f) or {}
+        except Exception as e:
+            self.get_logger().warn(f"[broker] failed to read task registry '{path}': {e}")
+            return
+
+        tasks = doc.get("tasks") or {}
+        seen_topics = set()
+
+        for task_id, task in tasks.items():
+            outputs = task.get("outputs") or []
+            for out in outputs:
+                # Perf outputs are marked with kind: perf in your registry
+                if str(out.get("kind", "")).lower() != "perf":
+                    continue
+                ros_cfg = out.get("ros") or {}
+                topic = ros_cfg.get("topic")
+                if not topic or topic in seen_topics:
+                    continue
+                seen_topics.add(topic)
+
+                # Subscribe as std_msgs/String; we parse JSON ourselves
+                self.get_logger().info(
+                    f"[broker] subscribing to perf topic '{topic}' for task '{task_id}'"
+                )
+                sub = self.create_subscription(
+                    StringMsg,
+                    topic,
+                    # capture task_id & topic in closure
+                    lambda msg, t_id=task_id, t_topic=topic: self._on_perf_msg(t_id, t_topic, msg),
+                    50,
+                )
+                self._perf_subscriptions.append(sub)
+
+    # ------------------------------ Perf ingestion ------------------------------
+    def _on_perf_msg(self, task_id: str, topic: str, msg: StringMsg):
+        """
+        Generic perf handler.
+
+        We try to extract:
+          - model_id (if present, e.g., payload["model"])
+          - a latency value in ms (lat_ms or latency_ms{...})
+        and maintain an EMA per (task_id, model_id).
+        """
+        try:
+            payload = json.loads(msg.data) if msg.data else {}
+        except Exception as e:
+            self.get_logger().warn(f"[broker] perf JSON parse error from {topic}: {e}")
+            return
+
+        ts = time.time()
+        model_id = None
+        lat_ms = None
+
+        # LLM perf (our schema_hint): {"node":"broker","model":str,"lat_ms":num,"ok":bool,"phase":str}
+        if isinstance(payload, dict):
+            if "model" in payload and isinstance(payload.get("lat_ms"), (int, float)):
+                model_id = str(payload.get("model"))
+                lat_ms = float(payload.get("lat_ms"))
+
+            # Vision / audio perf: {"latency_ms": {...}, "fps_ema": ...}
+            if lat_ms is None and isinstance(payload.get("latency_ms"), dict):
+                lm = payload["latency_ms"]
+                # Prefer total if present, otherwise take any one of the known keys
+                for key in ("total", "det", "pose", "utter_infer_mean", "window_infer_mean"):
+                    v = lm.get(key)
+                    if isinstance(v, (int, float)):
+                        lat_ms = float(v)
+                        break
+
+            # Fallback: direct numeric latency_ms
+            if lat_ms is None and isinstance(payload.get("latency_ms"), (int, float)):
+                lat_ms = float(payload["latency_ms"])
+
+        if lat_ms is None:
+            # Nothing we can aggregate
+            return
+
+        if not model_id:
+            model_id = "default"
+
+        key = (task_id, model_id)
+        alpha = 0.3  # EMA smoothing factor
+
+        with self._perf_lock:
+            ent = self._perf_ema.get(key)
+            if ent is None:
+                ent = {"lat_ms_ema": lat_ms, "n": 1, "last_ts": ts}
+            else:
+                ent["lat_ms_ema"] = (1.0 - alpha) * ent["lat_ms_ema"] + alpha * lat_ms
+                ent["n"] = ent.get("n", 0) + 1
+                ent["last_ts"] = ts
+            self._perf_ema[key] = ent
+
+
+    def _perf_summary(self) -> dict:
+        """
+        Return a nested summary:
+        {
+          "task_id": {
+            "model_id": {
+              "lat_ms_ema": float,
+              "samples": int,
+              "last_ts": float
+            },
+            ...
+          },
+          ...
+        }
+        """
+        out: Dict[str, Dict[str, dict]] = {}
+        with self._perf_lock:
+            for (task_id, model_id), ent in self._perf_ema.items():
+                task_entry = out.setdefault(task_id, {})
+                task_entry[model_id] = {
+                    "lat_ms_ema": ent.get("lat_ms_ema"),
+                    "samples": ent.get("n", 0),
+                    "last_ts": ent.get("last_ts"),
+                }
+        return out
+
+
+    # ------------------------------ Dynamic param handling ------------------------------
+    def _on_set_parameters(self, params):
+        """
+        React to dynamic parameter updates, in particular llm_model.
+        This allows you to call:
+          ros2 param set /broker_node llm_model gpt-4.1-mini
+        and have the broker switch models immediately.
+        """
+        for p in params:
+            if p.name == "llm_model" and p.type_ == Parameter.Type.STRING:
+                self.llm_model = p.value
+                self.get_logger().info(f"[broker] llm_model changed to: {self.llm_model}")
+        return SetParametersResult(successful=True, reason="ok")
+
+
+    def _publish_llm_perf(self, lat_ms: int, ok: bool, phase: str):
+        """
+        Publish LLM latency as a small JSON perf record and keep a local EMA.
+        phase: e.g. 'proactive_sql' or 'reactive_sql'
+        """
+        try:
+            lat_ms = int(lat_ms)
+        except Exception:
+            lat_ms = -1
+
+        # Update EMA (if latency valid)
+        if lat_ms >= 0:
+            if self._llm_lat_ema_ms is None:
+                self._llm_lat_ema_ms = float(lat_ms)
+            else:
+                a = self._llm_lat_alpha
+                self._llm_lat_ema_ms = (1.0 - a) * self._llm_lat_ema_ms + a * float(lat_ms)
+
+        payload = {
+            "node": "broker",
+            "model": self.llm_model,
+            "lat_ms": lat_ms,
+            "ok": bool(ok),
+            "phase": phase,
+            "ts": time.time(),
+        }
+        try:
+            self.pub_llm_perf.publish(StringMsg(data=json.dumps(payload)))
+        except Exception as e:
+            self.get_logger().warn(f"broker: failed to publish llm perf: {e}")
 
 
     def _publish_context_capsule(self):
@@ -485,7 +727,7 @@ class BrokerNode(Node):
         self._current_trigger = {"type": trig_type, "ts": ts, "composite": True, "rid": rid}
 
         # (optional) proactive run
-        if trig_type:
+        if trig_type in ("new_object", "finish_or_fail", "human_command"):
             try:
                 self._current_trigger["trigger_event"] = o
                 self._publish_context_capsule()
@@ -719,12 +961,24 @@ class BrokerNode(Node):
             cc = {}
         basket = [r[0] for r in self.conn.execute(
             "SELECT node_id FROM nodes_state WHERE in_basket=1 LIMIT 8").fetchall()]
+
+        # NEW: attach current perf summary
+        perf = self._perf_summary()
+
         return {
             "trigger": self._current_trigger,
             "profiles": self._profiles,
             "event_trace": list(self._event_trace)[-20:],
-            "world": {"backlog_counts": cc, "basket": basket},
-            "budgets": {"max_rows": self.sql_max_rows, "max_bytes": self.sql_max_bytes, "timeout_ms": self.sql_timeout_ms}
+            "world": {
+                "backlog_counts": cc,
+                "basket": basket,
+            },
+            "perf": perf,
+            "budgets": {
+                "max_rows": self.sql_max_rows,
+                "max_bytes": self.sql_max_bytes,
+                "timeout_ms": self.sql_timeout_ms
+            }
         }
 
     def _ws_id(self) -> str:
@@ -800,23 +1054,52 @@ class BrokerNode(Node):
 
 
     def _chat_json(self, messages, temperature=0.2, max_tokens=300, retries=1):
-        """Call OpenAI chat.completions and enforce JSON + schema."""
-        for _ in range(retries + 1):
-            resp = self.client.chat.completions.create(
-                model=self.llm_model,
-                messages=messages,
-                max_completion_tokens=max_tokens,
-                response_format={"type": "json_object"},
-            )
-            content = resp.choices[0].message.content
+        """Call OpenAI chat.completions and enforce JSON + schema, with latency telemetry."""
+        last_exc = None
+        for attempt in range(retries + 1):
+            t0 = time.time()
+            ok_api = False
             try:
+                resp = self.client.chat.completions.create(
+                    model=self.llm_model,
+                    messages=messages,
+                    max_completion_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                    temperature=temperature,
+                )
+                dt_ms = int((time.time() - t0) * 1000)
+                ok_api = True
+
+                content = resp.choices[0].message.content
                 obj = json.loads(content)
                 validate(instance=obj, schema=LLM_SQL_SCHEMA)
+
+                # success → publish perf once and return
+                self._publish_llm_perf(dt_ms, ok=True, phase="sql_plan")
                 return obj
-            except (json.JSONDecodeError, ValidationError):
-                messages = messages + [{"role":"system","content":"Return ONLY valid JSON per the schema. No prose."}]
+
+            except (json.JSONDecodeError, ValidationError) as e:
+                # API call worked but schema/json was bad
+                dt_ms = int((time.time() - t0) * 1000)
+                self._publish_llm_perf(dt_ms, ok=False, phase="sql_plan_schema")
+                last_exc = e
+                messages = messages + [{
+                    "role": "system",
+                    "content": "Return ONLY valid JSON per the schema. No prose."
+                }]
+                continue
+
+            except Exception as e:
+                # network / API error
+                dt_ms = int((time.time() - t0) * 1000)
+                self._publish_llm_perf(dt_ms, ok=False, phase="sql_plan_api")
+                last_exc = e
+                # no point retrying if it’s a hard error like auth/connection, but keep current behavior:
+                continue
+
         # last-resort fallback handled by caller
-        raise ValueError("LLM did not return valid JSON")
+        raise ValueError(f"LLM did not return valid JSON: {last_exc}")
+
 
     
 
