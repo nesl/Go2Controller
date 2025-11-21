@@ -87,16 +87,13 @@ PLAN_PARSE_SCHEMA: Dict[str, Any] = {
             },
         },
         "to_execute": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["skill"],
-                "properties": {
-                    "skill": {"type": "string"},
-                    "ctx": {"type": "object"},
-                },
-                "additionalProperties": True,
+            "type": "object",
+            "required": ["skill"],
+            "properties": {
+                "skill": {"type": "string"},
+                "ctx": {"type": "object"},
             },
+            "additionalProperties": True,
         },
         # NEW: optional LLM model choices per role ("broker", "planner", "orchestrator", etc.)
         "llm_models": {
@@ -107,38 +104,243 @@ PLAN_PARSE_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
 }
 
-SYSTEM_PARSE = (
-    "You are the ORCHESTRATOR for a mobile robot collaborating with humans.\n"
-    "The planner has already produced a high-level plan (plan_header, plan_doc, _hints).\n"
-    "You also have a skills library with primitive and composite skills, and a rules library.\n"
-    "You additionally receive a ContextCapsule from the broker, which may contain performance\n"
-    "summaries for different LLM models (e.g., average latency, error counts) in a field such as\n"
-    "llm_perf or similar.\n\n"
-    "Your job is to:\n"
-    " 1) Decide which skills to activate next (existing primitives or composites),\n"
-    " 2) Optionally define NEW composite skills that encode short sequences of existing primitives,\n"
-    " 3) Optionally define NEW rules (prefer composite rules using exists('rule_id', ms), but do not ever use\n"
-    "    rules with the 'trigger_' prefix),\n"
-    " 4) Optionally RECOMMEND which LLM model each role (broker, planner, orchestrator, etc.) should use,\n"
-    "    based on the performance information in the ContextCapsule, by filling an object 'llm_models',\n"
-    "    e.g., {\"broker\": \"gpt-5-nano\", \"planner\": \"gpt-4o-mini\"}.\n"
-    " 5) Return STRICT JSON ONLY following the provided schema.\n\n"
-    "Rules:\n"
-    " - You CANNOT invent new primitive actions. You may only reference existing skill names.\n"
-    " - New composite skills must use 'use: <skill_name>' where <skill_name> is in the skills list.\n"
-    " - Prefer short, focused composites (2–6 steps).\n"
-    " - 'to_execute' may reference either existing composites or new composites you define.\n"
-    " - For new rules:\n"
-    "     * Prefer composite rules over basic rules: type='composite', expr using exists('rule_id', ms).\n"
-    "     * Only create basic rules (with task/output) if necessary and ONLY using tasks/outputs from tasks_inventory.\n"
-    "     * Do NOT invent new task names or outputs.\n"
-    " - Use 'ctx' to pass simple arguments (e.g., object_ids, areas) when helpful, but keep it compact.\n"
-    " - If the plan is mostly about sensing or scanning, prefer existing skills like sense.here, beacons.report_top3,\n"
-    "   nav.go_absolute, tts.say, etc.\n"
-    " - If you are unsure, default to a simple tts.say composite that describes what you intend to do.\n"
-    " - For 'llm_models': only change a role’s model if the performance data clearly suggests a better choice;\n"
-    "   otherwise it is fine to omit or leave the current model.\n"
-)
+SYSTEM_PARSE = """
+You are the ORCHESTRATOR for a mobile robot collaborating with humans.
+
+The planner has already produced a high-level plan (plan_header, plan_doc, _hints).
+You also have:
+  - A skills library (primitives and composites)
+  - A rules library
+  - A tasks_inventory describing all perception, LLM, and VLM tools
+  - The task registry includes performance metrics for all models (latency, fps, etc.)
+
+Your job is to:
+  1) Decide which skill (state-machine) to activate next
+  2) Optionally define NEW composite skills as finite state machines
+  3) Optionally define NEW rules (prefer composite rules using exists('rule_id', ms))
+  4) Optionally recommend updated LLM/VLM models in llm_models, based on performance
+     metrics available in tasks_inventory and perf.json outputs
+  5) Return STRICT JSON ONLY following the required schema
+
+
+======================================================================
+ GENERAL RULES
+======================================================================
+- Do NOT invent new task names or outputs. Only use tasks/outputs from tasks_inventory.
+- You SHOULD NOT reference existing rules whose id starts with "trigger_".
+- You MAY reference existing composite or state_machine skills (from skills_inventory) as actions inside state machines (treat them as black-box actions that run until they finish).
+- Use ctx to pass small argument sets (object_ids, zones, text, etc.).
+- When proposing model upgrades or downgrades in llm_models:
+    * Use only performance metrics documented in tasks_inventory (and perf.json outputs if present).
+    * Prefer models with lower latency and acceptable quality.
+    * If no clear improvement is indicated, omit the role.
+
+
+======================================================================
+ STATE-MACHINE SKILLS
+======================================================================
+All NEW composite skills must be expressed as a finite state machine:
+
+{
+  "name": "string",
+  "kind": "state_machine",
+  "params_template": { ... },
+  "param_keys": [ ... ],
+  "when": {},                    // must be empty for skills used in to_execute
+  "until": { ...optional... },
+  "initial_state": "state_id",
+  "states": [ ... ]
+}
+
+Two allowed state types:
+
+1) ACTION STATE:
+   {
+     "id": "string",
+     "type": "action",
+     "action": { "use": "<primitive_or_composite>", "with": { ... } },
+     "on_complete": "next_state_or_done",
+     "on_failure":  "optional_state_or_done"
+   }
+
+2) WAIT STATE:
+   {
+     "id": "string",
+     "type": "wait",
+     "wait_for": {
+       "any_of": [
+         { "rule_id": "rule_name", "within_ms": <timeout> }
+       ]
+     },
+     "on_event":   "next_state_or_done",
+     "on_timeout": "timeout_state_or_done"
+   }
+
+Behavior guidelines:
+- Each state machine represents ONE SHORT INTERACTION SEGMENT.
+- action.use may be a primitive or another composite/state_machine skill.
+  - Nested skills run to completion before on_complete / on_failure is evaluated.
+- Examples:
+  * ask clarifying question then wait for reply
+  * call LLM/VLM primitive then wait for rule based on its output
+  * move short distance then wait for a perceptual event
+- If future actions depend on new speech, gesture, BT events, LLM output, or VLM output:
+  * end the current skill, then let rules trigger a new one.
+- Avoid recursion: do NOT have a state machine that eventually calls itself via action.use.
+
+
+
+======================================================================
+ LLM AND VLM MICRO-SERVICES
+======================================================================
+Some primitives wrap lower-level LLM or VLM modules and allow custom prompts and
+output schemas.
+
+Example primitives from skills_inventory:
+
+1) llm.check_speech
+   Params may include:
+     - check_kind: short mode label (example: "carry_intent")
+     - prompt: optional free-text instructions (overrides default template if non-empty)
+     - output_schema: optional JSON schema string describing expected fields
+     - text: utterance to analyze
+   The underlying node:
+     - Builds final prompt
+     - Calls an LLM and returns structured JSON
+     - Publishes output on its task output (example: check.json)
+
+2) vlm.run_query
+   Params may include:
+     - mode: short mode label (example: "pointing_zone")
+     - prompt: optional free-text question/instructions
+   The node:
+     - Builds prompt
+     - Calls VLM
+     - Publishes structured JSON on output topic
+
+When using these:
+- Keep prompts short and precise
+- Define small JSON output schemas
+- Use ctx variables such as {{ctx.last_utterance}}
+- After calling an LLM or VLM primitive in an action state, follow it with a WAIT state
+  listening for a rule that checks the parsed JSON output.
+
+
+======================================================================
+ RULE CREATION (new_rules)
+======================================================================
+Allowed rule types:
+
+1) Composite rules:
+   - type: "composite"
+   - expr uses exists('rule_id', ms)
+   - Preferred whenever possible.
+
+2) Basic rules:
+   - type: "basic"
+   - Must specify: id, task, output, mode, expr, enabled, and model_id if required
+   - May only reference tasks/outputs from tasks_inventory
+   - Useful for interpreting JSON from LLM/VLM (example: is_carry, zone, confidence, etc.)
+
+Do NOT:
+- invent task names
+- invent outputs
+- create new rules whose id starts with "trigger_"
+
+
+======================================================================
+ SKILL TO EXECUTE NOW (to_execute)
+======================================================================
+Your JSON must contain exactly one skill to run:
+
+"to_execute": {
+  "skill": "<state_machine_name>",
+  "ctx": { ... small context ... }
+}
+
+Requirements:
+- The selected skill must exist in skills_inventory or new_composites.
+- It must have top-level "when": {} to arm immediately.
+- Execution flow must be fully determined by its state-machine states.
+
+
+======================================================================
+ LLM MODEL SELECTION (llm_models)
+======================================================================
+The llm_models section may override which model each role uses:
+
+{
+  "broker": "model_id",
+  "planner": "model_id",
+  "orchestrator": "model_id",
+  "vlm": "model_id"
+}
+
+Rules for selecting models:
+- Base decisions only on performance metrics from tasks_inventory and perf.json outputs.
+- Look at fields like latency_ms.det_mean, utter_infer_mean, pose_mean, run_trigger_typical, etc.
+- Prefer lower latency and stable performance.
+- If no strong evidence for improvement, omit role.
+
+
+======================================================================
+ STRICT JSON OUTPUT SCHEMA
+======================================================================
+You MUST output STRICT JSON ONLY:
+
+{
+  "new_composites": [
+    {
+      "name": "...",
+      "kind": "state_machine",
+      "params_template": { ... },
+      "param_keys": [ ... ],
+      "when": {},
+      "until": { ...optional... },
+      "initial_state": "state_id",
+      "states": [
+        {
+          "id": "state_id",
+          "type": "action",
+          "action": { "use": "primitive_or_composite", "with": { ... } },
+          "on_complete": "next_state_or_done",
+          "on_failure": "optional_state_or_done"
+        },
+        {
+          "id": "state_id_2",
+          "type": "wait",
+          "wait_for": {
+            "any_of": [
+              { "rule_id": "rule_id", "within_ms": <int> }
+            ]
+          },
+          "on_event": "next_state_or_done",
+          "on_timeout": "timeout_state_or_done"
+        }
+      ]
+    }
+  ],
+  "new_rules": [
+    {
+      "id": "...",
+      "type": "basic_or_composite",
+      "task": "...",        // only for basic
+      "output": "...",      // only for basic
+      "model_id": "...",    // optional
+      "mode": "edge_or_level",
+      "expr": "expression OR exists('other_rule', ms)",
+      "enabled": true
+    }
+  ],
+  "to_execute": {
+    "skill": "<state_machine_name>",
+    "ctx": { ... }
+  },
+  "llm_models": {
+    "optional_role": "optional_model_id"
+  }
+}
+"""
 
 class OrchestratorNode(Node):
     """
@@ -171,6 +373,12 @@ class OrchestratorNode(Node):
 
         # NEW: where to publish THIS node's LLM perf so broker can ingest it
         self.declare_parameter("perf_topic", "/llm/orchestrator_perf")
+
+        # NEW: broker service that writes perf EMA into task_registry.yaml
+        self.declare_parameter(
+            "registry_refresh_service",
+            "/broker/save_task_registry_with_perf",
+        )
 
         # NEW: mapping from logical roles to (node, param) for remote model changes
         self.declare_parameter(
@@ -207,6 +415,20 @@ class OrchestratorNode(Node):
             .get_parameter_value()
             .string_value
         )
+
+
+        # NEW: registry refresh service name and client
+        self.registry_refresh_service: str = (
+            self.get_parameter("registry_refresh_service")
+            .get_parameter_value()
+            .string_value
+        )
+
+        self.registry_refresh_client = None
+        if self.registry_refresh_service:
+            self.registry_refresh_client = self.create_client(
+                Trigger, self.registry_refresh_service
+            )
 
         self.dynamic_prefix: str = (
             self.get_parameter("dynamic_prefix")
@@ -373,33 +595,81 @@ class OrchestratorNode(Node):
 
     def _build_skills_inventory(self) -> Dict[str, Any]:
         """
-        Build a combined inventory of base + composite skills for the LLM.
+        Build a combined inventory of base + state_machine skills for the LLM.
+
+        We expose:
+          - primitives: name, kind, action, params_template, param_keys, when, until
+          - composites: state machines only (kind == "state_machine"), including:
+              * name
+              * kind ("state_machine")
+              * params_template / param_keys
+              * when / until
+              * initial_state
+              * states (FULL array, no truncation)
+
+        NOTE:
+        - Legacy 'composite' + 'steps' skills are ignored here. If you still have them
+          in your YAML, they just won’t show up in skills_inventory.
         """
-        primitives = []
-        composites = []
+        primitives: List[Dict[str, Any]] = []
+        state_machines: List[Dict[str, Any]] = []
 
         for path in [self.skills_base_path, self.skills_composite_path]:
             doc = self._read_yaml_if_exists(path) or {}
             for s in doc.get("skills", []) or []:
                 if not isinstance(s, dict):
                     continue
-                name = str(s.get("name", ""))
-                kind = str(s.get("kind", ""))
-                if kind == "primitive":
-                    primitives.append(
-                        {
-                            "name": name,
-                            "action": s.get("action", ""),
-                            "params": list((s.get("params") or {}).keys()),
-                        }
-                    )
-                elif kind == "composite":
-                    steps = s.get("steps") or []
-                    composites.append(
-                        {"name": name, "num_steps": len(steps)}
-                    )
 
-        return {"primitives": primitives, "composites": composites}
+                name = str(s.get("name", "")).strip()
+                if not name:
+                    continue
+
+                kind = str(s.get("kind", "")).strip() or "primitive"
+                params_template = s.get("params") or {}
+                when_block = s.get("when") or {}
+                until_block = s.get("until") or {}
+
+                base_entry: Dict[str, Any] = {
+                    "name": name,
+                    "kind": kind,
+                    "params_template": params_template,
+                    "param_keys": (
+                        list(params_template.keys())
+                        if isinstance(params_template, dict)
+                        else []
+                    ),
+                    "when": when_block,
+                    "until": until_block,
+                }
+
+                if kind == "primitive":
+                    # Primitive: expose action + params
+                    base_entry["action"] = s.get("action", "")
+                    primitives.append(base_entry)
+
+                elif kind == "state_machine":
+                    # State machine: expose full structure
+                    base_entry["initial_state"] = s.get("initial_state")
+                    base_entry["states"] = s.get("states") or []
+                    # optional extras if you later add them in YAML (timeouts, docs, etc.)
+                    if "description" in s:
+                        base_entry["description"] = s.get("description")
+                    state_machines.append(base_entry)
+
+                else:
+                    # Unknown / legacy kinds (e.g., old "composite" with steps) are ignored.
+                    # If you still need them, either convert to state_machine in YAML
+                    # or add a compatibility branch here.
+                    continue
+
+        # For compatibility with the prompt + planner code, we still call this key "composites"
+        # even though it now contains only kind=="state_machine" entries.
+        return {
+            "primitives": primitives,
+            "composites": state_machines,
+        }
+
+
 
     def _prune_old_dynamic_skills(
         self, skills: List[Dict[str, Any]]
@@ -471,6 +741,8 @@ class OrchestratorNode(Node):
                         "type": r.get("type", "basic"),
                         "task": r.get("task"),
                         "output": r.get("output"),
+                        "model_id": r.get("model_id"),
+                        "mode": r.get("mode"),   # <── added
                         "expr": r.get("expr", ""),
                         "enabled": bool(r.get("enabled", True)),
                     }
@@ -507,26 +779,100 @@ class OrchestratorNode(Node):
 
     # --- tasks (registry; optional) ---
 
+
+    def _refresh_registry_from_broker(self):
+        if not self.registry_refresh_client:
+            return
+
+        if not self.registry_refresh_client.wait_for_service(timeout_sec=0.1):
+            self.get_logger().warn("registry refresh service unavailable")
+            return
+
+        req = Trigger.Request()
+        future = self.registry_refresh_client.call_async(req)
+
+        # Optional: log result asynchronously
+        def _cb(fut):
+            try:
+                res = fut.result()
+                if res and res.success:
+                    self.get_logger().info(f"registry refresh ok: {res.message}")
+                else:
+                    self.get_logger().warn("registry refresh failed or returned None")
+            except Exception as e:
+                self.get_logger().warn(f"registry refresh error: {e}")
+
+        future.add_done_callback(_cb)
+
+
     def _build_tasks_inventory(self) -> Dict[str, Any]:
         """
-        For rule creation, expose task->output IDs so the LLM doesn’t invent new names.
+        For rule & model selection, expose:
+          - task name
+          - outputs (id/topic/msg/fields)
+          - models: id, version, role, and latency_ms metrics (if present)
+
+        The registry file is assumed to follow task_registry.yaml structure.
         """
         if not self.registry_path:
             return {"tasks": []}
+
+        # Ask broker to flush latest perf EMAs into the registry before reading
+        self._refresh_registry_from_broker()
+
         doc = self._read_yaml_if_exists(self.registry_path) or {}
         out = []
+
         for tname, tdoc in (doc.get("tasks") or {}).items():
+            # ---- Outputs as before ----
             outputs = []
             for o in tdoc.get("outputs") or []:
+                context = o.get("context") or {}
+                fields = (
+                    context.get("fields")
+                    or context.get("per_detection_fields")
+                    or context.get("per_person_fields")
+                    or []
+                )
                 outputs.append(
                     {
                         "id": o.get("id"),
                         "topic": (o.get("ros") or {}).get("topic"),
                         "msg": (o.get("ros") or {}).get("msg"),
+                        "fields": fields,
                     }
                 )
-            out.append({"task": tname, "outputs": outputs})
+
+            # ---- Models: id + latency_ms (and a bit of structure) ----
+            models_info = []
+            for m in tdoc.get("models") or []:
+                metrics = m.get("metrics") or {}
+                latency_ms = None
+                if isinstance(metrics, dict):
+                    # this will pass through whatever shape you have under latency_ms
+                    # e.g. {det_mean: 8.0} or {typical: 40.0, utter_infer_mean: 160.0}
+                    latency_ms = metrics.get("latency_ms")
+
+                models_info.append(
+                    {
+                        "id": m.get("id"),
+                        "metrics": {
+                            "latency_ms": latency_ms
+                        } if latency_ms is not None else {},
+                    }
+                )
+
+            out.append(
+                {
+                    "task": tname,
+                    "description": tdoc.get("description"),
+                    "outputs": outputs,
+                    "models": models_info,
+                }
+            )
+
         return {"tasks": out}
+
 
     # =====================================================================
     # Context & perf I/O
@@ -576,15 +922,17 @@ class OrchestratorNode(Node):
             try:
                 resp = self.client.chat.completions.create(
                     model=self.model,
-                    messages=messages,
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "OrchestratorOutput",
-                            "schema": schema,
-                        },
+                    messages=messages)
+                '''
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "OrchestratorOutput",
+                        "schema": schema,
                     },
-                )
+                },
+                '''
+                
                 t1 = time.time()
                 lat_ms = (t1 - t0) * 1000.0
                 self._publish_perf(lat_ms=lat_ms, ok=True, phase=phase)
@@ -598,7 +946,7 @@ class OrchestratorNode(Node):
                 )
                 try:
                     obj = json.loads(content)
-                    validate(instance=obj, schema=schema)
+                    #validate(instance=obj, schema=schema)
                     return obj
                 except (json.JSONDecodeError, ValidationError) as e:
                     self.get_logger().warn(
@@ -624,8 +972,87 @@ class OrchestratorNode(Node):
         raise ValueError(f"LLM did not return valid JSON for schema: {last_error}")
 
     # =====================================================================
+    # Example inventory helpers (for prompt demo only)
+    # =====================================================================
+
+    def _build_example_skills_inventory(
+        self, skills_inventory: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Tiny skills_inventory only for the demonstration turn.
+
+        We keep just:
+          - nav.approach_speaker
+          - beacons.report_top3
+          - tts.say
+          - db.query_top_beacons
+
+        The full skills_inventory is still used for the real plan payload.
+        """
+        wanted = {
+            "nav.approach_speaker",
+            "beacons.report_top3",
+            "tts.say",
+            "db.query_top_beacons",
+        }
+
+        prims = [
+            p
+            for p in skills_inventory.get("primitives", [])
+            if p.get("name") in wanted
+        ]
+        comps = [
+            c
+            for c in skills_inventory.get("composites", [])
+            if c.get("name") in wanted
+        ]
+
+        return {"primitives": prims, "composites": comps}
+
+    def _build_example_rules_inventory(
+        self, rules_inventory: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Tiny rules_inventory only for the example.
+
+        Keep just the rules referenced in the example rule:
+          - bt_rssi_seen
+          - speech_final_any
+        """
+        wanted_ids = {"bt_rssi_seen", "speech_final_any"}
+
+        out_rules = [
+            r
+            for r in rules_inventory.get("rules", [])
+            if r.get("id") in wanted_ids
+        ]
+        return {"rules": out_rules}
+
+    def _build_example_tasks_inventory(
+        self, tasks_inventory: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Tiny tasks_inventory only for the example.
+
+        Keep just the tasks backing the example rules:
+          - bt_proximity  (bt_rssi_seen)
+          - audio_asr     (speech_final_any)
+        """
+        wanted_tasks = {"bt_proximity", "audio_asr"}
+
+        out_tasks = [
+            t
+            for t in tasks_inventory.get("tasks", [])
+            if t.get("task") in wanted_tasks
+        ]
+        return {"tasks": out_tasks}
+
+
+    # =====================================================================
     # Plan handling
     # =====================================================================
+
+
 
     def _build_llm_messages_for_plan(
         self,
@@ -639,31 +1066,48 @@ class OrchestratorNode(Node):
         hints = plan.get("_hints") or {}
         meta = plan.get("_meta") or {}
 
+        # --- Build minimal example inventories (demo only) ---
+        example_skills_inventory = self._build_example_skills_inventory(
+            skills_inventory
+        )
+        example_rules_inventory = self._build_example_rules_inventory(
+            rules_inventory
+        )
+        example_tasks_inventory = self._build_example_tasks_inventory(
+            tasks_inventory
+        )
+
         example_user = {
             "plan_header": {
-                "objective": "Bin all nodes in this short horizon",
+                "objective": "Approach the caller and summarize nearby beacons",
                 "time_horizon": "short",
-                "priority": ["scan new node CNode12"],
+                "priority": [
+                    "approach human caller",
+                    "report top 3 beacons at current location",
+                ],
             },
             "plan_doc": (
-                "Situation: New object_id=CNode12 detected in area=A.\n"
-                "Intent: Confirm label and scan nearby items.\n"
-                "Action Sketch: approach area=A; ask_scan CNode12; "
-                "confirm contamination; deliver to bin=contaminated in area=B.\n"
-                "Evidence & Uncertainty: OPEN: need stronger signal.\n"
-                "Coordination & Tone: concise prompts.\n"
-                "Hard Constraints: limited time."
+                "Situation: A human just called the robot (speech_keyword detected)\n"
+                "and the robot is near a rack with Bluetooth-tagged objects.\n"
+                "Intent: Move close enough to the caller for a brief interaction,\n"
+                "then summarize the strongest 3 beacon signals 'here'.\n"
+                "Action Sketch: if speech_keyword and pose_present_precise, approach\n"
+                "speaker by ~0.8m; query_top_beacons; speak concise summary.\n"
+                "Evidence & Uncertainty: beacon DB contains last RSSI per object;\n"
+                "uncertainty in contamination labels remains, but this step only\n"
+                "reports signals, not bin decisions.\n"
+                "Coordination & Tone: concise, status-style speech; no long dialogue.\n"
+                "Hard Constraints: do not move if no human is present or user interrupts."
             ),
             "_hints": {
                 "object_ids": ["CNode12"],
-                "areas": ["A", "B"],
-                "bins": ["contaminated"],
-                "open_items": ["need stronger signal"],
+                "areas": ["A"],
+                "bins": [],
+                "open_items": ["user might ask follow-up about CNode12 later"],
             },
             "_meta": {"ws_id": 0},
-            # Example of context capsule presence (shape is illustrative)
             "ContextCapsule": {
-                "trigger": {"type": "new_object"},
+                "trigger": {"type": "speech_keyword"},
                 "llm_perf": {
                     "broker": [{"model": "gpt-5-nano", "ema_ms": 120.0}],
                     "planner": [{"model": "gpt-5-mini", "ema_ms": 180.0}],
@@ -671,18 +1115,25 @@ class OrchestratorNode(Node):
             },
         }
 
+
         example_assistant = {
             "new_composites": [
                 {
-                    "name": "plan.ws_0",
+                    "name": "interact.beacon_brief_here",
                     "kind": "composite",
                     "when": {},
-                    "until": {"exists": "speech_final_any", "within_ms": 1},
+                    "until": {"not_exists": "human_detected_3d"},
                     "steps": [
-                        {"use": "sense.here", "when": {}, "with": {}},
+                        {
+                            "use": "nav.approach_speaker",
+                            "when": {},
+                            "with": {"dist_m": 0.8},
+                        },
                         {
                             "use": "beacons.report_top3",
-                            "when": {},
+                            "when": {
+                                "exists": "bt_rssi_seen",
+                            },
                             "with": {},
                         },
                     ],
@@ -690,30 +1141,31 @@ class OrchestratorNode(Node):
             ],
             "new_rules": [
                 {
-                    "id": "plan.ws_0_ready",
+                    "id": "interact.beacon_brief_here_ready",
                     "type": "composite",
                     "enabled": True,
-                    "expr": "exists('bt_rssi_seen', 2000) and not exists('speech_final_any', 500)",
+                    "expr": (
+                        "exists('speech_keyword', 3000) "
+                        "and exists('pose_present_precise', 2500) "
+                        "and exists('bt_rssi_seen', 2000)"
+                    ),
                 }
             ],
-            "to_execute": [
-                {
-                    "skill": "plan.ws_0",
-                    "ctx": {
-                        "objective": "scan and confirm CNode12",
-                        "object_ids": ["CNode12"],
-                        "areas": ["A", "B"],
-                        "bins": ["contaminated"],
-                    },
-                }
-            ],
-            # Example of the LLM choosing models based on perf
+            "to_execute": {
+                "skill": "interact.beacon_brief_here",
+                "ctx": {
+                    "objective": "approach caller and summarize nearby beacons",
+                    "object_ids": ["CNode12"],
+                    "areas": ["A"],
+                },
+            },
             "llm_models": {
                 "broker": "gpt-5-nano",
                 "planner": "gpt-5-mini",
                 "orchestrator": "gpt-4o-mini",
             },
         }
+
 
         payload = {
             "plan_header": header,
@@ -724,30 +1176,45 @@ class OrchestratorNode(Node):
             "rules_inventory": rules_inventory,
             "tasks_inventory": tasks_inventory,
             # NEW: give orchestrator LLM access to broker context capsule, including perf DB
-            "ContextCapsule": self._capsule or {},
+            #"ContextCapsule": self._capsule or {},
         }
 
+        '''
         return [
             {"role": "system", "content": SYSTEM_PARSE},
+            
             {
                 "role": "user",
                 "content": json.dumps(
                     {
                         "example": True,
                         "plan": example_user,
-                        "skills_inventory": skills_inventory,
-                        "rules_inventory": rules_inventory,
-                        "tasks_inventory": tasks_inventory,
+                        "skills_inventory": example_skills_inventory,
+                        "rules_inventory": example_rules_inventory,
+                        "tasks_inventory": example_tasks_inventory,
                     },
                     ensure_ascii=False,
                 ),
             },
+            
             {
                 "role": "assistant",
                 "content": json.dumps(
                     example_assistant, ensure_ascii=False
                 ),
             },
+            
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False),
+            },
+        ]
+        '''
+
+        return [
+            {"role": "system", "content": SYSTEM_PARSE},
+            
+            
             {
                 "role": "user",
                 "content": json.dumps(payload, ensure_ascii=False),
@@ -789,7 +1256,7 @@ class OrchestratorNode(Node):
 
         new_composites = orchestrator_obj.get("new_composites") or []
         new_rules = orchestrator_obj.get("new_rules") or []
-        to_execute = orchestrator_obj.get("to_execute") or []
+        to_execute_obj = orchestrator_obj.get("to_execute") or {}
         llm_models = orchestrator_obj.get("llm_models") or {}
 
         # --- Apply any LLM-chosen model changes first ---
@@ -857,7 +1324,12 @@ class OrchestratorNode(Node):
             )
 
         # Reload rules + skills, then execute
-        self._reload_all_and_execute(to_execute)
+        if isinstance(to_execute_obj, dict) and "skill" in to_execute_obj:
+            to_execute_list = [to_execute_obj]    # wrap single skill as a list
+        else:
+            to_execute_list = []
+
+        self._reload_all_and_execute(to_execute_list)
 
     # =====================================================================
     # Remote LLM model changes

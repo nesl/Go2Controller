@@ -44,7 +44,7 @@ rules:
     task: audio_asr
     output: text.final
     model_id: "whisper" 
-    mode: "level"                          # Whisper gate size
+    mode: "level"                          
     expr: "text and any(x in text.lower() for x in ['bob'])"
 
   - id: greet_with_presence

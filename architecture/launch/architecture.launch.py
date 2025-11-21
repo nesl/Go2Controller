@@ -58,7 +58,7 @@ def generate_launch_description():
             name='broker_node',
             output='screen',
             parameters=[{
-                
+                'task_registry_path': os.path.join(pkg_share, 'config', 'task_registry.yaml'),
             }]
         ),
         Node(

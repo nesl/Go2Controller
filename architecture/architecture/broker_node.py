@@ -108,7 +108,7 @@ class BrokerNode(Node):
         # NEW: task registry path so we can subscribe to perf topics
         self.declare_parameter(
             "task_registry_path",
-            os.path.expanduser("~/.task_registry.yaml")
+            ""
         )
         
         self.declare_parameter("human_agent_id", "human_a")  # or whatever label you use
@@ -227,6 +227,12 @@ class BrokerNode(Node):
 
         # Background contamination worker
         self.create_timer(0.25, self._process_pending_refresh)
+        
+        self._save_registry_srv = self.create_service(
+            Trigger,
+            "/broker/save_task_registry_with_perf",
+            self._on_save_registry_with_perf,
+        )
 
         self.get_logger().info(
             f"broker_node up | db={self.db_path} bus={self.bus_topic} rule={self.bt_rule_id} "
@@ -235,6 +241,14 @@ class BrokerNode(Node):
         )
 
     # ------------------------------ Perf topic discovery ------------------------------
+    
+    def _on_save_registry_with_perf(self, req, resp):
+        out_path = None  # or e.g. self.task_registry_path.replace(".yaml","_runtime.yaml")
+        self.write_task_registry_with_perf(self.task_registry_path, out_path=out_path)
+        resp.success = True
+        resp.message = "task_registry updated with runtime perf EMA"
+        return resp
+    
     def _load_task_registry_and_subscribe_perf(self):
         """
         Read task_registry.yaml, find all outputs with kind: perf,
@@ -291,66 +305,7 @@ class BrokerNode(Node):
                 self._perf_subscriptions.append(sub)
 
     # ------------------------------ Perf ingestion ------------------------------
-    def _on_perf_msg(self, task_id: str, topic: str, msg: StringMsg):
-        """
-        Generic perf handler.
-
-        We try to extract:
-          - model_id (if present, e.g., payload["model"])
-          - a latency value in ms (lat_ms or latency_ms{...})
-        and maintain an EMA per (task_id, model_id).
-        """
-        try:
-            payload = json.loads(msg.data) if msg.data else {}
-        except Exception as e:
-            self.get_logger().warn(f"[broker] perf JSON parse error from {topic}: {e}")
-            return
-
-        ts = time.time()
-        model_id = None
-        lat_ms = None
-
-        # LLM perf (our schema_hint): {"node":"broker","model":str,"lat_ms":num,"ok":bool,"phase":str}
-        if isinstance(payload, dict):
-            if "model" in payload and isinstance(payload.get("lat_ms"), (int, float)):
-                model_id = str(payload.get("model"))
-                lat_ms = float(payload.get("lat_ms"))
-
-            # Vision / audio perf: {"latency_ms": {...}, "fps_ema": ...}
-            if lat_ms is None and isinstance(payload.get("latency_ms"), dict):
-                lm = payload["latency_ms"]
-                # Prefer total if present, otherwise take any one of the known keys
-                for key in ("total", "det", "pose", "utter_infer_mean", "window_infer_mean"):
-                    v = lm.get(key)
-                    if isinstance(v, (int, float)):
-                        lat_ms = float(v)
-                        break
-
-            # Fallback: direct numeric latency_ms
-            if lat_ms is None and isinstance(payload.get("latency_ms"), (int, float)):
-                lat_ms = float(payload["latency_ms"])
-
-        if lat_ms is None:
-            # Nothing we can aggregate
-            return
-
-        if not model_id:
-            model_id = "default"
-
-        key = (task_id, model_id)
-        alpha = 0.3  # EMA smoothing factor
-
-        with self._perf_lock:
-            ent = self._perf_ema.get(key)
-            if ent is None:
-                ent = {"lat_ms_ema": lat_ms, "n": 1, "last_ts": ts}
-            else:
-                ent["lat_ms_ema"] = (1.0 - alpha) * ent["lat_ms_ema"] + alpha * lat_ms
-                ent["n"] = ent.get("n", 0) + 1
-                ent["last_ts"] = ts
-            self._perf_ema[key] = ent
-
-
+    
     def _perf_summary(self) -> dict:
         """
         Return a nested summary:
@@ -358,6 +313,7 @@ class BrokerNode(Node):
           "task_id": {
             "model_id": {
               "lat_ms_ema": float,
+              "fps_ema": float | None,
               "samples": int,
               "last_ts": float
             },
@@ -372,10 +328,180 @@ class BrokerNode(Node):
                 task_entry = out.setdefault(task_id, {})
                 task_entry[model_id] = {
                     "lat_ms_ema": ent.get("lat_ms_ema"),
+                    "fps_ema": ent.get("fps_ema"),
                     "samples": ent.get("n", 0),
                     "last_ts": ent.get("last_ts"),
                 }
         return out
+
+    def merge_perf_into_task_registry(self, registry: dict) -> dict:
+        """
+        Mutate a loaded task_registry dict to include current perf EMAs.
+
+        For each (task_id, model_id) in the perf summary, if there is a matching
+        task + model in registry["tasks"], we augment:
+
+          tasks[task_id].models[k].metrics.latency_ms:
+            ema_runtime_ms: <lat_ms_ema>
+            runtime_samples: <samples>
+            runtime_last_ts: <last_ts>
+
+          tasks[task_id].models[k].metrics.throughput_fps:
+            runtime_fps_ema: <fps_ema>  (if available)
+        """
+        summary = self._perf_summary()
+        tasks_cfg = registry.get("tasks")
+        if not isinstance(tasks_cfg, dict):
+            return registry
+
+        for task_id, models_perf in summary.items():
+            task_entry = tasks_cfg.get(task_id)
+            if not isinstance(task_entry, dict):
+                continue
+
+            models_list = task_entry.get("models")
+            if not isinstance(models_list, list):
+                continue
+
+            for model_cfg in models_list:
+                if not isinstance(model_cfg, dict):
+                    continue
+
+                # We use the 'id' field from YAML as the key to match perf.model_id.
+                model_key = str(model_cfg.get("id") or model_cfg.get("version") or "")
+                if not model_key:
+                    continue
+
+                perf_ent = models_perf.get(model_key)
+                if not perf_ent:
+                    continue
+
+                lat_ms_ema = perf_ent.get("lat_ms_ema")
+                fps_ema = perf_ent.get("fps_ema")
+                samples = perf_ent.get("samples", 0)
+                last_ts = perf_ent.get("last_ts")
+
+                metrics = model_cfg.setdefault("metrics", {})
+                lat_cfg = metrics.setdefault("latency_ms", {})
+
+                if isinstance(lat_ms_ema, (int, float)):
+                    lat_cfg["ema_runtime_ms"] = round(float(lat_ms_ema), 2)
+                lat_cfg["runtime_samples"] = int(samples)
+                if isinstance(last_ts, (int, float)):
+                    lat_cfg["runtime_last_ts"] = float(last_ts)
+
+                if isinstance(fps_ema, (int, float)):
+                    thr_cfg = metrics.setdefault("throughput_fps", {})
+                    thr_cfg["runtime_fps_ema"] = round(float(fps_ema), 2)
+
+        return registry
+
+    def write_task_registry_with_perf(self,
+                                      in_path: str,
+                                      out_path: Optional[str] = None) -> None:
+        """
+        Load task_registry YAML, merge in runtime perf EMAs, and write it back.
+
+        If out_path is None, overwrite in_path; otherwise write to out_path.
+        """
+        try:
+            with open(in_path, "r") as f:
+                registry = yaml.safe_load(f) or {}
+        except Exception as e:
+            self.get_logger().error(f"[broker] failed to load task_registry from {in_path}: {e}")
+            return
+
+        registry = self.merge_perf_into_task_registry(registry)
+
+        target_path = out_path or in_path
+        tmp_path = target_path + ".tmp"
+
+        try:
+            with open(tmp_path, "w") as f:
+                yaml.safe_dump(registry, f, sort_keys=False)
+            os.replace(tmp_path, target_path)
+            self.get_logger().info(f"[broker] wrote updated task registry with perf EMA to {target_path}")
+        except Exception as e:
+            self.get_logger().error(f"[broker] failed to write updated task_registry to {target_path}: {e}")
+
+
+    
+    def _on_perf_msg(self, task_id: str, topic: str, msg: StringMsg):
+        """
+        Generic perf handler.
+
+        We try to extract:
+          - model_id (if present, e.g., payload["model"])
+          - a latency value in ms (lat_ms or latency_ms{...})
+          - optional fps_ema (if present)
+        and maintain an EMA per (task_id, model_id).
+        """
+        try:
+            payload = json.loads(msg.data) if msg.data else {}
+        except Exception as e:
+            self.get_logger().warn(f"[broker] perf JSON parse error from {topic}: {e}")
+            return
+
+        ts = time.time()
+        model_id = None
+        lat_ms = None
+        fps_ema = None
+
+        if isinstance(payload, dict):
+            # LLM / TTS / VLM perf:
+            # {"node":"broker","model":str,"lat_ms":num,"ok":bool,"phase":str,...}
+            if "model" in payload and isinstance(payload.get("lat_ms"), (int, float)):
+                model_id = str(payload.get("model"))
+                lat_ms = float(payload.get("lat_ms"))
+
+            # Vision / audio perf: {"latency_ms": {...}, "fps_ema": ...}
+            if lat_ms is None and isinstance(payload.get("latency_ms"), dict):
+                lm = payload["latency_ms"]
+                for key in ("total", "det", "pose", "utter_infer_mean", "window_infer_mean"):
+                    v = lm.get(key)
+                    if isinstance(v, (int, float)):
+                        lat_ms = float(v)
+                        break
+
+            # Fallback: direct numeric latency_ms
+            if lat_ms is None and isinstance(payload.get("latency_ms"), (int, float)):
+                lat_ms = float(payload["latency_ms"])
+
+            # Optional throughput info
+            v_fps = payload.get("fps_ema")
+            if isinstance(v_fps, (int, float)):
+                fps_ema = float(v_fps)
+
+        if lat_ms is None:
+            # Nothing we can aggregate
+            return
+
+        if not model_id:
+            model_id = "default"
+
+        key = (task_id, model_id)
+        alpha = 0.3  # EMA smoothing factor
+
+        with self._perf_lock:
+            ent = self._perf_ema.get(key)
+            if ent is None:
+                ent = {
+                    "lat_ms_ema": lat_ms,
+                    "fps_ema": fps_ema,
+                    "n": 1,
+                    "last_ts": ts,
+                }
+            else:
+                # Update EMA for latency
+                ent["lat_ms_ema"] = (1.0 - alpha) * ent["lat_ms_ema"] + alpha * lat_ms
+                # Update fps EMA if we have it
+                if fps_ema is not None:
+                    old_fps = ent.get("fps_ema", fps_ema)
+                    ent["fps_ema"] = (1.0 - alpha) * old_fps + alpha * fps_ema
+                ent["n"] = ent.get("n", 0) + 1
+                ent["last_ts"] = ts
+
+            self._perf_ema[key] = ent
 
 
     # ------------------------------ Dynamic param handling ------------------------------
@@ -962,8 +1088,7 @@ class BrokerNode(Node):
         basket = [r[0] for r in self.conn.execute(
             "SELECT node_id FROM nodes_state WHERE in_basket=1 LIMIT 8").fetchall()]
 
-        # NEW: attach current perf summary
-        perf = self._perf_summary()
+
 
         return {
             "trigger": self._current_trigger,
@@ -972,12 +1097,6 @@ class BrokerNode(Node):
             "world": {
                 "backlog_counts": cc,
                 "basket": basket,
-            },
-            "perf": perf,
-            "budgets": {
-                "max_rows": self.sql_max_rows,
-                "max_bytes": self.sql_max_bytes,
-                "timeout_ms": self.sql_timeout_ms
             }
         }
 

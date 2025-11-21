@@ -20,6 +20,9 @@ def generate_launch_description():
     use_doa          = LaunchConfiguration('use_doa',          default='true')
     use_tts          = LaunchConfiguration('use_tts',          default='true')
     use_vlm          = LaunchConfiguration('use_vlm',          default='true')
+    use_llm_speech_check = LaunchConfiguration('use_llm_speech_check', default='true')
+
+    llm_speech_model       = LaunchConfiguration('llm_speech_model',       default='gpt-5.1-mini')
 
     # I/O topics
     cam_img      = LaunchConfiguration('cam_img',      default='/camera/image_raw')
@@ -42,6 +45,7 @@ def generate_launch_description():
         DeclareLaunchArgument('cam_info',       default_value='/camera/camera_info'),
         DeclareLaunchArgument('cloud_topic',    default_value='/point_cloud2'),
         DeclareLaunchArgument('eleven_api_key', default_value=EnvironmentVariable('ELEVEN_API_KEY', default_value='')),
+        DeclareLaunchArgument('llm_speech_model',       default_value='gpt-5.1-mini'),
 
         # ---- OpenAI command parser
         Node(
@@ -140,5 +144,18 @@ def generate_launch_description():
             ],
             # remappings=[('/camera/image_raw', cam_img)],
         ),
+        # ---- LLM speech check server — toggleable
+        Node(
+            condition=IfCondition(use_llm_speech_check),
+            package='vlm_pkg',          # adjust if the node lives in another pkg
+            executable='llm_speech_check_server',    # entrypoint for LlmSpeechCheckNode
+            name='llm_speech_check_server',
+            output='screen',
+            parameters=[
+                {'use_sim_time': use_sim_time},
+                {'model_id': llm_speech_model},
+            ],
+        ),
+        
     ])
 

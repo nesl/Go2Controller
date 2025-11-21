@@ -47,89 +47,114 @@ skills:
     params:
       top_n: "{{ctx.top_n | default:3}}"
 
+  - name: llm.check_speech
+    kind: primitive
+    action: llm_speech_check
+    params:
+      prompt: "{{ctx.prompt | default:''}}"
+      output_schema: "{{ctx.output_schema | default:''}}"
+      text: "{{ctx.text | default:''}}"
+      tag: "{{ctx.tag | default:'default_speech_check'}}"
+
+
+  - name: vlm.run_query
+    kind: primitive
+    action: vlm_inference
+    params:
+      prompt: "{{ctx.prompt | default:''}}"
+      output_schema: "{{ctx.output_schema | default:''}}"   # optional but nice symmetry
+      tag: "{{ctx.tag | default:'default_vlm'}}"
+      # you can keep 'mode' if you want, but it’s just metadata now
+      mode: "{{ctx.mode | default:'generic'}}"
+
+
+
   # ─────────────────────────────
-  # COMPOSITES
+  # STATE MACHINES (was: COMPOSITES)
   # ─────────────────────────────
 
   # Turn search: rotate incrementally left and right using nav.move_relative
   # until either a presence is detected or the user interrupts (speech_final_any).
   - name: base.turn_search
-    kind: composite
-    when:
-      any:
-        - exists: speech_keyword
-          within_ms: 5000
-        - exists: speech_final_any
-          within_ms: 5000
+    kind: state_machine
+    when: {}
     until:
       any:
         - exists: human_detected_3d
-          within_ms: 300
         - exists: speech_final_any
           within_ms: 1
-    steps:
-      - use: nav.move_relative
-        with: { azimuth_deg: 45.0, dist_m: 0.0 }
-        when: {}
-        until:
-          any:
-            - exists: human_detected_3d
-              within_ms: 300
-            - exists: speech_final_any
-              within_ms: 1
-      - use: nav.move_relative
-        with: { azimuth_deg: -90.0, dist_m: 0.0 }
-        when: {}
-        until:
-          any:
-            - exists: human_detected_3d
-              within_ms: 300
-            - exists: speech_final_any
-              within_ms: 1
-      - use: nav.move_relative
-        with: { azimuth_deg: 45.0, dist_m: 0.0 }
-        when: {}
-        until:
-          any:
-            - exists: human_detected_3d
-              within_ms: 300
-            - exists: speech_final_any
-              within_ms: 1
+    initial_state: turn_left_1
+    states:
+      - id: turn_left_1
+        type: action
+        action:
+          use: nav.move_relative
+          with:
+            azimuth_deg: 45.0
+            dist_m: 0.0
+        on_complete: turn_right
 
-  # Greet with presence; stop if user starts talking.
+      - id: turn_right
+        type: action
+        action:
+          use: nav.move_relative
+          with:
+            azimuth_deg: -90.0
+            dist_m: 0.0
+        on_complete: turn_left_2
+
+      - id: turn_left_2
+        type: action
+        action:
+          use: nav.move_relative
+          with:
+            azimuth_deg: 45.0
+            dist_m: 0.0
+        on_complete: null   # no next state -> finish
+
+
+  # Greet with presence; only speak if the person actually engages.
   - name: greet.with_presence
-    kind: composite
+    kind: state_machine
     when:
       all:
         - exists: pose_present_precise
           within_ms: 2500
         - exists: speech_keyword
           within_ms: 2500
-    until:
-      exists: speech_final_any
-      within_ms: 1
-    steps:
-      - use: gesture.greet
-        when: {}
-        until:
-          exists: speech_final_any
-          within_ms: 1
-      - use: tts.say
-        with: { text: "Hi! How can I help?" }
-        when:
-          any:
-            - exists: speech_final_any
+    until: {}
+    initial_state: greet
+    states:
+      - id: greet
+        type: action
+        action:
+          use: gesture.greet
+          with: {}
+        on_complete: wait_for_engagement
+
+      - id: wait_for_engagement
+        type: wait
+        wait_for:
+          any_of:
+            - rule_id: speech_final_any
               within_ms: 3000
-            - exists: speech_keyword
+            - rule_id: speech_keyword
               within_ms: 3000
-        until:
-          exists: speech_final_any
-          within_ms: 1
+        on_event: say_help
+        on_timeout: null   # if no engagement, just end
+
+      - id: say_help
+        type: action
+        action:
+          use: tts.say
+          with:
+            text: "Hi! How can I help?"
+        on_complete: null
 
 
   # Beacon report: query DB then speak summary.
   - name: beacons.report_top3
-    kind: composite
+    kind: state_machine
     when:
       any:
         - exists: speech_keyword
@@ -139,76 +164,23 @@ skills:
     until:
       exists: speech_final_any
       within_ms: 1
-    steps:
-      - use: db.query_top_beacons
-        with: { top_n: 3 }
-        when: {}
-        until:
-          exists: speech_final_any
-          within_ms: 1
-      - use: tts.say
-        with:
-          text: "{{ctx.last_query_beacons_speech | default:'Beacon report complete.'}}"
-        when: {}
-        until:
-          exists: speech_final_any
-          within_ms: 1
+    initial_state: query_db
+    states:
+      - id: query_db
+        type: action
+        action:
+          use: db.query_top_beacons
+          with:
+            top_n: 3
+        on_complete: speak
 
-  # Navigate absolute goal
-  - name: nav.go_absolute
-    kind: composite
-    when: {}
-    until:
-      exists: speech_final_any
-      within_ms: 1
-    steps:
-      - use: nav.move_absolute
-        when: {}
-        until:
-          exists: speech_final_any
-          within_ms: 1
+      - id: speak
+        type: action
+        action:
+          use: tts.say
+          with:
+            text: "{{ctx.last_query_beacons_speech | default:'Beacon report complete.'}}"
+        on_complete: null
 
-  # Approach speaker via DoA
-  - name: nav.approach_speaker
-    kind: composite
-    when:
-      exists: speech_keyword
-    steps:
-      - use: nav.move_relative
-        with: { dist_m: "{{ctx.dist_m | default:0.8}}" }
-        when: {}
-
-
-  # Simple acknowledgment
-  - name: tts.ack
-    kind: composite
-    when: {}
-    steps:
-      - use: tts.say
-        with: { text: "{{ctx.text | default:'Okay.'}}" }
-        when: {}
-        
-        
-  # Turn to search for a human; if found, move toward them
-  - name: human.turn_and_approach
-    kind: composite
-    when: {}
-    steps:
-      # 1) Spin in place until a human is detected (or user interrupts)
-      - use: base.turn_search
-        when: {}
-
-      # 2) Once a recent human_detected_3d event exists, move forward
-      - use: nav.move_relative
-        with:
-          dist_m: "{{ctx.approach_dist_m | default:0.8}}"
-          azimuth_deg: 0.0
-        when:
-          exists: human_detected_3d
-          within_ms: 1000
-        until:
-          any:
-            - exists: speech_final_any
-              within_ms: 1
 
 

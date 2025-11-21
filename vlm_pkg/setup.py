@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
 		'qwen_vlm_server = vlm_pkg.qwen_vlm_server:main',
+		'llm_speech_check_server = vlm_pkg.llm_speech_check_node:main',         
         ],
     },
 )

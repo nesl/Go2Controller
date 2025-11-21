@@ -676,6 +676,52 @@ class EventLayerNode(Node):
                 self.get_logger().info(f"Dropped {topic} (no longer desired)")
 
 
+    def _cb_vlm_answer(self, msg: StringMsg):
+        """
+        Handle VLM JSON envelope from /vlm/answer and evaluate vlm_inference rules.
+
+        Expected payload (from QwenVLMServer):
+          {
+            "id": <int or str>,
+            "success": <bool>,
+            "raw_text": <str>,
+            "json_text": <str>,
+            "model_id": <str>,
+            "lat_ms": <int>,
+            "tag": <str>,
+            "ts": <float>   # when VLM node recorded it
+          }
+        """
+        ts_event = self._now()
+        try:
+            env = json.loads(msg.data or "{}")
+        except Exception:
+            self.get_logger().warn(f"Bad JSON on /vlm/answer: {msg.data}")
+            return
+
+        # Choose a canonical 'text' field for rules; keep raw_text for compatibility
+        raw = (env.get("raw_text") or env.get("text") or "").strip()
+        json_text = env.get("json_text") or ""
+
+        ctx = {
+            # what most simple rules will look at
+            "text": raw,
+            # extra fields for richer rules
+            "raw_text": raw,
+            "json_text": json_text,
+            "success": bool(env.get("success", False)),
+            "model_id": env.get("model_id") or "",
+            "lat_ms": float(env.get("lat_ms", 0.0)),
+            "tag": env.get("tag") or "",
+            "id": env.get("id"),
+            # timestamps: both the EventLayer time and the VLM node's own ts if present
+            "ts": ts_event,
+            "vlm_ts": float(env.get("ts", ts_event)),
+        }
+
+        self._eval_for_rules("vlm_inference", "answer.text", ctx)
+
+
     def _make_cb(self, topic: str, msgstr: str):
         if msgstr == "vision_msgs/Detection2DArray":
             return self._cb_detection
@@ -689,6 +735,10 @@ class EventLayerNode(Node):
             return self._cb_text_final
         if msgstr == "bt_msgs/BtReading":                   # NEW
             return self._cb_bt_reading                      # NEW
+        if topic == "/vlm/answer":
+            return self._cb_vlm_answer
+        if topic == "/llm/speech_check":
+            return self._cb_llm_speech_check
         #if topic == "/skills/status":              # NEW
         #    return self._cb_skill_status          # NEW
         # default String
@@ -919,6 +969,78 @@ class EventLayerNode(Node):
             text = (msg.data or "").strip()
         ctx = {"text": text, "ts": ts}
         self._eval_for_rules("audio_asr", "text.final", ctx)
+
+    def _cb_llm_speech_check(self, msg: StringMsg):
+        """
+        Handle LLM speech check envelope from /llm/speech_check and
+        evaluate rules for task 'llm_speech_check', output 'check.json'.
+
+        Expected outer envelope (from llm_speech_check node):
+          {
+            "id": str,
+            "success": bool,
+            "raw_text": str,
+            "json_text": str,
+            "model_id": str,
+            "lat_ms": float,
+            "tag": str,
+            "ts": float
+          }
+
+        Optionally, json_text is a STRICT JSON string with:
+          {"kind":str,"intent":str,"ok":bool,"confidence":float,"text":str,"ts":float}
+        which we will parse and surface as extra fields.
+        """
+        ts_event = self._now()
+        try:
+            env = json.loads(msg.data or "{}")
+        except Exception:
+            self.get_logger().warn(f"Bad JSON on /llm/speech_check: {msg.data}")
+            return
+
+        # Outer envelope fields
+        raw_text  = (env.get("raw_text") or "").strip()
+        json_text = env.get("json_text") or ""
+
+        # Try to parse inner structured JSON (if present)
+        inner = {}
+        if json_text:
+            try:
+                inner = json.loads(json_text)
+            except Exception:
+                self.get_logger().warn(f"Bad inner json_text in /llm/speech_check: {json_text!r}")
+
+        # Prefer the normalized 'text' from inner JSON if available
+        inner_text = (inner.get("text") or "").strip() if isinstance(inner, dict) else ""
+        canonical_text = inner_text or raw_text
+
+        ctx = {
+            # what most rules will look at
+            "text": canonical_text,
+
+            # outer envelope
+            "raw_text": raw_text,
+            "json_text": json_text,
+            "success": bool(env.get("success", False)),
+            "model_id": env.get("model_id") or "",
+            "lat_ms": float(env.get("lat_ms", 0.0)),
+            "tag": env.get("tag") or "",
+            "id": env.get("id"),
+            "ts": ts_event,
+            "llm_ts": float(env.get("ts", ts_event)),
+
+            # inner structured fields (if any)
+            "kind": inner.get("kind", "") if isinstance(inner, dict) else "",
+            "intent": inner.get("intent", "") if isinstance(inner, dict) else "",
+            "ok": bool(inner.get("ok", False)) if isinstance(inner, dict) else False,
+            "confidence": float(inner.get("confidence", 0.0)) if isinstance(inner, dict) else 0.0,
+            "inner_ts": float(inner.get("ts", ts_event)) if isinstance(inner, dict) else ts_event,
+        }
+
+        self._eval_for_rules("llm_speech_check", "check.json", ctx)
+
+
+
 
     def _cb_bt_reading(self, msg: BtReading):
         """

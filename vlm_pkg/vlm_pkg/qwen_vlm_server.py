@@ -265,6 +265,10 @@ class QwenVLMServer(Node):
         self.perf_pub = self.create_publisher(RosString, self.perf_topic, 10)
         self.enable_srv = self.create_service(SetBool, "/vlm/enable", self.on_enable)
         self.add_on_set_parameters_callback(self._on_set_parameters)
+        # NEW: generic request channel, symmetric with llm_speech_check
+        self.create_subscription(RosString, "/vlm/req", self.on_req, 10)
+
+
 
         self._load_vlm()
 
@@ -278,6 +282,57 @@ class QwenVLMServer(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to load VLM: {e}")
             raise
+
+    def on_req(self, msg: RosString):
+        """
+        Handle generic VLM requests coming as JSON on /vlm/req.
+
+        Expected payload:
+          {
+            "id": <int or str>,
+            "prompt": <str>,
+            "output_schema": <str>,   # not enforced here, just forwarded
+            "tag": <str>,
+            "mode": <str>             # optional; ignored here
+          }
+        """
+        raw = msg.data or ""
+        self.get_logger().info(f"[vlm] /vlm/req raw payload (len={len(raw)}): {raw[:200]!r}")
+
+        try:
+            obj = json.loads(raw)
+        except Exception as e:
+            self.get_logger().warn(f"[vlm] bad JSON on /vlm/req: {e}")
+            return
+
+        req_id = obj.get("id")
+        prompt = obj.get("prompt") or "Describe the scene."
+        tag = obj.get("tag") or "default_vlm"
+        mode = obj.get("mode") or "generic"
+
+        self.get_logger().info(
+            f"[vlm] parsed /vlm/req id={req_id!r} tag={tag!r} mode={mode!r} "
+            f"prompt_len={len(prompt)} prompt_preview={prompt[:120]!r}"
+        )
+
+        ok, answer, dt_ms, envelope = self._run_vlm_once(
+            prompt=prompt,
+            tag=tag,
+            phase="run_trigger",   # distinguish from service calls
+            req_id=req_id,
+        )
+
+        if ok:
+            self.get_logger().info(
+                f"[vlm] req id={req_id} OK tag={tag!r} lat={dt_ms} ms "
+                f"answer_len={len(answer)} answer_preview={answer[:120]!r}"
+            )
+        else:
+            self.get_logger().warn(
+                f"[vlm] req id={req_id} FAILED tag={tag!r} lat={dt_ms} ms"
+            )
+
+
 
     def on_enable(self, req, res):
         self.enabled = bool(req.data)
@@ -340,25 +395,65 @@ class QwenVLMServer(Node):
         self.current_prompt = msg.data
         self.get_logger().info(f"Prompt updated: {self.current_prompt!r}")
 
-    def on_run(self, req, res):
+    def _run_vlm_once(self, *, prompt: str, tag: str = "", phase: str, req_id=None):
+        """
+        Shared helper: runs VLM on latest image and publishes JSON envelope to /vlm/answer.
+
+        Returns (ok: bool, answer_text: str, lat_ms: int, envelope: dict).
+        """
+        tag = tag or ""
         if not self.enabled:
-            res.success = False
-            res.message = "VLM is currently disabled."
-            return res
+            self.get_logger().warn(
+                f"[vlm] request while disabled (phase={phase}, tag={tag!r}, id={req_id!r})"
+            )
+            return False, "", 0, {
+                "id": req_id,
+                "success": False,
+                "raw_text": "",
+                "json_text": "",
+                "model_id": self.model_id,
+                "lat_ms": 0,
+                "tag": tag,
+                "ts": time.time(),
+            }
 
         if self.latest_pil is None:
-            res.success = False
-            res.message = "No image received yet on /camera/image_raw."
-            return res
+            self.get_logger().warn(
+                f"[vlm] request but no image yet (phase={phase}, tag={tag!r}, id={req_id!r})"
+            )
+            return False, "", 0, {
+                "id": req_id,
+                "success": False,
+                "raw_text": "",
+                "json_text": "",
+                "model_id": self.model_id,
+                "lat_ms": 0,
+                "tag": tag,
+                "ts": time.time(),
+            }
 
-        prompt = self.current_prompt
         max_new = self.get_parameter("max_new_tokens").get_parameter_value().integer_value
         temp = self.get_parameter("temperature").get_parameter_value().double_value
 
-        self.get_logger().info("Running VLM inference…")
+        # Extra debug about prompt + image
+        try:
+            w, h = self.latest_pil.size
+            img_info = f"{w}x{h}"
+        except Exception:
+            img_info = "unknown"
+
+        self.get_logger().info(
+            f"[vlm] running inference "
+            f"(phase={phase}, tag={tag!r}, id={req_id!r}, "
+            f"model_id={self.model_id!r}, img={img_info}, "
+            f"prompt_len={len(prompt)}, prompt_preview={prompt[:160]!r}, "
+            f"max_new_tokens={max_new}, temperature={temp})"
+        )
+
         t0 = time.time()
         ok = False
         answer = ""
+        dt_ms = 0
         try:
             answer = self.vlm.infer(
                 self.latest_pil,
@@ -366,27 +461,75 @@ class QwenVLMServer(Node):
                 max_new_tokens=max_new,
                 temperature=temp,
             )
-            # publish full text
-            self.ans_pub.publish(RosString(data=answer))
-            # truncate in service response
-            trunc = (answer[:180] + "…") if len(answer) > 180 else answer
-            res.success = True
-            res.message = f"OK: {trunc}"
             ok = True
         except Exception as e:
-            self.get_logger().error(f"VLM error: {e}")
-            res.success = False
-            res.message = f"Error: {e}"
+            self.get_logger().error(f"[vlm] error during inference: {e}")
         finally:
             dt_ms = int((time.time() - t0) * 1000)
             self._publish_perf(
                 lat_ms=dt_ms,
                 ok=ok,
-                phase="run_service",
-                prompt_len=len(prompt),
-                answer_len=len(answer),
+                phase=phase,
+                prompt_len=len(prompt or ""),
+                answer_len=len(answer or ""),
             )
+
+        self.get_logger().info(
+            f"[vlm] inference done (phase={phase}, tag={tag!r}, id={req_id!r}, "
+            f"ok={ok}, lat={dt_ms} ms, answer_len={len(answer)}, "
+            f"answer_preview={answer[:160]!r})"
+        )
+
+        # Build JSON envelope expected by EventLayer/SkillsAgent
+        envelope = {
+            "id": req_id,
+            "success": bool(ok),
+            "raw_text": answer or "",
+            # For now we don't try to enforce output_schema; leave JSON empty.
+            "json_text": "",
+            "model_id": self.model_id,
+            "lat_ms": dt_ms,
+            "tag": tag or "",
+            "ts": time.time(),
+        }
+
+        try:
+            self.ans_pub.publish(RosString(data=json.dumps(envelope)))
+        except Exception as e:
+            self.get_logger().warn(f"[vlm] answer publish failed: {e}")
+
+        return ok, answer, dt_ms, envelope
+
+
+
+    def on_run(self, req, res):
+        """
+        Legacy service interface for manual testing.
+
+        Uses self.current_prompt (set via /vlm/prompt) and also publishes a
+        JSON envelope on /vlm/answer, just like /vlm/req does.
+        """
+        prompt = self.current_prompt or "Describe the scene."
+        tag = "service_run"
+
+        ok, answer, dt_ms, envelope = self._run_vlm_once(
+            prompt=prompt,
+            tag=tag,
+            phase="run_service",
+            req_id=None,   # no correlation id for service by default
+        )
+
+        if ok:
+            trunc = (answer[:180] + "…") if len(answer) > 180 else answer
+            res.success = True
+            res.message = f"OK: {trunc}"
+        else:
+            res.success = False
+            # envelope already published; describe failure succinctly
+            res.message = "Error: VLM inference failed or no image available."
+
         return res
+
 
 def main():
     rclpy.init()

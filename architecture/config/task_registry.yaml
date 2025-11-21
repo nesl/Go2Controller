@@ -6,17 +6,32 @@ meta:
     throughput_fps: "frames/s at stated resolution"
     memory_mb: "approx resident"
   notes: "Tasks declare outputs; models implement task with metrics/params."
+  # Optional: shared scalar types the rule engine understands
+  value_types:
+    - { name: "int",    description: "integer" }
+    - { name: "float",  description: "floating point number" }
+    - { name: "bool",   description: "boolean" }
+    - { name: "string", description: "UTF-8 string" }
+    - { name: "ts",     description: "UNIX timestamp (seconds as float)" }
 
 tasks:
 
   odometry_tracking:
-      description: "Track robot base pose for distance and rotation changes"
-      node: ""   # Not required unless you dynamically enable something
-      outputs:
-        - id: "odom"
-          ros:
-            topic: "/odom"
-            msg: "nav_msgs/Odometry"
+    description: "Track robot base pose for distance and rotation changes"
+    node: ""   # Not required unless you dynamically enable something
+    outputs:
+      - id: "odom"
+        ros:
+          topic: "/odom"
+          msg: "nav_msgs/Odometry"
+        # Fields exposed to rules after decoding Odometry
+        context:
+          fields:
+            - { name: x,        type: "float",  desc: "map/base_link x position (m)" }
+            - { name: y,        type: "float",  desc: "map/base_link y position (m)" }
+            - { name: yaw,      type: "float",  desc: "heading yaw in radians" }
+            - { name: frame_id, type: "string", desc: "TF frame of pose ('map', etc.)" }
+            - { name: ts,       type: "ts",     desc: "message timestamp" }
 
   object_detection:
     description: "2D objects; optionally your node adds 3D map poses via depth/TF."
@@ -24,14 +39,44 @@ tasks:
     outputs:
       - id: detection.2d
         ros: { msg: vision_msgs/Detection2DArray, topic: "/detected_objects" }
-        fields: ["class","score","bbox","pose_3d?","frame_id"]
+        schema_hint: >
+          {"detections":[{"cls":str,"score":float,
+            "bbox":[float,float,float,float],
+            "map_x":float?,"map_y":float?,"frame_id":str}]}
+        context:
+          per_detection_fields:
+            - { name: cls,     type: "string", desc: "COCO class label (e.g. 'person')" }
+            - { name: score,   type: "float",  desc: "detection confidence 0..1" }
+            - { name: cx,      type: "float",  desc: "bbox center x (pixels)" }
+            - { name: cy,      type: "float",  desc: "bbox center y (pixels)" }
+            - { name: w,       type: "float",  desc: "bbox width (pixels)" }
+            - { name: h,       type: "float",  desc: "bbox height (pixels)" }
+            - { name: map_x,   type: "float?", desc: "3D x position in target_frame (if depth+TF OK)" }
+            - { name: map_y,   type: "float?", desc: "3D y position in target_frame (if depth+TF OK)" }
+            - { name: map_z,   type: "float?", desc: "3D z position in target_frame (if depth+TF OK)" }
+            - { name: frame_id,type: "string", desc: "frame for 3D pose, usually 'map'" }
+            
       - id: image.annotated
         ros: { msg: sensor_msgs/Image, topic: "/annotated_image" }
+        # No scalar fields; normally not used directly in rules.
+        context:
+          fields: []
+
       - id: markers
         ros: { msg: visualization_msgs/MarkerArray, topic: "/visualization_marker_array" }
+        context:
+          fields: []
+
       - id: perf.json
         ros: { msg: std_msgs/String, topic: "/yolo_perf" }
-        schema_hint: '{"latency_ms":{"det":num,"pose":num,"total":num},"fps_ema":num}'
+        schema_hint: '{"latency_ms":{"det":float,"pose":float,"total":float},"fps_ema":float}'
+        context:
+          fields:
+            - { name: lat_det_ms,   type: "float", desc: "detector latency (ms)" }
+            - { name: lat_pose_ms,  type: "float", desc: "pose latency (ms, if used)" }
+            - { name: lat_total_ms, type: "float", desc: "total pipeline latency (ms)" }
+            - { name: fps_ema,      type: "float", desc: "EMA of detector FPS" }
+
     services:
       enable:                                # std_srvs/SetBool to gate inference
         name: "/toggle_yolo"
@@ -40,24 +85,24 @@ tasks:
         param_service: "/coco_detector/set_parameters"
         param_name: "yolo_weights"
         type: "rcl_interfaces/SetParameters"
-      # optional 'reload' poke after changing params (if your node needs it)
-      # reload:
-      #   name: "/toggle_yolo"
-      #   type: "std_srvs/SetBool"
-
     models:
       - id: yolo11n
         version: "11n"
         description: "Nano detector (very low latency)."
         metrics:
           latency_ms: { det_mean: 8.0 }       # example at 640p
-          throughput_fps: { rgb_640: 60.0 }
-          accuracy: { coco_map_50_95: 0.38 }
         resources: { device_pref: ["cuda","cpu"], memory_mb: 600, vram_mb: 500 }
         parameters:
-          detection_threshold: { default: 0.30 }
-          device: { default: "cuda" }
-          weights: "yolo11n.pt"
+          detection_threshold:
+            type: "float"
+            default: 0.30
+          device:
+            type: "string"
+            default: "cuda"
+            enum: ["cuda","cpu"]
+          weights:
+            type: "string"
+            default: "yolo11n.pt"
 
       - id: yolo11x
         version: "11x"
@@ -68,9 +113,16 @@ tasks:
           accuracy: { coco_map_50_95: 0.53 }
         resources: { device_pref: ["cuda","cpu"], memory_mb: 2600, vram_mb: 2400 }
         parameters:
-          detection_threshold: { default: 0.25 }
-          device: { default: "cuda" }
-          weights: "yolo11x.pt"
+          detection_threshold:
+            type: "float"
+            default: 0.25
+          device:
+            type: "string"
+            default: "cuda"
+            enum: ["cuda","cpu"]
+          weights:
+            type: "string"
+            default: "yolo11x.pt"
 
   pose_detection:
     description: "Human keypoints (COCO-17), on-demand."
@@ -78,12 +130,29 @@ tasks:
     outputs:
       - id: pose.json
         ros: { msg: std_msgs/String, topic: "/yolo_pose_json" }
-        schema_hint: '{"persons":[{"bbox":[x1,y1,x2,y2],"score":p,"keypoints":[[x,y,conf],...]}]}'
+        schema_hint: >
+          {"persons":[{"bbox":[x1,y1,x2,y2],
+                       "score":float,
+                       "keypoints":[[x,y,conf],...]}]}
+        context:
+          per_person_fields:
+            - { name: bbox,      type: "[float;4]", desc: "[x1,y1,x2,y2] pixels" }
+            - { name: score,     type: "float?",    desc: "pose person score (if available)" }
+            - { name: n_kpts,    type: "int",      desc: "number of keypoints" }
+            - { name: kpts,      type: "list",     desc: "list of [x,y,conf]" }
+
       - id: image.annotated
         ros: { msg: sensor_msgs/Image, topic: "/annotated_image" }
+        context:
+          fields: []
+
       - id: perf.json
         ros: { msg: std_msgs/String, topic: "/yolo_perf" }
-        schema_hint: '{"latency_ms":{"pose":num}}'
+        schema_hint: '{"latency_ms":{"pose":float}}'
+        context:
+          fields:
+            - { name: lat_pose_ms, type: "float", desc: "pose latency (ms)" }
+
     services:
       enable:
         name: "/toggle_yolo_pose"
@@ -101,7 +170,14 @@ tasks:
           throughput_fps: { rgb_640: 55.0 }
           accuracy: { keypoint_AP_50_95: 0.50 }
         resources: { device_pref: ["cuda","cpu"], memory_mb: 800, vram_mb: 700 }
-        parameters: { device: { default: "cuda" }, weights: "yolo11n-pose.pt" }
+        parameters:
+          device:
+            type: "string"
+            default: "cuda"
+            enum: ["cuda","cpu"]
+          weights:
+            type: "string"
+            default: "yolo11n-pose.pt"
 
       - id: yolo11x-pose
         version: "11x-pose"
@@ -110,7 +186,14 @@ tasks:
           throughput_fps: { rgb_640: 22.0 }
           accuracy: { keypoint_AP_50_95: 0.63 }
         resources: { device_pref: ["cuda","cpu"], memory_mb: 2800, vram_mb: 2500 }
-        parameters: { device: { default: "cuda" }, weights: "yolo11x-pose.pt" }
+        parameters:
+          device:
+            type: "string"
+            default: "cuda"
+            enum: ["cuda","cpu"]
+          weights:
+            type: "string"
+            default: "yolo11x-pose.pt"
 
   audio_gating:
     description: "Low-latency gate; partial text and DoA summary per window."
@@ -118,9 +201,32 @@ tasks:
     outputs:
       - id: text.partial
         ros: { msg: std_msgs/String, topic: "/audio/stt_partial_json" }
-        schema_hint: '{"kind":"partial_gate","text":str,"avg_logprob":num,"lat_ms":num,"doa":{"angle_mode_deg":num,"angle_mean_deg":num}}'
+        schema_hint: >
+          {"kind":"partial_gate","text":str,"avg_logprob":float,"lat_ms":float,
+           "doa":{"angle_mode_deg":float,"angle_mean_deg":float}}
+        context:
+          fields:
+            - { name: text,              type: "string", desc: "partial ASR text" }
+            - { name: avg_logprob,       type: "float",  desc: "avg token logprob" }
+            - { name: lat_ms,            type: "float",  desc: "window latency (ms)" }
+            - { name: doa_angle_mode_deg,type: "float",  desc: "mode DoA (deg)" }
+            - { name: doa_angle_mean_deg,type: "float",  desc: "mean DoA (deg)" }
+            - { name: ts,                type: "ts",     desc: "message timestamp" }
+
       - id: perf.json
         ros: { msg: std_msgs/String, topic: "/stt_perf" }
+        context:
+          fields:
+            - { name: lat_gate_ms_ema, type: "float?", desc: "EMA gate latency (ms)" }
+            - { name: lat_asr_ms_ema,  type: "float?", desc: "EMA ASR latency (ms)" }
+            - { name: lat_e2e_ms_ema,  type: "float?", desc: "EMA end-to-end latency (ms)" }
+            - { name: windows_processed,      type: "int",    desc: "gate windows processed" }
+            - { name: utterances_finalized,   type: "int",    desc: "final utterances emitted" }
+            - { name: last_gate_lat_ms,       type: "float?", desc: "most recent gate window latency (ms)" }
+            - { name: last_asr_lat_ms,        type: "float?", desc: "most recent ASR latency (ms)" }
+            - { name: last_e2e_ms,            type: "float?", desc: "most recent end-to-end latency (ms)" }
+
+
     services:
       enable:
         name: "/toggle_gate"
@@ -136,8 +242,12 @@ tasks:
         metrics: { latency_ms: { window_infer_mean: 25.0 } }
         resources: { device_pref: ["cuda","cpu"], memory_mb: 2200, vram_mb: 1600 }
         parameters:
-          wg_window_ms: { default: 3000 }
-          wg_hop_ms: { default: 1000 }
+          wg_window_ms:
+            type: "int"
+            default: 3000
+          wg_hop_ms:
+            type: "int"
+            default: 1000
 
   audio_asr:
     description: "Final, higher-quality utterance transcription."
@@ -146,11 +256,36 @@ tasks:
       - id: text.final
         ros: { msg: std_msgs/String, topic: "/audio/stt_text" }
         schema_hint: '{"text": str}'
+        context:
+          fields:
+            - { name: text, type: "string", desc: "final ASR text" }
+
       - id: json.final
         ros: { msg: std_msgs/String, topic: "/audio/stt_doa_json" }
-        schema_hint: '{"text":str,"azimuth_deg":num,"stamp":{...}}'
+        schema_hint: >
+          {"text":str,"azimuth_deg":float,"stamp":{"sec":int,"nanosec":int}}
+        context:
+          fields:
+            - { name: text,        type: "string", desc: "final utterance transcript" }
+            - { name: azimuth_deg, type: "float",  desc: "DoA for utterance (deg)" }
+            - { name: language,    type: "string?",desc: "language code, e.g. 'en', may be null" }
+            - { name: duration,    type: "float?", desc: "utterance duration in seconds (if set)" }
+            - { name: ts,          type: "ts",     desc: "utterance end timestamp (derived from stamp)" }
+
+
       - id: perf.json
         ros: { msg: std_msgs/String, topic: "/stt_perf" }
+        context:
+          fields:
+            - { name: lat_gate_ms_ema, type: "float?", desc: "EMA gate latency (ms)" }
+            - { name: lat_asr_ms_ema,  type: "float?", desc: "EMA ASR latency (ms)" }
+            - { name: lat_e2e_ms_ema,  type: "float?", desc: "EMA end-to-end latency (ms)" }
+            - { name: windows_processed,      type: "int",    desc: "gate windows processed" }
+            - { name: utterances_finalized,   type: "int",    desc: "final utterances emitted" }
+            - { name: last_gate_lat_ms,       type: "float?", desc: "most recent gate window latency (ms)" }
+            - { name: last_asr_lat_ms,        type: "float?", desc: "most recent ASR latency (ms)" }
+            - { name: last_e2e_ms,            type: "float?", desc: "most recent end-to-end latency (ms)" }
+
     services:
       enable:
         name: "/toggle_stt"
@@ -166,9 +301,13 @@ tasks:
         metrics: { latency_ms: { utter_infer_mean: 160.0 } }
         resources: { device_pref: ["cuda","cpu"], memory_mb: 3200, vram_mb: 2400 }
         parameters:
-          stt_model_size: { default: "medium", enum: ["tiny","base","small","medium","large-v3"] }
-          stt_chunk_s: { default: 30.0 }
-          
+          stt_model_size:
+            type: "string"
+            default: "medium"
+            enum: ["tiny","base","small","medium","large-v3"]
+          stt_chunk_s:
+            type: "float"
+            default: 30.0
 
   bt_proximity:
     description: "Raw Bluetooth RSSI readings for objects (no TF/DB)."
@@ -178,9 +317,15 @@ tasks:
         ros:
           topic: "/bt/readings"
           msg: "bt_msgs/BtReading"
-        # Available fields in rule context (from the event layer):
-        # rssi:int, object_id:str, device_id:str, phone_id:str, frame_id:str, strength_bucket:str, ts:float
-        
+        context:
+          fields:
+            - { name: rssi,        type: "int",    desc: "RSSI (dBm)" }
+            - { name: object_id,   type: "string", desc: "object / CNode id" }
+            - { name: device_id,   type: "string", desc: "BT device id" }
+            - { name: phone_id,    type: "string", desc: "phone id (human/device)" }
+            - { name: frame_id,    type: "string", desc: "TF frame of reading (should be 'map')" }
+            - { name: ts,          type: "ts",     desc: "reading timestamp" }
+
   skill_status:
     description: "Skill execution status and completion events."
     node: ""   # no enable/disable; published directly by SkillsAgent
@@ -189,8 +334,20 @@ tasks:
         ros:
           topic: "/skills/status"
           msg: "std_msgs/String"
-        # schema_hint (conceptual):
-        # '{"skill":str,"status":str,"reason":str,"step_idx":int,"ctx":{...}}'
+        # conceptual schema:
+        # {"skill":str,"status":str,"reason":str,"step_idx":int,"ctx":{...}}
+        context:
+          fields:
+            - { name: kind,       type: "string", desc: "event kind: skill_started, step_started, skill_finished" }
+            - { name: skill,      type: "string", desc: "composite skill name" }
+            - { name: step_idx,   type: "int",    desc: "current step index (0-based)" }
+            - { name: started_ms, type: "int",    desc: "time skill was armed (ms since epoch)" }
+            - { name: activated,  type: "bool",   desc: "whether composite-level when has fired" }
+            - { name: done,       type: "bool",   desc: "true if skill has finished" }
+            - { name: primitive,  type: "string", desc: "primitive name for this step (if applicable; may be null)" }
+            - { name: composite,  type: "string", desc: "nested composite name for this step (if applicable; may be null)" }
+            - { name: reason,     type: "string", desc: "optional completion reason (e.g., all_steps, composite_until)" }
+            - { name: ctx,        type: "json",   desc: "skill context dictionary carried through execution" }
 
   # ─────────────────────────────
   # LLM tasks (broker, planner, orchestrator)
@@ -204,16 +361,33 @@ tasks:
         ros:
           topic: "/broker/facts"
           msg: "std_msgs/String"
+        context:
+          fields:
+            - { name: n_facts, type: "int?", desc: "count of facts in payload (if computed by broker)" }
+
       - id: facts_delta.json
         ros:
           topic: "/broker/facts_delta"
           msg: "std_msgs/String"
+        context:
+          fields:
+            - { name: n_delta, type: "int?", desc: "count of changed facts (if computed)" }
+
       - id: perf.json
         kind: perf
         ros:
           topic: "/llm/broker_perf"
           msg: "std_msgs/String"
-        schema_hint: '{"node":"broker","model":str,"lat_ms":num,"ok":bool,"phase":str}'
+        schema_hint: '{"node":"broker","model":str,"lat_ms":float,"ok":bool,"phase":str}'
+        context:
+          fields:
+            - { name: node,   type: "string", desc: "node name 'broker'" }
+            - { name: model,  type: "string", desc: "model id" }
+            - { name: lat_ms, type: "float",  desc: "LLM latency (ms)" }
+            - { name: ok,     type: "bool",   desc: "true if call succeeded" }
+            - { name: phase,  type: "string", desc: "phase, e.g. 'draft','retry'" }
+            - { name: ts,     type: "ts",     desc: "perf sample timestamp" }
+
     models:
       - id: gpt-5-nano
         version: "gpt-5.1-nano"
@@ -222,6 +396,8 @@ tasks:
           latency_ms: { typical: 40.0 }
         resources:
           device_pref: ["cloud"]
+        parameters: {}
+
       - id: gpt-4.1-mini
         version: "gpt-4.1-mini"
         role: "higher_quality"
@@ -229,6 +405,7 @@ tasks:
           latency_ms: { typical: 120.0 }
         resources:
           device_pref: ["cloud"]
+        parameters: {}
 
   llm_planner:
     description: "LLM that turns broker facts + goals into high-level task plans."
@@ -238,16 +415,33 @@ tasks:
         ros:
           topic: "/planner/plan"
           msg: "std_msgs/String"
+        context:
+          fields:
+            - { name: has_plan,  type: "bool?", desc: "true if a plan was produced (if tagged)" }
+
       - id: needs.json
         ros:
           topic: "/planner/needs"
           msg: "std_msgs/String"
+        context:
+          fields:
+            - { name: n_needs, type: "int?", desc: "number of needs (if tagged)" }
+
       - id: perf.json
         kind: perf
         ros:
           topic: "/llm/planner_perf"
           msg: "std_msgs/String"
-        schema_hint: '{"node":"planner","model":str,"lat_ms":num,"ok":bool,"phase":str}'
+        schema_hint: '{"node":"planner","model":str,"lat_ms":float,"ok":bool,"phase":str}'
+        context:
+          fields:
+            - { name: node,   type: "string", desc: "node name 'planner'" }
+            - { name: model,  type: "string", desc: "model id" }
+            - { name: lat_ms, type: "float",  desc: "LLM latency (ms)" }
+            - { name: ok,     type: "bool",   desc: "true if call succeeded" }
+            - { name: phase,  type: "string", desc: "phase label" }
+            - { name: ts,     type: "ts",     desc: "perf sample timestamp" }
+
     models:
       - id: gpt-4.1-mini
         version: "gpt-4.1-mini"
@@ -256,6 +450,8 @@ tasks:
           latency_ms: { typical: 150.0 }
         resources:
           device_pref: ["cloud"]
+        parameters: {}
+
       - id: gpt-4.1
         version: "gpt-4.1"
         role: "high_reasoning"
@@ -263,6 +459,7 @@ tasks:
           latency_ms: { typical: 300.0 }
         resources:
           device_pref: ["cloud"]
+        parameters: {}
 
   llm_orchestrator:
     description: "LLM that maps plans into executable skills and orchestrates execution."
@@ -272,12 +469,25 @@ tasks:
         ros:
           topic: "/orchestrator/skills"
           msg: "std_msgs/String"
+        context:
+          fields:
+            - { name: n_skills, type: "int?", desc: "number of skills proposed (if tagged)" }
+
       - id: perf.json
         kind: perf
         ros:
           topic: "/llm/orchestrator_perf"
           msg: "std_msgs/String"
-        schema_hint: '{"node":"orchestrator","model":str,"lat_ms":num,"ok":bool,"phase":str}'
+        schema_hint: '{"node":"orchestrator","model":str,"lat_ms":float,"ok":bool,"phase":str}'
+        context:
+          fields:
+            - { name: node,   type: "string", desc: "node name 'orchestrator'" }
+            - { name: model,  type: "string", desc: "model id" }
+            - { name: lat_ms, type: "float",  desc: "LLM latency (ms)" }
+            - { name: ok,     type: "bool",   desc: "true if call succeeded" }
+            - { name: phase,  type: "string", desc: "phase label" }
+            - { name: ts,     type: "ts",     desc: "perf sample timestamp" }
+
     models:
       - id: gpt-4.1-mini
         version: "gpt-4.1-mini"
@@ -286,6 +496,8 @@ tasks:
           latency_ms: { typical: 120.0 }
         resources:
           device_pref: ["cloud"]
+        parameters: {}
+
       - id: gpt-5-nano
         version: "gpt-5.1-nano"
         role: "low_latency_fallback"
@@ -293,7 +505,7 @@ tasks:
           latency_ms: { typical: 40.0 }
         resources:
           device_pref: ["cloud"]
-
+        parameters: {}
 
   audio_tts:
     description: "Text-to-speech synthesis; publishes WAV bytes for playback and perf telemetry."
@@ -301,21 +513,35 @@ tasks:
     outputs:
       - id: wav.bytes
         ros: { msg: std_msgs/UInt8MultiArray, topic: "/tts_wav" }
+        context:
+          fields: []   # audio bytes are not directly rule-addressable
+
       - id: perf.json
         kind: perf
         ros:
           msg: std_msgs/String
           topic: "/tts/perf"
         schema_hint: >
-          {"node":"tts","task":"audio_tts","model":str,"lat_ms":num,"ok":bool,
-           "phase":str,"n_chunks":int,"n_bytes":int,"ts":num}
-           
+          {"node":"tts","task":"audio_tts","model":str,"lat_ms":float,"ok":bool,
+           "phase":str,"n_chunks":int,"n_bytes":int,"ts":float}
+        context:
+          fields:
+            - { name: node,     type: "string", desc: "node name 'tts'" }
+            - { name: task,     type: "string", desc: "task id 'audio_tts'" }
+            - { name: model,    type: "string", desc: "tts model identifier" }
+            - { name: lat_ms,   type: "float",  desc: "synthesis latency (ms)" }
+            - { name: ok,       type: "bool",   desc: "true if synthesis ok" }
+            - { name: phase,    type: "string", desc: "phase label" }
+            - { name: n_chunks, type: "int",    desc: "number of generated chunks" }
+            - { name: n_bytes,  type: "int",    desc: "size of audio payload" }
+            - { name: ts,       type: "ts",     desc: "perf timestamp" }
+
     services:
       set_model:
         param_service: "/tts_node/set_parameters"
         param_name: "model_profile"
         type: "rcl_interfaces/SetParameters"
-           
+
     models:
       - id: mms-eng
         version: "facebook/mms-tts-eng"
@@ -325,35 +551,70 @@ tasks:
           throughput_fps: { n/a: 0.0 }
         resources: { device_pref: ["cuda","cpu"], memory_mb: 900, vram_mb: 800 }
         parameters:
-          target_sr: { default: 16000 }
-          use_half: { default: false }
+          target_sr:
+            type: "int"
+            default: 16000
+          use_half:
+            type: "bool"
+            default: false
+
       - id: elevenlabs-turbo
         version: "eleven_turbo_v2_5"
         description: "Cloud TTS (fast, expressive)."
         metrics:
           latency_ms: { synth_total_typical: 180.0 }
-        resources: { device_pref: ["cloud"] }
+        resources:
+          device_pref: ["cloud"]
         parameters:
-          voice_name: { default: "XrExE9yKIg1WjnnlVkGX" }
-          stability: { default: 0.50 }
-          similarity_boost: { default: 0.50 }
+          voice_name:
+            type: "string"
+            default: "XrExE9yKIg1WjnnlVkGX"
+          stability:
+            type: "float"
+            default: 0.50
+          similarity_boost:
+            type: "float"
+            default: 0.50
 
   vlm_inference:
-    description: "Vision-language model answering prompts about the latest camera frame."
+    description: "Vision-language micro-service that answers prompts about the latest camera frame."
     node: "/qwen_vlm_server"
+
     outputs:
       - id: answer.text
         ros:
           msg: std_msgs/String
           topic: "/vlm/answer"
+
+        context:
+          fields:
+            - { name: id,        type: "string", desc: "Correlation id copied from request (if used)" }
+            - { name: success,   type: "bool",   desc: "True if VLM call & JSON normalization succeeded" }
+            - { name: raw_text,  type: "string", desc: "Raw VLM completion text (may not be valid JSON)" }
+            - { name: json_text, type: "string", desc: "Normalized STRICT JSON string, or empty if parse failed" }
+            - { name: model_id,  type: "string", desc: "Model id used for this request" }
+            - { name: lat_ms,    type: "float",  desc: "End-to-end latency in milliseconds" }
+            - { name: tag,       type: "string", desc: "Optional free-form tag from the request" }
+            - { name: ts,        type: "ts",     desc: "EventLayer timestamp when message was processed" }
+
       - id: perf.json
         kind: perf
         ros:
           msg: std_msgs/String
           topic: "/vlm/perf"
-        schema_hint: >
-          {"node":"vlm","task":"vlm_inference","model":str,"lat_ms":num,
-           "ok":bool,"phase":str,"prompt_len":int,"answer_len":int,"ts":num}
+
+        context:
+          fields:
+            - { name: node,       type: "string", desc: "node name 'vlm'" }
+            - { name: task,       type: "string", desc: "task id 'vlm_inference'" }
+            - { name: model,      type: "string", desc: "model id" }
+            - { name: lat_ms,     type: "float",  desc: "VLM latency (ms)" }
+            - { name: ok,         type: "bool",   desc: "true if inference ok" }
+            - { name: phase,      type: "string", desc: "phase label" }
+            - { name: prompt_len, type: "int",    desc: "prompt length" }
+            - { name: answer_len, type: "int",    desc: "answer length" }
+            - { name: ts,         type: "ts",     desc: "perf timestamp" }
+
     services:
       enable:
         name: "/vlm/enable"
@@ -362,19 +623,25 @@ tasks:
         param_service: "/qwen_vlm_server/set_parameters"
         param_name: "model_id"
         type: "rcl_interfaces/SetParameters"
+
     models:
       - id: qwen2.5-vl-7b-int4
         version: "Qwen/Qwen2.5-VL-7B-Instruct"
         description: "7B Qwen VLM, int4 quantized."
         metrics:
-          latency_ms: { run_trigger_typical: 800.0 }   # rough; will be refined by EMA
+          latency_ms: { run_trigger_typical: 800.0 }
         resources:
           device_pref: ["cuda","cpu"]
           memory_mb: 16000
           vram_mb: 12000
         parameters:
-          int4: { default: true }
-          bf16: { default: true }
+          int4:
+            type: "bool"
+            default: true
+          bf16:
+            type: "bool"
+            default: true
+
       - id: qwen2.5-vl-7b-bf16
         version: "Qwen/Qwen2.5-VL-7B-Instruct"
         description: "7B Qwen VLM, full bf16."
@@ -385,7 +652,102 @@ tasks:
           memory_mb: 20000
           vram_mb: 16000
         parameters:
-          int4: { default: false }
-          bf16: { default: true }
+          int4:
+            type: "bool"
+            default: false
+          bf16:
+            type: "bool"
+            default: true
+  
+
+  llm_speech_check:
+    description: "LLM micro-service that classifies or validates the latest utterance."
+    node: "/llm_speech_check"          # ROS node that wraps the LLM
+
+    outputs:
+      - id: check.json
+        ros:
+          topic: "/llm/speech_check"
+          msg: "std_msgs/String"
+        schema_hint: >
+          {"kind":str,"intent":str,"ok":bool,"confidence":float,
+           "text":str,"ts":float}
+        context:
+          fields:
+            - { name: id,        type: "string", desc: "Correlation id copied from /llm/speech_check_req" }
+            - { name: success,   type: "bool",   desc: "True if LLM call & JSON normalization succeeded" }
+            - { name: raw_text,  type: "string", desc: "Raw LLM completion text (may not be valid JSON)" }
+            - { name: json_text, type: "string", desc: "Normalized STRICT JSON string, or empty if parse failed" }
+            - { name: model_id,  type: "string", desc: "Model id used for this request" }
+            - { name: lat_ms,    type: "float",  desc: "End-to-end latency in milliseconds" }
+            - { name: tag,       type: "string", desc: "Optional free-form tag from the request" }
+            # Added by EventLayer when it builds ctx
+            - { name: ts,        type: "ts",     desc: "EventLayer timestamp when message was processed" }
+
+
+      - id: perf.json
+        kind: perf
+        ros:
+          topic: "/llm/speech_check_perf"
+          msg: "std_msgs/String"
+        context:
+          fields:
+            - { name: model,  type: "string", desc: "Model id used for this check" }
+            - { name: lat_ms, type: "float",  desc: "Latency in milliseconds" }
+            - { name: ok,     type: "bool",   desc: "True if request completed without error" }
+            - { name: tag,    type: "string", desc: "Optional tag / scenario label" }
+            # Also directly from the node
+            - { name: ts,     type: "ts",     desc: "Timestamp (sec) from node when metrics were recorded" }
+
+
+    services:
+      enable:
+        name: "/llm_speech_check/enable"
+        type: "std_srvs/SetBool"
+      set_model:
+        param_service: "/llm_speech_check/set_parameters"
+        param_name: "model_id"
+        type: "rcl_interfaces/SetParameters"
+
+    models:
+      - id: gpt-5-nano
+        version: "gpt-5.1-nano"
+        description: "Low-latency LLM for simple utterance checks."
+        metrics:
+          latency_ms: { typical: 60.0 }
+        resources:
+          device_pref: ["cloud"]
+          memory_mb: 0
+          vram_mb: 0
+        parameters:
+          max_new_tokens:
+            type: "int"
+            default: 128
+          temperature:
+            type: "float"
+            default: 0.2
+          top_p:
+            type: "float"
+            default: 0.9
+
+      - id: gpt-4.1-mini
+        version: "gpt-4.1-mini"
+        description: "Higher-quality LLM for nuanced checks."
+        metrics:
+          latency_ms: { typical: 150.0 }
+        resources:
+          device_pref: ["cloud"]
+          memory_mb: 0
+          vram_mb: 0
+        parameters:
+          max_new_tokens:
+            type: "int"
+            default: 256
+          temperature:
+            type: "float"
+            default: 0.3
+          top_p:
+            type: "float"
+            default: 0.9
 
 

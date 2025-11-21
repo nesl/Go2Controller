@@ -35,32 +35,53 @@ class SkillInstance:
     name: str
     ctx: dict
     started_ms: int
-    step_idx: int = 0
-    activated: bool = False   # composite-level when satisfied
+    activated: bool = False
     done: bool = False
-    handle: StepHandle | None = None  # ← active primitive handle
+
+    # State-machine specific fields
+    state_id: Optional[str] = None      # logical state id (string)
+    state_idx: int = 0                  # index in states[]
+    state_started_ms: int = 0           # when we entered this state (ms)
+
+    # Active primitive handle for action states
+    handle: "StepHandle" | None = None
+
     
     
 # ───────────────────────────────────────────────────────────────────────────────
 #                          Number → words helpers (TTS)
 # ───────────────────────────────────────────────────────────────────────────────
-# Standalone integer tokens
-_NUM_TOKEN_RE = re.compile(r'(?<!\w)(-?\d+)(?!\w)')
-# CNode pattern like "CNode101" or "cnode7"
-_CNODE_RE    = re.compile(r'\bCNode(\d+)\b', re.IGNORECASE)
+# Integer-only token (standalone, not part of a decimal)
+_INT_TOKEN_RE = re.compile(r'(?<![\w.])(-?\d+)(?![\w.])')
 
+# Decimal token: captures "-12.34", "0.56", ".75", etc.
+_DECIMAL_RE = re.compile(r'(?<![\w])(-?\d*\.\d+)(?![\w])')
+
+# CNode pattern
+_CNODE_RE = re.compile(r'\bCNode(\d+)\b', re.IGNORECASE)
 
 def _num_to_words(n: int) -> str:
+    """
+    Convert small-ish integers to words. For large values, just return the digits
+    so we don't blow up on indexing.
+    """
+    # Hard guard to avoid gigantic indices / unexpected values
+    if abs(n) > 999:
+        return str(n)
+
     nums0_19 = [
-        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
-        "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
-        "seventeen", "eighteen", "nineteen"
+        "zero", "one", "two", "three", "four", "five", "six", "seven",
+        "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+        "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
     ]
-    tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+    tens = [
+        "", "", "twenty", "thirty", "forty", "fifty",
+        "sixty", "seventy", "eighty", "ninety",
+    ]
 
     neg = n < 0
     n = abs(n)
-    parts = []
+    parts: list[str] = []
 
     if n >= 100:
         parts.append(nums0_19[n // 100])
@@ -80,29 +101,94 @@ def _num_to_words(n: int) -> str:
     return f"minus {spoken}" if neg else spoken
 
 
+def _fraction_to_words(frac_str: str) -> str:
+    """
+    Fractional part after the decimal point.
+    Choose **digit-by-digit** or **full number** style.
+    """
+
+    # DIGIT-BY-DIGIT STYLE (recommended)
+    # "23" -> "two three"
+    digit_words = {
+        "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
+        "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine"
+    }
+    spoken = " ".join(digit_words[d] for d in frac_str)
+    return spoken
+
+    # FULL NUMBER STYLE (the one you asked for: "1.23" -> "one point twenty three")
+    # return _num_to_words(int(frac_str))
+
+
 def _normalize_tts_text(text: str) -> str:
     """
-    - Map 'CNode101' -> 'node one hundred and one'
-    - Then map bare integers '42' -> 'forty two'
+    Safe TTS normalizer:
+      - CNode### → spoken if ID <= 999
+      - Integers → spoken if |n| <= 999
+      - Decimals → fully spoken: "1.23" → "one point two three"
+      - Large numbers left untouched
     """
+
+    # 1) CNode### (before decimal/integer replacement)
     def repl_cnode(m: re.Match) -> str:
-        nid = int(m.group(1))
-        # You can change this to `node number ...` if you prefer
+        nid_str = m.group(1)
+        try:
+            nid = int(nid_str)
+        except:
+            return m.group(0)
+        if abs(nid) > 999:
+            return f"node {nid_str}"
         return f"node {_num_to_words(nid)}"
 
-    def repl_num(m: re.Match) -> str:
+    out = _CNODE_RE.sub(repl_cnode, text)
+
+    # 2) Decimals: handle BEFORE integer replacement
+    def repl_decimal(m: re.Match) -> str:
+        s = m.group(0)       # e.g. "-12.34"
+        negative = s.startswith("-")
+        if negative:
+            s2 = s[1:]       # strip sign for processing
+        else:
+            s2 = s
+
+        if "." not in s2:
+            return s  # shouldn't happen due to regex
+
+        whole_str, frac_str = s2.split(".", 1)
+
+        # numeric safety: only speak if not crazy huge
+        if whole_str.isdigit() and abs(int(whole_str)) > 999:
+            return s  # keep as digits
+
+        # whole part (if empty, treat ".5" as "zero")
+        whole_val = int(whole_str) if whole_str else 0
+        whole_spoken = _num_to_words(whole_val)
+
+        # fractional part
+        frac_spoken = _fraction_to_words(frac_str)
+
+        spoken = f"{whole_spoken} point {frac_spoken}"
+        if negative:
+            spoken = "minus " + spoken
+        return spoken
+
+    out = _DECIMAL_RE.sub(repl_decimal, out)
+
+    # 3) Standalone integers
+    def repl_int(m: re.Match) -> str:
         s = m.group(0)
         try:
             n = int(s)
-        except ValueError:
+        except:
+            return s
+        if abs(n) > 999:
             return s
         return _num_to_words(n)
 
-    # First: rewrite CNode### patterns
-    out = _CNODE_RE.sub(repl_cnode, text)
-    # Then: generic standalone integers
-    out = _NUM_TOKEN_RE.sub(repl_num, out)
+    out = _INT_TOKEN_RE.sub(repl_int, out)
+
     return out
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 #                               Skills YAML (inline fallback)
@@ -264,8 +350,17 @@ class RulesView:
         })
 
     def exists(self, rule_id: str, within_ms: int) -> bool:
-        cutoff = (self._now() - within_ms)
-        return any(e['id'] == str(rule_id) and e['ts_ms'] >= cutoff for e in self._events)
+        cutoff = self._now() - within_ms
+        rid = str(rule_id)
+        last = None
+        for e in self._events:
+            if e.get('id') == rid and e.get('ts_ms', 0) >= cutoff:
+                if last is None or e['ts_ms'] > last['ts_ms']:
+                    last = e
+        if not last:
+            return False
+        # default to True if no 'active' key (for backward compatibility)
+        return bool(last.get('payload', {}).get('active', True))
 
     def latest_payload(self, rule_id: str, within_ms: int) -> Optional[dict]:
         cutoff = (self._now() - within_ms)
@@ -367,32 +462,91 @@ def _cond_pass(cond: dict, rules: RulesView, defaults_window_ms: int, empty_mean
         rid = cond.get('exists')
         win = int(cond.get('within_ms') or defaults_window_ms)
         return rules.exists(rid, win)
+    if "not_exists" in cond:
+        rid = cond.get('not_exists')
+        win = int(cond.get('within_ms') or defaults_window_ms)
+        return not rules.exists(rid, win)
     if 'any' in cond:
         return any(_cond_pass(c, rules, defaults_window_ms) for c in (cond['any'] or []))
     if 'all' in cond:
         return all(_cond_pass(c, rules, defaults_window_ms) for c in (cond['all'] or []))
-    return True
+    return empty_means
 
 class SkillEngineV2:
-    """Executes composite skills with step-level `when` using a RulesView."""
-    def __init__(self, bindings: Dict[str, callable], rules_view: RulesView, defaults_window_ms: int = 3000, logger=None, event_cb=None):
+    """
+    Executes primitive skills and state-machine skills.
+
+    Skill kinds:
+      - kind: "primitive"
+          name: "tts.say"
+          action: "tts"
+          params: {...}
+
+      - kind: "state_machine"
+          name: "assist.carry_query_and_wait"
+          when: {...}        # optional composite-level gate
+          until: {...}       # optional composite-level stop
+          initial_state: "ask_clarify"
+          states:
+            - id: "ask_clarify"
+              type: "action"
+              action:
+                use: "tts.say"
+                with: {...}
+              on_complete: "wait_for_carry_event"
+              on_failure: "done"   # optional
+
+            - id: "wait_for_carry_event"
+              type: "wait"
+              wait_for:
+                any_of:
+                  - { rule_id: "carry_event", within_ms: 10000 }
+              on_event: "ack_and_ready"
+              on_timeout: "prompt_again"
+
+            - id: "done"
+              type: "action"
+              action: {...}
+              on_complete: null   # or omitted => skill finishes
+    """
+
+    def __init__(
+        self,
+        bindings: Dict[str, callable],
+        rules_view: RulesView,
+        defaults_window_ms: int = 3000,
+        logger=None,
+        event_cb=None,
+    ):
         self.bindings = dict(bindings or {})
         self.rules = rules_view
         self.defaults_window_ms = int(defaults_window_ms)
         self.registry: Dict[str, dict] = {}
         self._loaded_path: Optional[str] = None
         self.logger = logger
-        self._active: List[SkillInstance] = []   # ← active/armed skills live here
-        self.event_cb = event_cb   # ← NEW
-        
-        
+        self._active: List[SkillInstance] = []
+        self.event_cb = event_cb  # function(event_dict) -> None
+
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)
+
     def _emit_event(self, kind: str, inst: SkillInstance, extra: dict | None = None):
+        """
+        Emit an event to the callback and /skills/status.
+
+        kind: "skill_started", "skill_finished", "state_entered"
+        """
         if not self.event_cb:
             return
+
         payload = {
             "kind": kind,
             "skill": inst.name,
-            "step_idx": inst.step_idx,
+            "step_idx": int(getattr(inst, "state_idx", 0)),
+            "state_id": inst.state_id,
             "ctx": inst.ctx,
             "started_ms": inst.started_ms,
             "activated": inst.activated,
@@ -402,117 +556,24 @@ class SkillEngineV2:
             payload.update(extra)
         self.event_cb(payload)
 
-        
-    def _exec_primitive_get_handle(self, action: str, params: dict, ctx: dict) -> StepHandle:
+    def _start_child_state_machine(
+        self,
+        parent_inst: SkillInstance,
+        action_spec: dict,
+        child_skill: dict,
+    ) -> StepHandle:
         """
-        Call the bound primitive; normalize return to a StepHandle:
-          - returns StepHandle → use it
-          - returns None or sync primitive → create a handle, mark_done()
+        Treat a state_machine referenced in action_spec['use'] as a nested sub-skill.
+
+        - Build child ctx: parent ctx + rendered action_spec['with']
+        - Create a child SkillInstance and add it to self._active
+        - Return a StepHandle whose done() mirrors child.done
         """
-        fn = self.bindings.get(action)
-        if not callable(fn):
-            raise KeyError(f"No binding for action '{action}'")
+        ref_name = child_skill["name"]
 
-        rendered = _render_params(params, ctx, self.rules, self.defaults_window_ms)
-
-        import inspect
-        sig = inspect.signature(fn)
-        ret = fn(**rendered, ctx=ctx) if 'ctx' in sig.parameters else fn(**rendered)
-
-        if isinstance(ret, StepHandle):
-            return ret
-
-        h = StepHandle()
-        # If primitive returned a truthy “instant” signal, still mark done immediately.
-        h.mark_done()
-        return h
-
-
-        
-    def load_from_string(self, yaml_text: str):
-        data = yaml.safe_load(yaml_text)
-        self.defaults_window_ms = int(data.get('defaults', {}).get('window_ms', self.defaults_window_ms))
-        self.registry = {s['name']: s for s in data.get('skills', [])}
-        self._loaded_path = None
-        return self
-
-    def load_from_path(self, path: str):
-        with open(path, 'r') as f:
-            data = yaml.safe_load(f.read())
-        self.defaults_window_ms = int(data.get('defaults', {}).get('window_ms', self.defaults_window_ms))
-        self.registry = {s['name']: s for s in data.get('skills', [])}
-        self._loaded_path = path
-        return self
-
-    def composite_names(self) -> List[str]:
-        return [n for n, s in self.registry.items() if s.get('kind') == 'composite']
-
-    def is_step_eligible(self, step: dict) -> bool:
-        return _cond_pass(step.get('when') or {}, self.rules, self.defaults_window_ms)
-
-    def is_composite_eligible_now(self, composite_name: str) -> bool:
-        s = self.registry.get(composite_name)
-        if not s or s.get('kind') != 'composite':
-            return False
-        # Consider eligible if at least one step is currently passable.
-        return any(self.is_step_eligible(st) for st in s.get('steps', []))
-
-    def plan_eligible(self) -> List[dict]:
-        out = []
-        for name in self.composite_names():
-            if not self.is_composite_eligible_now(name):
-                continue
-            steps = self.registry[name].get('steps', [])
-            passing = [i for i, st in enumerate(steps) if self.is_step_eligible(st)]
-            out.append({"name": name, "passing_steps": passing})
-        return out
-
-    def run(self, composite_name: str, ctx: dict):
-      
-        self.arm(composite_name, ctx)
-        self.tick()
-
-    def _exec_primitive(self, action: str, params: dict, ctx: dict):
-        if self.logger:
-            self.logger.info(f"[SkillEngine] → Executing primitive: {action} with params={params}")
-        fn = self.bindings.get(action)
-        if not callable(fn):
-            raise KeyError(f"No binding for action '{action}'")
-        rendered = _render_params(params, ctx, self.rules, self.defaults_window_ms)
-        sig = inspect.signature(fn)
-        if 'ctx' in sig.parameters:
-            fn(**rendered, ctx=ctx)
-        else:
-            fn(**rendered)
-
-    def _now_ms(self) -> int:
-        return int(time.time() * 1000)
-
-    def arm(self, composite_name: str, ctx: dict):
-        s = self.registry.get(composite_name)
-        if not s or s.get('kind') != 'composite':
-            raise KeyError(f"Unknown composite: {composite_name}")
-        inst = SkillInstance(name=composite_name, ctx=dict(ctx or {}), started_ms=self._now_ms())
-        self._active.append(inst)
-        if self.logger:
-            self.logger.info(f"[SkillEngine] Armed skill: {composite_name} ctx={ctx}")
-
-    def active_count(self) -> int:
-        return sum(1 for i in self._active if not i.done)
-        
-    def _start_child_composite(self, parent_inst: SkillInstance, step: dict, composite: dict) -> StepHandle:
-        """
-        Treat a composite referenced in `use:` as a nested sub-skill.
-        We:
-          - build a child ctx from parent ctx + rendered step.with
-          - create a child SkillInstance and add it to _active
-          - return a StepHandle that becomes done() when the child finishes
-        """
-        ref_name = composite["name"]
-
-        # Render step.with into a ctx overlay, like params for primitives
+        # Render "with" block against parent ctx/rules
         with_overrides = _render_params(
-            step.get("with") or {},
+            action_spec.get("with") or {},
             parent_inst.ctx,
             self.rules,
             self.defaults_window_ms,
@@ -523,136 +584,467 @@ class SkillEngineV2:
         child = SkillInstance(
             name=ref_name,
             ctx=child_ctx,
-            started_ms=int(time.time() * 1000),
+            started_ms=self._now_ms(),
         )
+        # State-machine specific fields: start inactive, no state yet
+        child.activated = False
+        child.state_id = None
+        child.state_idx = 0
+        child.state_started_ms = 0
+        child.handle = None
+        child.done = False
+
         self._active.append(child)
 
-        # Build a StepHandle that proxies to the child's done()
         def _cancel_child():
+            # cancel any running primitive in the child, then mark done
+            if child.handle is not None and not child.handle.done():
+                try:
+                    child.handle.cancel()
+                except Exception:
+                    pass
             child.done = True
 
         h = StepHandle(cancel_fn=_cancel_child)
 
-        # override done() to reflect child.done
+        # Proxy handle.done() to child.done
         def _done_proxy(self_handle=h, child_inst=child):
             return child_inst.done
 
-        h.done = _done_proxy  # monkey-patch method on this instance
+        h.done = _done_proxy  # override instance method
+        if self.logger:
+            self.logger.info(
+                f"[SkillEngine] Nested state_machine '{ref_name}' started as child of '{parent_inst.name}'"
+            )
         return h
+
+
+    def _exec_primitive_get_handle(self, action: str, params: dict, ctx: dict) -> StepHandle:
+        """
+        Call the bound primitive; normalize return to a StepHandle:
+          - if primitive returns a StepHandle -> use it
+          - otherwise -> create a StepHandle and mark done immediately
+        """
+        fn = self.bindings.get(action)
+        if not callable(fn):
+            raise KeyError(f"No binding for action '{action}'")
+
+        rendered = _render_params(params or {}, ctx, self.rules, self.defaults_window_ms)
+
+        sig = inspect.signature(fn)
+        ret = fn(**rendered, ctx=ctx) if "ctx" in sig.parameters else fn(**rendered)
+
+        if isinstance(ret, StepHandle):
+            return ret
+
+        h = StepHandle()
+        h.mark_done()
+        return h
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+    def load_from_string(self, yaml_text: str):
+        data = yaml.safe_load(yaml_text)
+        self.defaults_window_ms = int(data.get("defaults", {}).get("window_ms", self.defaults_window_ms))
+        self.registry = {s["name"]: s for s in data.get("skills", [])}
+        self._loaded_path = None
+        return self
+
+    def load_from_path(self, path: str):
+        with open(path, "r") as f:
+            data = yaml.safe_load(f.read())
+        self.defaults_window_ms = int(data.get("defaults", {}).get("window_ms", self.defaults_window_ms))
+        self.registry = {s["name"]: s for s in data.get("skills", [])}
+        self._loaded_path = path
+        return self
+
+    # ------------------------------------------------------------------
+    # Planning helpers
+    # ------------------------------------------------------------------
+    def state_machine_names(self) -> List[str]:
+        return [n for n, s in self.registry.items() if s.get("kind") == "state_machine"]
+
+    def _skill_when_passes(self, skill: dict) -> bool:
+        cond = skill.get("when") or {}
+        return _cond_pass(cond, self.rules, self.defaults_window_ms)
+
+    def plan_eligible(self) -> List[dict]:
+        """
+        Simple planning view: which state_machine skills have their top-level
+        'when' condition satisfied right now.
+        """
+        out = []
+        for name in self.state_machine_names():
+            s = self.registry.get(name) or {}
+            if self._skill_when_passes(s):
+                out.append({"name": name})
+        return out
+
+    # ------------------------------------------------------------------
+    # State-machine operations
+    # ------------------------------------------------------------------
+    def arm(self, skill_name: str, ctx: dict):
+        s = self.registry.get(skill_name)
+        if not s:
+            raise KeyError(f"Unknown skill: {skill_name}")
+
+        kind = s.get("kind")
+        if kind != "state_machine":
+            raise KeyError(f"Skill '{skill_name}' is not a state_machine (kind={kind})")
+
+        inst = SkillInstance(
+            name=skill_name,
+            ctx=dict(ctx or {}),
+            started_ms=self._now_ms(),
+        )
+        self._active.append(inst)
+        if self.logger:
+            self.logger.info(f"[SkillEngine] Armed state_machine '{skill_name}' ctx={ctx}")
+
+        return inst
         
+    def _spawn_nested_child(self, parent: SkillInstance, skill_name: str, ctx: dict) -> StepHandle:
+        """
+        Spawn a nested state_machine/composite as a child of `parent`
+        and return a StepHandle that tracks its completion.
+        """
+        # Arm child skill with merged ctx
+        child_ctx = dict(parent.ctx)
+        child_ctx.update(ctx or {})
+
+        child_inst = self.arm(skill_name, child_ctx)
+
+        h = StepHandle()
+
+        def cancel_child():
+            # Best-effort cancel: stop its primitive and mark done
+            child_inst.done = True
+            if child_inst.handle is not None and not child_inst.handle.done():
+                try:
+                    child_inst.handle.cancel()
+                except Exception:
+                    pass
+            h.mark_done()
+
+        h._cancel = cancel_child  # replace cancel with child-aware version
+
+        # Make this handle's done() proxy the child's done
+        def done_proxy(self):
+            return child_inst.done
+
+        h.done = done_proxy.__get__(h, StepHandle)
+        return h
+
+        
+    def run(self, skill_name: str, ctx: dict):
+        """
+        Backwards-compatible helper: arm + tick once.
+        Usually you just call arm() and let the timer tick.
+        """
+        self.arm(skill_name, ctx)
+        self.tick()
+
+    def active_count(self) -> int:
+        return sum(1 for i in self._active if not i.done)
+
+    # ------------------------------------------------------------------
+    # State lookup and transitions
+    # ------------------------------------------------------------------
+    def _find_state(self, skill: dict, state_id: str | None) -> Optional[dict]:
+        if not state_id:
+            return None
+        for idx, st in enumerate(skill.get("states", [])):
+            if st.get("id") == state_id:
+                st = dict(st)  # copy
+                st["_idx"] = idx
+                return st
+        return None
+
+    def _enter_state(self, inst: SkillInstance, skill: dict, state: dict):
+        """Enter a new state: set ids, start primitive or nested skill if action, emit events."""
+        now_ms = self._now_ms()
+        inst.state_id = state.get("id")
+        inst.state_idx = int(state.get("_idx", inst.state_idx))
+        inst.state_started_ms = now_ms
+        inst.handle = None
+
+        st_type = state.get("type", "action")
+        extra = {"state_type": st_type}
+        self._emit_event("state_entered", inst, extra)
+
+        if self.logger:
+            self.logger.info(
+                f"[SkillEngine] Skill '{inst.name}': entering state "
+                f"'{inst.state_id}' (idx={inst.state_idx}, type={st_type})"
+            )
+
+        if st_type != "action":
+            # wait states and others don't launch a step here
+            return
+
+        action_spec = state.get("action") or {}
+        use_name = action_spec.get("use")
+        with_ctx = action_spec.get("with") or {}
+
+        if not use_name:
+            if self.logger:
+                self.logger.warn(f"[SkillEngine] action state '{inst.state_id}' missing 'use'")
+            return
+
+        base = self.registry.get(use_name)
+
+        # Case 1: registry primitive → normal primitive execution
+        if base and base.get("kind") == "primitive":
+            params = dict(base.get("params") or {})
+            params.update(with_ctx)
+
+            if self.logger:
+                self.logger.info(
+                    f"[SkillEngine] state '{inst.state_id}' executing primitive '{use_name}' params={params}"
+                )
+
+            # Emit step_started with primitive field
+            self._emit_event(
+                "step_started",
+                inst,
+                {"primitive": use_name, "state_type": "action"},
+            )
+
+            inst.handle = self._exec_primitive_get_handle(base["action"], params, inst.ctx)
+            return
+
+        # Case 2: registry state_machine/composite → nested skill
+        if base and base.get("kind") in ("state_machine", "composite"):
+            if self.logger:
+                self.logger.info(
+                    f"[SkillEngine] state '{inst.state_id}' spawning nested skill '{use_name}' with ctx={with_ctx}"
+                )
+
+            # Emit step_started with composite field
+            self._emit_event(
+                "step_started",
+                inst,
+                {"composite": use_name, "state_type": "action"},
+            )
+
+            inst.handle = self._spawn_nested_child(inst, use_name, with_ctx)
+            return
+
+        # Case 3: direct binding (no registry entry, `use_name` is binding key)
+        params = with_ctx
+        if self.logger:
+            self.logger.info(
+                f"[SkillEngine] state '{inst.state_id}' executing bound action '{use_name}' params={params}"
+            )
+
+        # Emit step_started as a primitive-like bound action
+        self._emit_event(
+            "step_started",
+            inst,
+            {"primitive": use_name, "state_type": "action"},
+        )
+
+        inst.handle = self._exec_primitive_get_handle(use_name, params, inst.ctx)
+
+    def _transition_to(self, inst: SkillInstance, skill: dict, next_id: Optional[str]):
+        """Transition to next state id or finish skill if next_id is falsy."""
+        cur_state = inst.state_id
+        
+        if not next_id:
+            inst.done = True
+            if self.logger:
+                self.logger.info(f"[SkillEngine] Skill '{inst.name}' finished (no next state)")
+            self._emit_event("skill_finished", inst, {"reason": "no_next_state"})
+            return
+
+        if self.logger:
+            self.logger.info(
+                f"[SkillEngine] Skill '{inst.name}': state '{cur_state}' -> '{next_id}'"
+            )
+
+        st = self._find_state(skill, next_id)
+        if not st:
+            # If the next state does not exist, consider the skill finished.
+            inst.done = True
+            if self.logger:
+                self.logger.warn(
+                    f"[SkillEngine] Skill '{inst.name}' next state '{next_id}' not found; finishing."
+                )
+            self._emit_event("skill_finished", inst, {"reason": "missing_state"})
+            return
+
+        self._enter_state(inst, skill, st)
+
+    # ------------------------------------------------------------------
+    # Main tick
+    # ------------------------------------------------------------------
     def tick(self):
-        """Advance armed skills. Call this on a timer and/or on every /events/* message."""
+        """
+        Advance all active state_machine instances.
+        Call this at 10-20 Hz from the ROS node.
+        """
+        now_ms = self._now_ms()
+
         for inst in list(self._active):
             if inst.done:
                 continue
 
-            s = self.registry.get(inst.name) or {}
-            steps = s.get('steps', [])
-            comp_when  = s.get('when')  or {}
-            comp_until = s.get('until') or {}
+            skill = self.registry.get(inst.name) or {}
+            kind = skill.get("kind")
 
-            # If a primitive is running, check completion or stop-early
-            if inst.handle is not None:
-                # stop early if composite until is true
-                if _cond_pass(comp_until, self.rules, self.defaults_window_ms, empty_means=False):
-                    if not inst.handle.done():
-                        inst.handle.cancel()
-                    inst.done = True
-                    if self.logger:
-                        self.logger.info(f"[SkillEngine] Finished '{inst.name}' (composite until=true during step)")
-                    continue
-                # still running? keep waiting
-                if not inst.handle.done():
-                    continue
-                # finished; clear handle and advance to next step
-                inst.handle = None
-                inst.step_idx += 1
-                # fall-through to possibly launch next step this tick
+            if kind != "state_machine":
+                # Should not happen, but guard anyway
+                inst.done = True
+                continue
 
-            # Not yet activated? wait for composite when
+            comp_when = skill.get("when") or {}
+            comp_until = skill.get("until") or {}
+
+            # If not activated yet, wait for top-level "when"
             if not inst.activated:
                 if _cond_pass(comp_when, self.rules, self.defaults_window_ms):
                     inst.activated = True
+                    inst.started_ms = now_ms
                     if self.logger:
-                        self.logger.info(f"[SkillEngine] Activating '{inst.name}' (when=true)")
+                        self.logger.info(
+                            f"[SkillEngine] Activating state_machine '{inst.name}' "
+                            f"with ctx={inst.ctx}"
+                        )
                     self._emit_event("skill_started", inst, {})
+
+                    if not inst.state_id:
+                        # Enter initial state
+                        init_id = skill.get("initial_state")
+                        st = self._find_state(skill, init_id)
+                        if not st and self.logger:
+                            self.logger.error(
+                                f"[SkillEngine] Skill '{inst.name}' missing initial_state '{init_id}'"
+                            )
+                            inst.done = True
+                            self._emit_event(
+                                "skill_finished",
+                                inst,
+                                {"reason": "missing_initial_state"},
+                            )
+                            continue
+                        self._enter_state(inst, skill, st)
                 else:
+                    # Still not activated
                     continue
 
-            # Composite-level until gate before starting a new step
+            # Composite-level until: stop skill even if current state has not finished
             if _cond_pass(comp_until, self.rules, self.defaults_window_ms, empty_means=False):
+                # cancel running primitive if any
+                if inst.handle is not None and not inst.handle.done():
+                    try:
+                        inst.handle.cancel()
+                    except Exception:
+                        pass
                 inst.done = True
                 if self.logger:
-                    self.logger.info(f"[SkillEngine] Finished '{inst.name}' (composite until=true before step)")
+                    self.logger.info(
+                        f"[SkillEngine] Finished '{inst.name}' due to composite-level 'until'"
+                    )
                 self._emit_event("skill_finished", inst, {"reason": "composite_until"})
                 continue
 
-            # Launch steps (one per tick at most)
-            if inst.step_idx < len(steps):
-                step = steps[inst.step_idx]
-                step_when  = step.get('when')  or {}
-                step_until = step.get('until') or {}
-
-                # step-level stop-before-start
-                if _cond_pass(step_until, self.rules, self.defaults_window_ms, empty_means=False):
-                    inst.done = True
-                    if self.logger:
-                        self.logger.info(f"[SkillEngine] Finished '{inst.name}' (step until=true pre-start idx={inst.step_idx})")
-                    continue
-
-                # wait until step when becomes true
-                if not _cond_pass(step_when, self.rules, self.defaults_window_ms):
-                    continue
-
-                # launch the primitive and keep its handle
-                ref = step.get("use")
-                base = self.registry.get(ref)
-                if not base:
-                    raise KeyError(f"Unknown step target '{ref}'")
-
-                kind = base.get("kind")
-
-                if kind == "primitive":
-                    # existing behavior
-                    params = dict(base.get("params") or {})
-                    params.update(step.get("with") or {})
-
-                    if self.logger:
-                        self.logger.info(f"[SkillEngine] → Step {inst.step_idx} executing primitive '{ref}'")
-
-                    self._emit_event("step_started", inst, {"primitive": ref})
-                    inst.handle = self._exec_primitive_get_handle(base["action"], params, inst.ctx)
-
-                elif kind == "composite":
-                    # NEW: nested composite behavior
-                    if self.logger:
-                        self.logger.info(f"[SkillEngine] → Step {inst.step_idx} spawning composite '{ref}'")
-
-                    self._emit_event("step_started", inst, {"composite": ref})
-                    # attach a handle that tracks the nested skill
-                    # (base must carry its own name for helper; if not, pass ref directly)
-                    base_with_name = dict(base)
-                    base_with_name["name"] = ref
-                    inst.handle = self._start_child_composite(inst, step, base_with_name)
-
-                else:
-                    raise KeyError(f"Bad step '{ref}' (unknown kind '{kind}')")
-
-
-                # If primitive finished instantly (sync), advance now
-                if inst.handle is not None and inst.handle.done():
-                    inst.handle = None
-                    inst.step_idx += 1
-
-            # End condition
-            if inst.activated and inst.step_idx >= len(steps) and inst.handle is None:
+            # No current state? Nothing to do.
+            st = self._find_state(skill, inst.state_id)
+            if not st:
                 inst.done = True
+                self._emit_event("skill_finished", inst, {"reason": "no_state"})
+                continue
+
+            st_type = st.get("type", "action")
+
+            # 1) Action states: wait for primitive handle to complete
+            if st_type == "action":
+                if inst.handle is None:
+                    # We entered state but did not start primitive (should not happen)
+                    # Start it now as a safety net.
+                    if self.logger:
+                        self.logger.warn(
+                            f"[SkillEngine] Skill '{inst.name}' state '{inst.state_id}' "
+                            "has no active handle; starting primitive now."
+                        )
+                    
+                    self._enter_state(inst, skill, st)
+                    continue
+
+                if not inst.handle.done():
+                    # Still in progress
+                    continue
+
+                # Primitive finished -> choose transition
                 if self.logger:
-                    self.logger.info(f"[SkillEngine] Finished '{inst.name}' (all steps)")
+                    self.logger.info(
+                        f"[SkillEngine] Skill '{inst.name}' action state '{inst.state_id}' "
+                        "completed; selecting on_complete transition."
+                    )
 
-                self._emit_event("skill_finished", inst, {"reason": "all_steps"})
+                # Primitive finished -> choose transition
+                next_id = st.get("on_complete")
+                self._transition_to(inst, skill, next_id)
+                continue
 
+            # 2) Wait states: look for rule events or timeout
+            if st_type == "wait":
+                wait_spec = st.get("wait_for") or {}
+                any_of = wait_spec.get("any_of") or []
+
+                # a) event fired?
+                fired = False
+                fired_rule = None
+                for cond in any_of:
+                    rid = cond.get("rule_id")
+                    win = int(cond.get("within_ms") or self.defaults_window_ms)
+                    if rid and self.rules.exists(rid, win):
+                        fired = True
+                        fired_rule = rid
+                        break
+
+                if fired:
+                    if self.logger:
+                        self.logger.info(
+                            f"[SkillEngine] Skill '{inst.name}' wait state '{inst.state_id}' "
+                            f"event fired (rule='{fired_rule}'); transitioning via on_event."
+                        )
+                    next_id = st.get("on_event")
+                    self._transition_to(inst, skill, next_id)
+                    continue
+
+                # b) timeout?
+                if any_of:
+                    max_wait = max(int(c.get("within_ms") or self.defaults_window_ms) for c in any_of)
+                else:
+                    max_wait = self.defaults_window_ms
+
+                if now_ms - inst.state_started_ms >= max_wait:
+                    if self.logger:
+                        self.logger.info(
+                            f"[SkillEngine] Skill '{inst.name}' wait state '{inst.state_id}' "
+                            f"timed out after {max_wait} ms; transitioning via on_timeout."
+                        )
+                    next_id = st.get("on_timeout")
+                    self._transition_to(inst, skill, next_id)
+                    continue
+
+                # still waiting
+                continue
+
+
+            # 3) Unknown state type -> finish
+            if self.logger:
+                self.logger.warn(
+                    f"[SkillEngine] Skill '{inst.name}' state '{inst.state_id}' has unknown type '{st_type}'"
+                )
+            inst.done = True
+            self._emit_event("skill_finished", inst, {"reason": "bad_state_type"})
+
+        # prune finished instances
         self._active = [i for i in self._active if not i.done]
+
 # ───────────────────────────────────────────────────────────────────────────────
 #                          ROS RulesView + Orchestrator
 # ───────────────────────────────────────────────────────────────────────────────
@@ -765,6 +1157,32 @@ class SkillsAgent(Node):
         self.webrtc_req_pub = self.create_publisher(WebRtcReq, "webrtc_req", 10)
         self.cmd_vel_pub = self.create_publisher(Twist, self.rotate_topic, 10)
         self.nav_client  = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+
+        # LLM speech_check req/resp
+        self.llm_speech_req_pub = self.create_publisher(StringMsg, "/llm/speech_check_req", 10)
+        self.llm_speech_resp_sub = self.create_subscription(
+            StringMsg,
+            "/llm/speech_check_resp",
+            self._cb_llm_speech_resp,
+            10,
+        )
+        
+        self._llm_speech_pending = {}   # req_id -> {"handle": StepHandle, "ctx": dict}
+        self._llm_speech_next_id = 1
+
+        # VLM request/response (generic, like llm_speech_check)
+        self.vlm_req_pub = self.create_publisher(
+            StringMsg, "/vlm/req", 10
+        )
+        self.vlm_resp_sub = self.create_subscription(
+            StringMsg,
+            "/vlm/answer",
+            self._cb_vlm_resp,
+            10,
+        )
+        self._vlm_pending = {}   # req_id -> {"handle": StepHandle, "ctx": dict}
+        self._vlm_next_id = 1
+
 
         # TF buffer for turning reference
         self.tf_buffer   = Buffer()
@@ -1040,6 +1458,79 @@ class SkillsAgent(Node):
 
 
     # ───────────────────────────── Basic Actions ──────────────────────────────
+
+    def _cb_llm_speech_resp(self, msg: StringMsg):
+        try:
+            obj = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().warn(f"llm_speech_check_resp bad JSON: {e}")
+            return
+
+        req_id = obj.get("id")
+        if req_id is None:
+            return
+
+        pending = self._llm_speech_pending.pop(req_id, None)
+        if not pending:
+            return
+
+        handle: StepHandle = pending["handle"]
+        ctx = pending["ctx"]
+
+        ctx["speech_check"] = {
+            "success": bool(obj.get("success", False)),
+            "raw_text": obj.get("raw_text", ""),
+            "json_text": obj.get("json_text", ""),
+            "model_id": obj.get("model_id", ""),
+            "lat_ms": float(obj.get("lat_ms", 0.0)),
+            "tag": obj.get("tag", ""),
+        }
+
+        self.get_logger().info(
+            f"[llm_speech_check] id={req_id} tag={ctx['speech_check']['tag']} "
+            f"success={ctx['speech_check']['success']} "
+            f"lat={ctx['speech_check']['lat_ms']:.1f} ms"
+        )
+
+        handle.mark_done()
+
+    def _cb_vlm_resp(self, msg: StringMsg):
+        try:
+            obj = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().warn(f"vlm_resp bad JSON: {e}")
+            return
+
+        req_id = obj.get("id")
+        if req_id is None:
+            return
+
+        key = str(req_id)                     # <<< normalize to string
+        pending = self._vlm_pending.pop(req_id, None)
+        if not pending:
+            return
+
+        handle: StepHandle = pending["handle"]
+        ctx = pending["ctx"]
+
+        # Mirror the llm_speech_check structure but for images
+        ctx["vlm"] = {
+            "success":  bool(obj.get("success", False)),
+            "raw_text": obj.get("raw_text", ""),
+            "json_text": obj.get("json_text", ""),
+            "model_id": obj.get("model_id", ""),
+            "lat_ms": float(obj.get("lat_ms", 0.0)),
+            "tag": obj.get("tag", ""),
+        }
+
+        self.get_logger().info(
+            f"[VLM] id={req_id} tag={ctx['vlm']['tag']} "
+            f"success={ctx['vlm']['success']} "
+            f"lat={ctx['vlm']['lat_ms']:.1f} ms"
+        )
+
+        handle.mark_done()
+
 
     def say(self, text: str):
         # Normalize to string
@@ -1409,6 +1900,72 @@ class SkillsAgent(Node):
             h.mark_done()
             return h
 
+        def llm_speech_check(prompt: str = "",
+                             output_schema: str = "",
+                             text: str = "",
+                             tag: str = "",
+                             ctx: dict = None):
+            """
+            Generic LLM JSON worker.
+            Caller specifies prompt + output_schema; we just relay and await response.
+            Result goes into ctx["speech_check"].
+            """
+            h = StepHandle()
+            if ctx is None:
+                ctx = {}
+
+            req_id = int(time.time() * 1000) ^ self._llm_speech_next_id
+            self._llm_speech_next_id += 1
+
+            self._llm_speech_pending[req_id] = {
+                "handle": h,
+                "ctx": ctx,
+            }
+
+            payload = {
+                "id": req_id,
+                "prompt": prompt or "",
+                "output_schema": output_schema or "",
+                "text": text or "",
+                "tag": tag or "",
+            }
+            self.llm_speech_req_pub.publish(StringMsg(data=json.dumps(payload)))
+            return h
+
+
+        def vlm_inference(prompt: str = "",
+                          output_schema: str = "",
+                          tag: str = "",
+                          mode: str = "generic",
+                          ctx: dict = None):
+            """
+            Generic VLM micro-service, symmetric with llm_speech_check.
+            We just relay request; answer comes back on /vlm/answer.
+            """
+            h = StepHandle()
+            if ctx is None:
+                ctx = {}
+
+            self.get_logger().info(f"[VLM primitive] prompt={prompt!r}, tag={tag}, mode={mode}")
+            req_id = int(time.time() * 1000) ^ self._vlm_next_id
+            self._vlm_next_id += 1
+            req_id = str(req_id_int)   # <<< normalize to str
+            
+            self._vlm_pending[req_id] = {
+                "handle": h,
+                "ctx": ctx,
+            }
+
+            payload = {
+                "id": req_id,
+                "prompt": prompt or "",
+                "output_schema": output_schema or "",
+                "tag": tag or "",
+                "mode": mode or "generic",
+            }
+            # Send to VLM node; it should look at the latest frame and respond.
+            self.vlm_req_pub.publish(StringMsg(data=json.dumps(payload)))
+            return h
 
 
         return {
@@ -1417,6 +1974,8 @@ class SkillsAgent(Node):
             'move_relative': move_relative,
             'move_absolute': move_absolute,
             'query_beacons': query_beacons,
+            'llm_speech_check': llm_speech_check,
+            'vlm_inference': vlm_inference,
         }
 
     def _move_relative_handle(self, az_deg: float, dist_m: float) -> StepHandle:
