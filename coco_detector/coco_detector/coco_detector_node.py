@@ -687,11 +687,23 @@ class CocoDetectorNode(Node):
         return (1.0 - alpha) * ema_val + alpha * x
 
     def _periodic_log(self):
+        if self.count_frames == 0:
+            self.get_logger().info("[perf] no frames processed yet")
+            return
+
+        def fmt(val, pattern):
+            return pattern.format(val) if val is not None else "n/a"
+
         self.get_logger().info(
-            f"[perf] EMA fps={self.fps_ema:.2f} | det={self.lat_det_ms_ema:.1f}ms "
-            f"| pose={0.0 if self.lat_pose_ms_ema is None else self.lat_pose_ms_ema:.1f}ms "
-            f"| total={self.lat_total_ms_ema:.1f}ms | frames={self.count_frames}"
+            "[perf] EMA fps={fps} | det={det}ms | pose={pose}ms | total={total}ms | frames={frames}".format(
+                fps   = fmt(self.fps_ema, "{:.2f}"),
+                det   = fmt(self.lat_det_ms_ema, "{:.1f}"),
+                pose  = fmt(self.lat_pose_ms_ema, "{:.1f}"),
+                total = fmt(self.lat_total_ms_ema, "{:.1f}"),
+                frames=self.count_frames,
+            )
         )
+
 
 def main():
     rclpy.init()

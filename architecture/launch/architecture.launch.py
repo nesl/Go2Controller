@@ -83,4 +83,19 @@ def generate_launch_description():
                 'rules_init_path':    os.path.join(pkg_share, 'config', 'rules_init.yaml'),
             }]
         ),
+
+        Node(
+            package='architecture',
+            executable='hdt_node',   # adjust if your console_script name differs
+            name='hdt_node',
+            output='screen',
+            parameters=[{
+                'capsule_topic': '/broker/context_capsule',
+                'profiles_topic': '/profiles/summary',
+                'perf_topic': '/llm/hdt_perf',
+                'human_ids': ['H1', 'H2'],
+                'update_period_s': 2.0,
+                'enabled': True,
+            }]
+        ),
     ])

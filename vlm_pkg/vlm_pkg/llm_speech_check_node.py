@@ -141,6 +141,12 @@ class LlmSpeechCheckNode(Node):
 
 
     def _call_llm(self, prompt: str):
+    
+        self.get_logger().info(
+            f"[llm_speech_check] calling LLM model={self.model_id!r} "
+            f"prompt_len={len(prompt)} prompt_preview={prompt!r}"
+        )
+    
         start = time.time()
         resp = self.client.chat.completions.create(
             model=self.model_id,
@@ -154,6 +160,11 @@ class LlmSpeechCheckNode(Node):
         )
         lat_ms = (time.time() - start) * 1000.0
         content = resp.choices[0].message.content or ""
+        self.get_logger().info(
+            f"[llm_speech_check] LLM reply lat={lat_ms:.1f} ms "
+            f"content_len={len(content)} content_preview={content!r}"
+        )
+        
         return content, lat_ms
 
     # ────────────────────────── Request handler ───────────────────

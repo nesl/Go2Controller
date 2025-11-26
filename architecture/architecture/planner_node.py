@@ -205,6 +205,14 @@ class PlannerNode(Node):
         # NEW: LLM perf topic (matches task_registry llm_planner perf.json)
         self.declare_parameter("perf_topic", "/llm/planner_perf")   # NEW
 
+        # NEW: enable/disable planner LLM
+        self.declare_parameter("llm_enabled", True)
+        self.llm_enabled = (
+            self.get_parameter("llm_enabled")
+            .get_parameter_value()
+            .bool_value
+        )
+
         self.declare_parameter("max_open_iterations", 0)
         self.max_open_iters = int(self.get_parameter("max_open_iterations").value)
 
@@ -270,6 +278,7 @@ class PlannerNode(Node):
         """
         Allow runtime changes such as:
           ros2 param set /planner_node model gpt-4.1-mini
+          ros2 param set /planner_node llm_enabled false
         """
         for p in params:
             if p.name == "model" and p.type_ == Parameter.Type.STRING:
@@ -281,7 +290,58 @@ class PlannerNode(Node):
             elif p.name == "temperature_needs" and p.type_ in (Parameter.Type.DOUBLE, Parameter.Type.INTEGER):
                 self.temp_needs = float(p.value)
                 self.get_logger().info(f"[planner] temperature_needs -> {self.temp_needs}")
+            # NEW: on/off switch for planner LLM
+            elif p.name == "llm_enabled" and p.type_ == Parameter.Type.BOOL:
+                self.llm_enabled = bool(p.value)
+                self.get_logger().info(f"[planner] llm_enabled -> {self.llm_enabled}")
         return SetParametersResult(successful=True, reason="ok")
+
+    # ---------- Fallbacks when LLM is disabled ----------
+    def _fallback_plan(self) -> Dict[str, Any]:
+        """
+        Build a minimal, schema-valid plan that delegates decision-making to the orchestrator
+        when the planner LLM is disabled.
+        """
+        cap = self._capsule if isinstance(self._capsule, dict) else {}
+        trigger = cap.get("trigger") or {}
+        trig_type = trigger.get("type", "unknown")
+
+        objective = f"fallback_{trig_type}_delegated_to_orchestrator"
+
+        header = {
+            "objective": objective,
+            "time_horizon": "short",
+            "priority": ["reactive_response", "delegate_to_orchestrator"],
+            "communication_policy": {},          # can stay empty, still schema-valid
+            "risk_flags": ["planner_llm_disabled"],
+            "assumptions": [],
+            "exploration_hint": "orchestrator decides detailed skill sequence"
+        }
+
+        doc = (
+            "Situation: Planner LLM is disabled; using ContextCapsule and recent Facts only as background.\n"
+            f"Intent: Respect the current trigger.type={trig_type} and allow the orchestrator to choose a simple, "
+            "reactive skill sequence.\n"
+            "Action Sketch: The orchestrator should pick a short behavior (e.g., confirm the human command, approach "
+            "the speaker, or provide a brief status update) without long multi-step missions.\n"
+            "Evidence & Uncertainty: OPEN: full high-level plan narrative is unavailable because planner LLM is "
+            "disabled.\n"
+            "Coordination & Tone: Keep speech brief and reactive; avoid over-explaining.\n"
+            "Hard Constraints: Maintain safety; avoid long detours or complex missions while operating in fallback."
+        )
+
+        return {
+            "plan_header": header,
+            "plan_doc": doc
+        }
+
+    def _fallback_needs(self) -> Dict[str, Any]:
+        """
+        When planner LLM is disabled, do not ask the broker for extra info.
+        Emit an empty needs list that still satisfies NEEDS_SCHEMA.
+        """
+        return {"needs": []}
+
 
     # ---------- Subscribers ----------
     def _on_facts(self, msg: StringMsg):
@@ -541,15 +601,19 @@ class PlannerNode(Node):
         raise ValueError(f"LLM did not return valid JSON for schema: {last_exc}")
 
     def _plan_once(self) -> Dict[str, Any]:
-        msgs = self._build_llm_messages_plan()
-        obj = self._chat_json(
-            msgs,
-            PLAN_SCHEMA,
-            temperature=self.temp_plan,
-            max_tokens=900,
-            retries=1,
-            phase="plan"
-        )
+        # If planner LLM is disabled, build a cheap fallback plan and skip OpenAI
+        if not getattr(self, "llm_enabled", True):
+            obj = self._fallback_plan()
+        else:
+            msgs = self._build_llm_messages_plan()
+            obj = self._chat_json(
+                msgs,
+                PLAN_SCHEMA,
+                temperature=self.temp_plan,
+                max_tokens=900,
+                retries=1,
+                phase="plan"
+            )
 
         # cap narrative length a bit (LLM should comply, but belt-and-suspenders)
         doc = obj.get("plan_doc","").strip()
@@ -560,29 +624,38 @@ class PlannerNode(Node):
 
         # quick hints for orchestrator (optional)
         obj["_hints"] = _extract_hints(doc)
+        # mark whether this came from LLM or fallback, and which model
+        origin = "llm" if getattr(self, "llm_enabled", True) else "fallback_no_llm"
         obj["_meta"]  = {
             "ws_id": self._ws_id,
             "ts": time.time(),
             "packs_used": len(self._facts_buffer),
-            "model": self.model
+            "model": self.model if self.llm_enabled else "disabled",
+            "origin": origin
         }
         self._ws_id += 1
         return obj
 
     def _needs_once(self) -> Dict[str, Any]:
-        msgs = self._build_llm_messages_needs()
-        obj = self._chat_json(
-            msgs,
-            NEEDS_SCHEMA,
-            temperature=self.temp_needs,
-            max_tokens=500,
-            retries=1,
-            phase="needs"
-        )
+        # If LLM is disabled, don't ask for more info; just emit empty needs.
+        if not getattr(self, "llm_enabled", True):
+            obj = self._fallback_needs()
+        else:
+            msgs = self._build_llm_messages_needs()
+            obj = self._chat_json(
+                msgs,
+                NEEDS_SCHEMA,
+                temperature=self.temp_needs,
+                max_tokens=500,
+                retries=1,
+                phase="needs"
+            )
+
         obj["_meta"] = {
             "ws_id": self._ws_id,
             "ts": time.time(),
-            "model": self.model
+            "model": self.model if self.llm_enabled else "disabled",
+            "origin": "llm" if self.llm_enabled else "fallback_no_llm"
         }
         return obj
 

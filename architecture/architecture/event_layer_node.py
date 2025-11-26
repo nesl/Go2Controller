@@ -111,6 +111,10 @@ class EventLayerNode(Node):
         self.declare_parameter('skills_base_path', '')
         self.declare_parameter('skills_composite_path', '')
 
+        self.declare_parameter('zone_split_x', 0.0)   # simple A/B split on x
+        self.zone_split_x = float(self.get_parameter('zone_split_x').value)
+
+
         self.registry_path = self.get_parameter('registry_path').get_parameter_value().string_value
         self.rules_path    = self.get_parameter('rules_path').get_parameter_value().string_value
         self.rescan_period = float(self.get_parameter('rescan_period_s').value)
@@ -190,7 +194,18 @@ class EventLayerNode(Node):
 
         self.get_logger().info("event_layer_node (expr) up")
 
+
     # ---------- utils ----------
+    
+    def _zone_from_xy(self, x: float | None, y: float | None) -> str:
+        """
+        Simple A/B zone split on x coordinate.
+        If x is None, default to 'B' (or whatever you like).
+        """
+        if x is None:
+            return "B"
+        return "A" if x < self.zone_split_x else "B"
+
 
     def _lookup_robot_pose_map(self):
         """
@@ -755,11 +770,31 @@ class EventLayerNode(Node):
             dq.popleft()
 
     def _publish_basic(self, rule_id: str, payload: dict):
-        self.pub_basic.publish(StringMsg(data=json.dumps({
-            "ts": self._now(),
+        ts_event = self._now()
+
+        # Derive zone:
+        # 1) if payload already has a robot_zone, use that
+        # 2) otherwise, try to infer from TF
+        zone = payload.get("robot_zone")
+        if zone is None:
+            try:
+                pose_map = self._lookup_robot_pose_map()
+                if pose_map is not None:
+                    rx, ry, ryaw, rts = pose_map
+                    zone = self._zone_from_xy(rx, ry)
+                else:
+                    zone = "unknown"
+            except Exception:
+                zone = "unknown"
+
+        evt = {
+            "ts": ts_event,
             "rule": rule_id,
-            "data": payload
-        })))
+            "data": payload,
+            "zone": zone,          # ← new top-level field
+        }
+
+        self.pub_basic.publish(StringMsg(data=json.dumps(evt)))
 
     def _eval_for_rules(self, task: str, output: str, ctx: dict):
         if not self.enabled:
@@ -1163,8 +1198,26 @@ class EventLayerNode(Node):
                 self.get_logger().warn(f"Composite {r.get('id')} expr error: {e}")
                 continue
             if ok:
-                evt = {"type": "composite", "rule": r["id"], "expr": expr, "ts": now}
+                # NEW: attach current robot zone (and optionally pose) to composite events
+                zone = "unknown"
+                try:
+                    pose_map = self._lookup_robot_pose_map()
+                    if pose_map is not None:
+                        rx, ry, ryaw, rts = pose_map
+                        zone = self._zone_from_xy(rx, ry)
+                    # if pose_map is None, we leave zone="unknown"
+                except Exception as e:
+                    self.get_logger().debug(f"Composite zone lookup failed: {e}")
+
+                evt = {
+                    "type": "composite",
+                    "rule": r["id"],
+                    "expr": expr,
+                    "ts": now,
+                    "zone": zone,        # ← NEW
+                }
                 self.pub_comp.publish(StringMsg(data=json.dumps(evt)))
+
 
         # 2) Edge rule timeouts → synthesize OFF when no hit for window
         for r in self.rules_enabled:

@@ -398,8 +398,8 @@ tasks:
           device_pref: ["cloud"]
         parameters: {}
 
-      - id: gpt-4.1-mini
-        version: "gpt-4.1-mini"
+      - id: gpt-5-mini
+        version: "gpt-5-mini"
         role: "higher_quality"
         metrics:
           latency_ms: { typical: 120.0 }
@@ -443,8 +443,8 @@ tasks:
             - { name: ts,     type: "ts",     desc: "perf sample timestamp" }
 
     models:
-      - id: gpt-4.1-mini
-        version: "gpt-4.1-mini"
+      - id: gpt-5-nano
+        version: "gpt-5-nano"
         role: "default"
         metrics:
           latency_ms: { typical: 150.0 }
@@ -452,8 +452,8 @@ tasks:
           device_pref: ["cloud"]
         parameters: {}
 
-      - id: gpt-4.1
-        version: "gpt-4.1"
+      - id: gpt-5-mini
+        version: "gpt-5-mini"
         role: "high_reasoning"
         metrics:
           latency_ms: { typical: 300.0 }
@@ -489,8 +489,8 @@ tasks:
             - { name: ts,     type: "ts",     desc: "perf sample timestamp" }
 
     models:
-      - id: gpt-4.1-mini
-        version: "gpt-4.1-mini"
+      - id: gpt-5-mini
+        version: "gpt-5-mini"
         role: "default"
         metrics:
           latency_ms: { typical: 120.0 }
@@ -499,7 +499,7 @@ tasks:
         parameters: {}
 
       - id: gpt-5-nano
-        version: "gpt-5.1-nano"
+        version: "gpt-5-nano"
         role: "low_latency_fallback"
         metrics:
           latency_ms: { typical: 40.0 }
@@ -625,13 +625,13 @@ tasks:
         type: "rcl_interfaces/SetParameters"
 
     models:
-      - id: qwen2.5-vl-7b-int4
-        version: "Qwen/Qwen2.5-VL-7B-Instruct"
-        description: "7B Qwen VLM, int4 quantized."
+      - id: Qwen/Qwen3-VL-4B-Thinking
+        version: "Qwen/Qwen3-VL-4B-Thinking"
+        description: "4B Qwen VLM"
         metrics:
           latency_ms: { run_trigger_typical: 800.0 }
         resources:
-          device_pref: ["cuda","cpu"]
+          device_pref: ["cuda"]
           memory_mb: 16000
           vram_mb: 12000
         parameters:
@@ -642,7 +642,7 @@ tasks:
             type: "bool"
             default: true
 
-      - id: qwen2.5-vl-7b-bf16
+      - id: Qwen/Qwen2.5-VL-7B-Instruct
         version: "Qwen/Qwen2.5-VL-7B-Instruct"
         description: "7B Qwen VLM, full bf16."
         metrics:
@@ -711,7 +711,7 @@ tasks:
 
     models:
       - id: gpt-5-nano
-        version: "gpt-5.1-nano"
+        version: "gpt-5-nano"
         description: "Low-latency LLM for simple utterance checks."
         metrics:
           latency_ms: { typical: 60.0 }
@@ -730,8 +730,8 @@ tasks:
             type: "float"
             default: 0.9
 
-      - id: gpt-4.1-mini
-        version: "gpt-4.1-mini"
+      - id: gpt-5.1-mini
+        version: "gpt-5.1-mini"
         description: "Higher-quality LLM for nuanced checks."
         metrics:
           latency_ms: { typical: 150.0 }
@@ -749,5 +749,85 @@ tasks:
           top_p:
             type: "float"
             default: 0.9
+
+
+  llm_hdt:
+    description: "LLM that maintains human digital twin profiles (H1/H2) from context capsules."
+    node: "/hdt_node"
+
+    outputs:
+      - id: profiles.json
+        ros:
+          topic: "/profiles/summary"
+          msg: "std_msgs/String"
+        # Conceptual payload:
+        # {
+        #   "H1": { ...profile... },
+        #   "H2": { ...profile... },
+        #   "_meta": {"active_human":"H2","robot_zone":"B","ts":...}
+        # }
+        context:
+          fields:
+            - { name: active_human, type: "string?", desc: "most likely active human id (from _meta.active_human)" }
+            - { name: robot_zone,   type: "string?", desc: "robot zone as seen by HDT (from _meta.robot_zone)" }
+            - { name: ts,           type: "ts?",     desc: "last update timestamp (from _meta.ts)" }
+
+      - id: perf.json
+        kind: perf
+        ros:
+          topic: "/llm/hdt_perf"
+          msg: "std_msgs/String"
+        schema_hint: >
+          {"node":"hdt","model":str,"lat_ms":float,"ok":bool,"phase":str,"ts":float}
+        context:
+          fields:
+            - { name: node,   type: "string", desc: "node name 'hdt'" }
+            - { name: model,  type: "string", desc: "LLM model id used" }
+            - { name: lat_ms, type: "float",  desc: "LLM latency (ms) for profile update" }
+            - { name: ok,     type: "bool",   desc: "true if HDT LLM call + validation succeeded" }
+            - { name: phase,  type: "string", desc: "phase label (e.g. 'profile_update')" }
+            - { name: ts,     type: "ts",     desc: "perf sample timestamp" }
+
+    services:
+      enable:
+        name: "/hdt_node/enable"
+        type: "std_srvs/SetBool"
+      update_now:
+        name: "/hdt_node/update_profiles"
+        type: "std_srvs/Trigger"
+      set_model:
+        # lets you switch the *base* model param at runtime
+        param_service: "/hdt_node/set_parameters"
+        param_name: "model"
+        type: "rcl_interfaces/SetParameters"
+
+    models:
+      - id: gpt-5-nano
+        version: "gpt-5-nano"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 150.0 }   # ballpark, will be overwritten by EMA
+        resources:
+          device_pref: ["cloud"]
+          memory_mb: 0
+          vram_mb: 0
+        parameters:
+          temperature:
+            type: "float"
+            default: 0.2
+
+      - id: gpt-5-mini
+        version: "gpt-5-mini"
+        role: "higher_quality"
+        metrics:
+          latency_ms: { typical: 250.0 }
+        resources:
+          device_pref: ["cloud"]
+          memory_mb: 0
+          vram_mb: 0
+        parameters:
+          temperature:
+            type: "float"
+            default: 0.2
 
 

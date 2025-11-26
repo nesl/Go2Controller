@@ -17,7 +17,7 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.time import Time
 
-from std_msgs.msg import String as StringMsg
+from std_msgs.msg import String as StringMsg, Bool
 from std_srvs.srv import Trigger
 from geometry_msgs.msg import Twist, PoseStamped, Quaternion
 from rclpy.action import ActionClient
@@ -876,6 +876,24 @@ class SkillEngineV2:
 
         self._enter_state(inst, skill, st)
 
+    def _resolve_wait_next_state(self, state: dict, rule_id: str) -> Optional[str]:
+        """
+        Given a WAIT state and the rule_id that fired, decide next state.
+
+        Priority:
+          1) First matching entry in state['branches'] (if present)
+          2) state['on_event'] (if present)
+          3) None (no transition)
+        """
+        branches = state.get("branches") or []
+        for br in branches:
+            if br.get("rule_id") == rule_id:
+                return br.get("next")
+
+        # fallback: plain on_event
+        return state.get("on_event")
+
+
     # ------------------------------------------------------------------
     # Main tick
     # ------------------------------------------------------------------
@@ -1008,11 +1026,14 @@ class SkillEngineV2:
                     if self.logger:
                         self.logger.info(
                             f"[SkillEngine] Skill '{inst.name}' wait state '{inst.state_id}' "
-                            f"event fired (rule='{fired_rule}'); transitioning via on_event."
+                            f"event fired (rule='{fired_rule}'); resolving branches/on_event."
                         )
-                    next_id = st.get("on_event")
+
+                    # NEW: use branches if present, else fall back to on_event
+                    next_id = self._resolve_wait_next_state(st, fired_rule)
                     self._transition_to(inst, skill, next_id)
                     continue
+
 
                 # b) timeout?
                 if any_of:
@@ -1233,6 +1254,17 @@ class SkillsAgent(Node):
 
         self.skill_status_pub = self.create_publisher(StringMsg, "/skills/status", 10)
 
+        # Track TTS playback state from TTSPlayerNode (/tts_busy)
+        self._tts_busy = False          # current busy flag
+        self._tts_has_busy = False      # did we ever see /tts_busy?
+        self._tts_waiting: List[StepHandle] = []  # handles waiting for speech to finish
+
+        self.create_subscription(
+            Bool,
+            "/tts_busy",
+            self._cb_tts_busy,
+            10,
+
         self.get_logger().info("SkillsAgent ready.")
 
         # call engine.tick() ~10–20 Hz, lightweight
@@ -1287,6 +1319,29 @@ class SkillsAgent(Node):
             self.skill_status_pub.publish(msg)
         except Exception as e:
             self.get_logger().warn(f"Failed to publish skill status: {e}")
+
+
+    def _cb_tts_busy(self, msg: Bool):
+        """
+        Track speaking state from TTSPlayerNode.
+
+        We treat each falling edge (True -> False) as 'one utterance finished',
+        and complete one pending TTS StepHandle for it.
+        """
+        prev = self._tts_busy
+        self._tts_busy = bool(msg.data)
+        self._tts_has_busy = True
+
+        if prev != self._tts_busy:
+            self.get_logger().info(f"[TTS busy] {prev} -> {self._tts_busy}")
+
+        # On falling edge (done speaking): complete one waiting handle
+        if prev and not self._tts_busy:
+            if self._tts_waiting:
+                h = self._tts_waiting.pop(0)
+                if not h.done():
+                    self.get_logger().info("[TTS] marking one waiting handle done (speech finished).")
+                    h.mark_done()
 
     
     def _read_yaml_if_exists(self, path: str) -> Optional[dict]:
@@ -1828,11 +1883,37 @@ class SkillsAgent(Node):
 
     # Bindings factory (so actions call our methods)
     def _make_bindings_for_self(self):
-        def tts(text: str):
-            # Synchronous primitive → return a handle already done
+    
+        def tts(text: str, ctx: dict = None):
+            """
+            TTS primitive that waits for speech playback to finish.
+
+            Flow:
+              - publish text via self.say() (downstream turns it into /tts_wav)
+              - if we have a /tts_busy signal, queue a StepHandle that will
+                be completed on the next 'speaking=False' edge
+              - if we never see /tts_busy, fall back to immediate completion
+                so the state machine doesn't deadlock
+            """
             h = StepHandle()
             self.say(str(text))
-            h.mark_done()
+
+            # If we've ever seen /tts_busy, treat it as authoritative
+            if getattr(self, "_tts_has_busy", False):
+                # Queue this handle; _cb_tts_busy will mark it done
+                self._tts_waiting.append(h)
+                self.get_logger().info(
+                    f"[TTS] queued handle waiting for /tts_busy to go False "
+                    f"(waiting={len(self._tts_waiting)})"
+                )
+            else:
+                # No TTS player feedback available → don't block
+                self.get_logger().warn(
+                    "[TTS] /tts_busy has not been observed; "
+                    "completing TTS handle immediately."
+                )
+                h.mark_done()
+
             return h
 
         def gesture(kind: str):
@@ -1852,13 +1933,6 @@ class SkillsAgent(Node):
                 gesture_api_map = {
                     "greet":        1016,  # Hello
                     "hello":        1016,
-                    "dance1":       1022,
-                    "dance2":       1023,
-                    "finger_heart": 1036,
-                    "front_flip":   1030,
-                    "left_flip":    1042,
-                    "right_flip":   1043,
-                    "back_flip":    1044,
                 }
 
                 api_id = gesture_api_map.get(str(kind), 1016)  # default to Hello
@@ -1885,13 +1959,56 @@ class SkillsAgent(Node):
             return self._move_relative_handle(float(azimuth_deg), float(dist_m))
 
         def move_absolute(frame: str, x: float, y: float, yaw: float):
-            # If you want this to be async-completing on Nav2 result, wrap similarly.
             h = StepHandle()
-            self.navigate_absolute(str(frame), float(x), float(y), float(yaw))
-            # If you need to wait for Nav2 result, set the mark_done() in the result callback,
-            # and set cancel() to cancel the goal. Otherwise, just mark_done() immediately.
-            h.mark_done()
+
+            if not self.nav_client.wait_for_server(timeout_sec=0.5):
+                self.say("Navigation is not available.")
+                h.mark_done()
+                return h
+
+            goal = NavigateToPose.Goal()
+            ps = PoseStamped()
+            ps.header.frame_id = str(frame)
+            ps.header.stamp = self.get_clock().now().to_msg()
+            ps.pose.position.x = float(x)
+            ps.pose.position.y = float(y)
+            ps.pose.orientation = yaw_to_q(float(yaw))
+            goal.pose = ps
+
+            def _goal_done(fut):
+                try:
+                    goal_handle = fut.result()
+                except Exception as e:
+                    self.get_logger().error(f"Nav goal error: {e}")
+                    self.say("Navigation failed.")
+                    h.mark_done()
+                    return
+
+                if not goal_handle or not goal_handle.accepted:
+                    self.say("Navigation goal was rejected.")
+                    h.mark_done()
+                    return
+
+                def _result_done(res_fut):
+                    try:
+                        res = res_fut.result()
+                    except Exception as e:
+                        self.get_logger().error(f"Nav result error: {e}")
+                        self.say("Navigation failed.")
+                        h.mark_done()
+                        return
+
+                    if getattr(res, "status", 0) == GoalStatus.STATUS_SUCCEEDED:
+                        self.say("Arrived at the destination.")
+                    else:
+                        self.say("Navigation failed.")
+                    h.mark_done()
+
+                goal_handle.get_result_async().add_done_callback(_result_done)
+
+            self.nav_client.send_goal_async(goal).add_done_callback(_goal_done)
             return h
+
 
         def query_beacons(top_n: int, ctx: dict):
             h = StepHandle()
@@ -1949,7 +2066,7 @@ class SkillsAgent(Node):
             self.get_logger().info(f"[VLM primitive] prompt={prompt!r}, tag={tag}, mode={mode}")
             req_id = int(time.time() * 1000) ^ self._vlm_next_id
             self._vlm_next_id += 1
-            req_id = str(req_id_int)   # <<< normalize to str
+            req_id = str(req_id)   # <<< normalize to str
             
             self._vlm_pending[req_id] = {
                 "handle": h,

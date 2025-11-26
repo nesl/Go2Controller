@@ -37,6 +37,33 @@ from jsonschema import validate, ValidationError
 
 # ---------- JSON schema for LLM output ----------
 
+# ---------- Deterministic latency tiers → concrete model ids ----------
+
+MODEL_CATALOG: Dict[str, Dict[str, str]] = {
+    # role   → tier  → model_id
+    "broker": {
+        "fast":     "gpt-5-nano",
+        "balanced": "gpt-5-mini",
+        "thorough": "gpt-5",   # or a bigger one if you want
+    },
+    "planner": {
+        "fast":     "gpt-5-nano",
+        "balanced": "gpt-5-mini",
+        "thorough": "gpt-5",   # or e.g. "gpt-5"
+    },
+    "orchestrator": {
+        "fast":     "gpt-5-nano",
+        "balanced": "gpt-5-mini",
+        "thorough": "gpt-5",
+    },
+    "hdt": {
+        "fast":     "gpt-5-nano",
+        "balanced": "gpt-5-mini",
+        "thorough": "gpt-5",
+    },
+}
+
+
 PLAN_PARSE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "required": ["to_execute"],
@@ -95,10 +122,28 @@ PLAN_PARSE_SCHEMA: Dict[str, Any] = {
             },
             "additionalProperties": True,
         },
-        # NEW: optional LLM model choices per role ("broker", "planner", "orchestrator", etc.)
+        # OLD: optional direct model overrides (we keep for backwards compat)
         "llm_models": {
             "type": "object",
             "additionalProperties": {"type": "string"},
+        },
+
+        # NEW: latency-profile-based policy
+        "llm_policy": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["fast_reactive", "normal", "deep_reasoning"]
+                },
+                "nodes": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"   # "fast" | "balanced" | "thorough" | "off"
+                    }
+                }
+            },
+            "additionalProperties": True
         },
     },
     "additionalProperties": False,
@@ -169,12 +214,26 @@ Two allowed state types:
      "type": "wait",
      "wait_for": {
        "any_of": [
-         { "rule_id": "rule_name", "within_ms": <timeout> }
+         { "rule_id": "rule_name", "within_ms": <timeout_ms_int> }
        ]
      },
-     "on_event":   "next_state_or_done",
+     "branches": [
+       { "rule_id": "rule_name_1", "next": "state_id_1" },
+       { "rule_id": "rule_name_2", "next": "state_id_2" }
+     ],
+     "on_event":   "default_state_or_done",
      "on_timeout": "timeout_state_or_done"
    }
+
+   Behavior:
+   - When a matching rule is observed while this state is active:
+     * If "branches" is present:
+         - If there is an entry with the same rule_id, transition to its "next".
+         - Otherwise, if "on_event" is set, transition to "on_event".
+     * If "branches" is not present:
+         - If "on_event" is set, transition to "on_event".
+   - If no rule in "any_of" fires before its timeout, transition to "on_timeout".
+
 
 Behavior guidelines:
 - Each state machine represents ONE SHORT INTERACTION SEGMENT.
@@ -187,7 +246,46 @@ Behavior guidelines:
 - If future actions depend on new speech, gesture, BT events, LLM output, or VLM output:
   * end the current skill, then let rules trigger a new one.
 - Avoid recursion: do NOT have a state machine that eventually calls itself via action.use.
+- When a skill’s purpose is to ANSWER a human question based on events
+  (speech, BT, vision, LLM, VLM, DB, etc.), include at least one tts.say
+  state whose text uses rule.<rule_id>.<field> and/or ctx.<key> to verbally
+  summarize those results (not just “I scanned”).
+  
+======================================================================
+ USING RULE PAYLOADS AND CONTEXT IN TEMPLATES
+======================================================================
+The runtime exposes two main sources of data for parameters and TTS text:
 
+1) rule.<rule_id>.<field>  (recent event payloads)
+   - Each basic/composite rule in rules_inventory corresponds to recent events
+     stored by the EventLayer.
+   - You may reference the latest payload fields for a rule with:
+       {{ rule.<rule_id>.<field_name> | default:'fallback' }}
+   - <field_name> must come from the task/output schema in tasks_inventory
+     (e.g., text, azimuth_deg, rssi, cls, map_x, map_y, success, json_text, etc.).
+   - Examples:
+       {{ rule.speech_final_any.text | default:'I did not hear the words.' }}
+       {{ rule.bt_rssi_seen.object_id | default:'unknown object' }}
+       {{ rule.vlm_scene_json.raw_text | default:'I could not interpret the scene.' }}
+
+2) ctx.<key>  (skill-local context)
+   - ctx is a small JSON dictionary carried through the skill.
+   - You may read keys with:
+       {{ ctx.<key> | default:'fallback' }}
+   - Use ctx to pass small argument sets (object_ids, zones, text snippets,
+     summaries derived from LLM/VLM/DB, etc.).
+   - Examples:
+       {{ ctx.text | default:'OK' }}
+       {{ ctx.scene_summary | default:'I am not sure what I see.' }}
+
+General rules:
+- You MAY combine these in any action params, especially for tts.say:
+    "text": "I heard: {{ rule.speech_final_any.text | default:'nothing intelligible yet.' }}"
+- Always provide a default: use "| default:'...'" so the skill stays robust
+  if the event did not fire or a field is missing.
+- This pattern applies to ANY event/rule type (speech, BT, odometry, VLM,
+  LLM, DB-derived rules, skill_status, etc.), as long as the field exists in
+  the corresponding tasks_inventory schema.
 
 
 ======================================================================
@@ -265,23 +363,34 @@ Requirements:
 
 
 ======================================================================
- LLM MODEL SELECTION (llm_models)
+ LLM LATENCY POLICY (llm_policy)
 ======================================================================
-The llm_models section may override which model each role uses:
+Instead of choosing concrete model_ids, you choose a latency policy.
 
-{
-  "broker": "model_id",
-  "planner": "model_id",
-  "orchestrator": "model_id",
-  "vlm": "model_id"
+Use:
+
+"llm_policy": {
+  "mode": "fast_reactive" | "normal" | "deep_reasoning",
+  "nodes": {
+    "broker": "fast|balanced|thorough|off",
+    "planner": "fast|balanced|thorough|off",
+    "hdt": "fast|balanced|thorough|off",
+    "orchestrator": "fast|balanced|thorough|off"
+  }
 }
 
-Rules for selecting models:
-- Base decisions only on performance metrics from tasks_inventory and perf.json outputs.
-- Look at fields like latency_ms.det_mean, utter_infer_mean, pose_mean, run_trigger_typical, etc.
-- Prefer lower latency and stable performance.
-- If no strong evidence for improvement, omit role.
-
+Rules:
+- "mode" is a high-level interaction style:
+  * fast_reactive: short, urgent commands; low latency; minimal chain.
+  * normal: typical interactions; moderate latency.
+  * deep_reasoning: complex multi-step reasoning; higher latency allowed.
+- For each node:
+  * "fast": use the fastest acceptable model and keep that node enabled.
+  * "balanced": use a mid-tier model.
+  * "thorough": use a slower but higher-capacity model.
+  * "off": skip that node’s LLM for this interaction (or leave it in a cheap fallback).
+- DO NOT output concrete model names; only tiers as above.
+- If you have no strong opinion, omit llm_policy entirely.
 
 ======================================================================
  STRICT JSON OUTPUT SCHEMA
@@ -387,6 +496,7 @@ class OrchestratorNode(Node):
                 "broker": {"node": "broker_node", "param": "llm_model"},
                 "planner": {"node": "planner_node", "param": "model"},
                 "orchestrator": {"node": "orchestrator_node", "param": "model"},
+                "hdt": {"node": "hdt_node", "param": "model"},
             }),
         )
 
@@ -463,6 +573,10 @@ class OrchestratorNode(Node):
             .get_parameter_value()
             .string_value
         )
+
+
+        # Track whether planner LLM is currently considered enabled
+        self._planner_llm_enabled: bool = True
 
         if not self.skills_composite_path:
             self.get_logger().warn(
@@ -1179,6 +1293,10 @@ class OrchestratorNode(Node):
             #"ContextCapsule": self._capsule or {},
         }
 
+        # Only expose ContextCapsule to the orchestrator LLM when the planner LLM is disabled
+        if not self._planner_llm_enabled:
+            payload["ContextCapsule"] = self._capsule or {}
+
         '''
         return [
             {"role": "system", "content": SYSTEM_PARSE},
@@ -1257,13 +1375,19 @@ class OrchestratorNode(Node):
         new_composites = orchestrator_obj.get("new_composites") or []
         new_rules = orchestrator_obj.get("new_rules") or []
         to_execute_obj = orchestrator_obj.get("to_execute") or {}
-        llm_models = orchestrator_obj.get("llm_models") or {}
 
-        # --- Apply any LLM-chosen model changes first ---
-        if isinstance(llm_models, dict):
-            for role, model in llm_models.items():
-                if isinstance(model, str) and model:
-                    self._set_remote_model(role, model)
+        # Prefer new llm_policy; fall back to old llm_models if present.
+        llm_policy = orchestrator_obj.get("llm_policy")
+        if isinstance(llm_policy, dict):
+            self._apply_llm_policy(llm_policy)
+        else:
+            # Backwards-compatible behavior: direct model overrides
+            llm_models = orchestrator_obj.get("llm_models") or {}
+            if isinstance(llm_models, dict):
+                for role, model in llm_models.items():
+                    if isinstance(model, str) and model:
+                        self._set_remote_model(role, model)
+
 
         # --- Update composite YAML only ---
         if new_composites and self.skills_composite_path:
@@ -1367,6 +1491,106 @@ class OrchestratorNode(Node):
             f"orchestrator: requesting LLM model change role='{role}' node='{node_name}' param='{param_name}' -> '{model}'"
         )
         _ = client.call_async(req)
+
+    # =====================================================================
+    # Latency-profile → concrete models, and enable/disable
+    # =====================================================================
+
+    def _choose_model_for_tier(self, role: str, tier: str) -> Optional[str]:
+        """
+        Map a (role, tier) pair to a concrete model_id using MODEL_CATALOG.
+        Returns None if no mapping is found.
+        """
+        tier = (tier or "").lower()
+        table = MODEL_CATALOG.get(role, {})
+        return table.get(tier)
+
+    def _set_remote_bool(self, role: str, param_name: str, value: bool):
+        """
+        Set a boolean parameter on the target node for the given role
+        (e.g., llm_enabled).
+        """
+        info = self.llm_targets.get(role) or {}
+        node_name = info.get("node")
+        if not node_name:
+            self.get_logger().warn(f"no node mapping for role='{role}'")
+            return
+        client = self._param_clients.get(role)
+        if client is None:
+            self.get_logger().warn(f"no SetParameters client for role='{role}'")
+            return
+
+        if not client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn(
+                f"SetParameters service not available for role='{role}' (node={node_name})"
+            )
+            return
+
+        req = SetParameters.Request()
+        p = ParamMsg()
+        p.name = param_name
+        pv = ParameterValue()
+        pv.type = ParameterType.PARAMETER_BOOL
+        pv.bool_value = bool(value)
+        p.value = pv
+        req.parameters.append(p)
+
+        self.get_logger().info(
+            f"orchestrator: setting bool param role='{role}' node='{node_name}' "
+            f"param='{param_name}' -> {value}"
+        )
+        _ = client.call_async(req)
+
+    def _apply_llm_policy(self, llm_policy: Dict[str, Any]):
+        """
+        Apply an llm_policy of the form:
+          {
+            "mode": "fast_reactive" | "normal" | "deep_reasoning",
+            "nodes": {
+              "broker": "fast|balanced|thorough|off",
+              "planner": "...",
+              "hdt": "...",
+              "orchestrator": "..."
+            }
+          }
+        """
+        if not isinstance(llm_policy, dict):
+            return
+
+        nodes = llm_policy.get("nodes") or {}
+        if not isinstance(nodes, dict):
+            return
+
+        for role, tier in nodes.items():
+            if not isinstance(tier, str):
+                continue
+            t = tier.lower().strip()
+
+            if t == "off":
+                # Disable that node's LLM
+                self._set_remote_bool(role, "llm_enabled", False)
+                self.get_logger().info(f"orchestrator: role='{role}' → LLM OFF")
+
+                if role == "planner":
+                    self._planner_llm_enabled = False
+                continue
+
+            # Otherwise: enable and set model
+            self._set_remote_bool(role, "llm_enabled", True)
+            if role == "planner":
+                self._planner_llm_enabled = True
+
+            model_id = self._choose_model_for_tier(role, t)
+            if model_id:
+                self._set_remote_model(role, model_id)
+                self.get_logger().info(
+                    f"orchestrator: role='{role}' tier='{t}' → model_id='{model_id}'"
+                )
+            else:
+                self.get_logger().warn(
+                    f"orchestrator: no model mapping for role='{role}', tier='{t}'"
+                )
+
 
     # =====================================================================
     # Reload + execute

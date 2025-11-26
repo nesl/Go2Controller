@@ -24,15 +24,26 @@ from rcl_interfaces.msg import SetParametersResult  # NEW
 
 # LLM reply must be STRICT JSON like: {"sql":"SELECT ...", "params": {...}, "purpose":"..."}
 LLM_SQL_SCHEMA = {
-  "type": "object",
-  "required": ["sql"],
-  "properties": {
-    "sql":    {"type":"string"},
-    "params": {"type":"object"},
-    "purpose":{"type":"string"}
-  },
-  "additionalProperties": False
+    "type": "object",
+    "required": ["sql"],
+    "properties": {
+        "sql": {
+            "type": "string",
+        },
+        "params": {
+            "type": "object",
+            # OpenAI's json_schema mode requires object schemas to have `properties`.
+            # We don't constrain param names, so we leave it empty and allow additional props.
+            "properties": {},
+            "additionalProperties": True,
+        },
+        "purpose": {
+            "type": "string",
+        },
+    },
+    "additionalProperties": False,
 }
+
 
 # ------------------------------ Broker Node ------------------------------
 
@@ -103,6 +114,14 @@ class BrokerNode(Node):
             self.get_parameter("llm_perf_topic")
             .get_parameter_value()
             .string_value
+        )
+        
+        # NEW: enable/disable use of LLM (everything else still works)
+        self.declare_parameter("llm_enabled", True)
+        self.llm_enabled = (
+            self.get_parameter("llm_enabled")
+            .get_parameter_value()
+            .bool_value
         )
         
         # NEW: task registry path so we can subscribe to perf topics
@@ -182,6 +201,10 @@ class BrokerNode(Node):
         self._event_trace = deque(maxlen=40)       # compact recent events
         self._current_trigger = None               # {"type": "...", "hints": {...}}
         self._ws = {}                               # ws_id -> {"hashes": set(), "iters": int}
+
+        # NEW: last known robot zone (from event-layer)
+        self._last_robot_zone: Optional[str] = None
+
 
         # NEW: runtime perf database (EMA per task/model)
         # key: (task_id, model_id or "default")
@@ -507,16 +530,23 @@ class BrokerNode(Node):
     # ------------------------------ Dynamic param handling ------------------------------
     def _on_set_parameters(self, params):
         """
-        React to dynamic parameter updates, in particular llm_model.
+        React to dynamic parameter updates, in particular llm_model and llm_enabled.
         This allows you to call:
           ros2 param set /broker_node llm_model gpt-4.1-mini
-        and have the broker switch models immediately.
+          ros2 param set /broker_node llm_enabled false
         """
         for p in params:
             if p.name == "llm_model" and p.type_ == Parameter.Type.STRING:
                 self.llm_model = p.value
                 self.get_logger().info(f"[broker] llm_model changed to: {self.llm_model}")
+
+            # NEW: enable / disable broker LLM
+            if p.name == "llm_enabled" and p.type_ == Parameter.Type.BOOL:
+                self.llm_enabled = bool(p.value)
+                self.get_logger().info(f"[broker] llm_enabled changed to: {self.llm_enabled}")
+
         return SetParametersResult(successful=True, reason="ok")
+
 
 
     def _publish_llm_perf(self, lat_ms: int, ok: bool, phase: str):
@@ -804,13 +834,21 @@ class BrokerNode(Node):
         rule = str(o.get("rule") or "")
         data = o.get("data") or {}
         ts   = float(o.get("ts") or time.time())
-
+        zone = o.get("zone")  # NEW: top-level zone from EventLayer
+        
         # compact trace entry
         trace_entry = {"rule": rule, "ts": ts}
         if isinstance(data, dict):
             trace_entry.update(data)
+        if zone is not None:
+            trace_entry["zone"] = zone          # NEW: keep zone in trace
+            
         self._event_trace.append(trace_entry)
 
+        # remember last robot zone for capsule
+        if zone is not None:
+            self._last_robot_zone = zone        # NEW
+            
         # trigger state (used by LLM prompt)
         trig_type = self.trigger_map.get(rule)
         if trig_type:
@@ -841,23 +879,44 @@ class BrokerNode(Node):
             self.get_logger().warn("broker: invalid JSON on /events/composite")
             return
 
-        rid = str(o.get("rule") or "")
-        ts  = float(o.get("ts") or time.time())
+        rid  = str(o.get("rule") or "")
+        ts   = float(o.get("ts") or time.time())
         expr = o.get("expr") or ""
+        zone = o.get("zone")  # NEW: zone stamped by EventLayer composite
 
-        # trace entry
-        self._event_trace.append({"rule": rid, "ts": ts, "composite": True, "expr": expr[:160]})
+        # trace entry (keep expr + mark composite; add zone if present)
+        trace_entry = {
+            "rule": rid,
+            "ts": ts,
+            "composite": True,
+            "expr": expr[:160],
+        }
+        if zone is not None:
+            trace_entry["zone"] = zone      # NEW
+
+        self._event_trace.append(trace_entry)
+
+        # remember last robot zone for capsule
+        if zone is not None:
+            self._last_robot_zone = zone    # NEW
 
         # map composite rule id → trigger (use the same trigger_map param)
         trig_type = self.trigger_map.get(rid, "composite_hit")
-        self._current_trigger = {"type": trig_type, "ts": ts, "composite": True, "rid": rid}
+        self._current_trigger = {
+            "type": trig_type,
+            "ts": ts,
+            "composite": True,
+            "rid": rid,
+        }
+        if zone is not None:
+            self._current_trigger["zone"] = zone  # optional but handy
 
         # (optional) proactive run
         if trig_type in ("new_object", "finish_or_fail", "human_command"):
             try:
                 self._current_trigger["trigger_event"] = o
                 self._publish_context_capsule()
-                
+
                 pack = self._llm_sql_to_facts(proactive=True)
                 self.pub_facts.publish(StringMsg(data=json.dumps(pack)))
                 self._emit_sql_debug(pack)
@@ -1088,7 +1147,8 @@ class BrokerNode(Node):
         basket = [r[0] for r in self.conn.execute(
             "SELECT node_id FROM nodes_state WHERE in_basket=1 LIMIT 8").fetchall()]
 
-
+        # NEW: robot_zone from last basic event (may be None)
+        robot_zone = self._last_robot_zone
 
         return {
             "trigger": self._current_trigger,
@@ -1097,6 +1157,7 @@ class BrokerNode(Node):
             "world": {
                 "backlog_counts": cc,
                 "basket": basket,
+                "robot_zone": robot_zone,   # ← HDT & planner use this
             }
         }
 
@@ -1178,6 +1239,31 @@ class BrokerNode(Node):
         for attempt in range(retries + 1):
             t0 = time.time()
             ok_api = False
+            self.get_logger().info("\n=== LLM PROMPT ===\n" + json.dumps(messages, indent=2))
+            resp = self.client.chat.completions.create(
+                model=self.llm_model,
+                messages=messages,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "BrokerSQL",
+                        "schema": LLM_SQL_SCHEMA,
+                    },
+                },
+            )
+            dt_ms = int((time.time() - t0) * 1000)
+            ok_api = True
+
+            content = resp.choices[0].message.content
+            obj = json.loads(content)
+            validate(instance=obj, schema=LLM_SQL_SCHEMA)
+
+            self.get_logger().info(f"\n=== LLM RAW RESPONSE ===\n{content}\n")
+
+            # success → publish perf once and return
+            self._publish_llm_perf(dt_ms, ok=True, phase="sql_plan")
+            return obj
+            '''
             try:
                 resp = self.client.chat.completions.create(
                     model=self.llm_model,
@@ -1192,6 +1278,8 @@ class BrokerNode(Node):
                 content = resp.choices[0].message.content
                 obj = json.loads(content)
                 validate(instance=obj, schema=LLM_SQL_SCHEMA)
+                self.get_logger().info("\n=== LLM PROMPT ===\n" + json.dumps(messages, indent=2))
+                self.get_logger().info(f"\n=== LLM RAW RESPONSE ===\n{content}\n")
 
                 # success → publish perf once and return
                 self._publish_llm_perf(dt_ms, ok=True, phase="sql_plan")
@@ -1206,6 +1294,9 @@ class BrokerNode(Node):
                     "role": "system",
                     "content": "Return ONLY valid JSON per the schema. No prose."
                 }]
+                
+
+                
                 continue
 
             except Exception as e:
@@ -1215,7 +1306,7 @@ class BrokerNode(Node):
                 last_exc = e
                 # no point retrying if it’s a hard error like auth/connection, but keep current behavior:
                 continue
-
+            '''
         # last-resort fallback handled by caller
         raise ValueError(f"LLM did not return valid JSON: {last_exc}")
 
@@ -1262,16 +1353,36 @@ class BrokerNode(Node):
             if not sql.lower().startswith("select"):
                 raise ValueError("LLM did not return a SELECT")
             return sql, params, purpose
-        except Exception:
-            # safe fallbacks if the call fails or returns garbage
-            hints = (context_capsule.get("trigger") or {}).get("hints") or {}
-            oid = hints.get("object_id")
-            if oid:
-                return "SELECT * FROM vw_object_sheet WHERE node_id=:object_id LIMIT 1", {"object_id": oid}, "fallback object sheet"
-            return ("SELECT node_id, best_zone, best_rssi, in_basket, disposed_to "
-                    "FROM vw_object_sheet WHERE disposed_to='none' ORDER BY best_ts DESC LIMIT 5",
-                    {}, "fallback shortlist")
 
+        except Exception:
+            # NEW: reuse the same fallback for both errors and disabled LLM
+            self.get_logger().info(f"\nERROR BROKER\n")
+            return self._fallback_sql_from_capsule(context_capsule)
+
+
+    # NEW: shared fallback logic used on errors *and* when LLM is disabled
+    def _fallback_sql_from_capsule(self, context_capsule: dict) -> tuple[str, dict, str]:
+        """
+        Produce a default SQL query when the LLM is disabled or fails.
+
+        Prefer a single hinted object, otherwise return a small shortlist.
+        """
+        hints = (context_capsule.get("trigger") or {}).get("hints") or {}
+        oid = hints.get("object_id")
+        if oid:
+            return (
+                "SELECT * FROM vw_object_sheet WHERE node_id=:object_id LIMIT 1",
+                {"object_id": oid},
+                "fallback object sheet"
+            )
+
+        return (
+            "SELECT node_id, best_zone, best_rssi, in_basket, disposed_to "
+            "FROM vw_object_sheet WHERE disposed_to='none' "
+            "ORDER BY best_ts DESC LIMIT 5",
+            {},
+            "fallback shortlist"
+        )
 
 
     # ---- Turn LLM SQL into facts ----
@@ -1284,7 +1395,18 @@ class BrokerNode(Node):
         schema = self._schema_card()
         capsule = self._context_capsule()
 
-        sql, params, purpose = self._llm_plan_sql(proactive=proactive, schema_card=schema, context_capsule=capsule, planner_needs=needs)
+        # NEW: if LLM is disabled, use fallback SQL instead of calling _llm_plan_sql
+        if not getattr(self, "llm_enabled", True):
+            sql, params, purpose = self._fallback_sql_from_capsule(capsule)
+            # You might want to tag the purpose so the planner/orchestrator can tell:
+            purpose = (purpose + " (llm_disabled)").strip()
+        else:
+            sql, params, purpose = self._llm_plan_sql(
+                proactive=proactive,
+                schema_card=schema,
+                context_capsule=capsule,
+                planner_needs=needs
+            )
 
         err = self._validate_sql_readonly(sql)
         if err:
