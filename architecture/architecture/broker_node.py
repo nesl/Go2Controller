@@ -77,6 +77,8 @@ class BrokerNode(Node):
             "trigger_speech_final": "human_command",
         }))
 
+        self.declare_parameter('planner_trigger_prefix', 'trigger_')
+
         # Contamination fetch policy (broker owns it)
         self.declare_parameter('contam_enable_server_calls', True)
         self.declare_parameter('contam_server_url', 'http://127.0.0.1:8000/check')
@@ -161,6 +163,12 @@ class BrokerNode(Node):
         self.human3d_rule_id = self.get_parameter('human3d_rule_id').get_parameter_value().string_value
 
         self.trigger_map   = json.loads(self.get_parameter('trigger_map_json').get_parameter_value().string_value)
+
+        self.planner_trigger_prefix = (
+            self.get_parameter('planner_trigger_prefix')
+            .get_parameter_value()
+            .string_value
+        )
 
         self.enable_server = bool(self.get_parameter('contam_enable_server_calls').value)
         self.server_url    = self.get_parameter('contam_server_url').get_parameter_value().string_value
@@ -851,8 +859,20 @@ class BrokerNode(Node):
             
         # trigger state (used by LLM prompt)
         trig_type = self.trigger_map.get(rule)
+
+        # NEW: any basic rule whose id starts with the trigger prefix is a planner trigger
+        if rule.startswith(self.planner_trigger_prefix):
+            if not trig_type:
+                trig_type = "planner_trigger"
+
         if trig_type:
-            self._current_trigger = {"type": trig_type, "trigger_event": o, "ts": ts}
+            self._current_trigger = {
+                "type": trig_type,
+                "trigger_event": o,
+                "ts": ts,
+            }
+            if zone is not None:
+                self._current_trigger["zone"] = zone
 
         # ingestion
         if rule == self.bt_rule_id:
@@ -861,16 +881,15 @@ class BrokerNode(Node):
             self._ingest_human3d(data, o)
 
         # Proactive: if this event is a planning trigger, immediately run initial LLM-SQL
-        if trig_type in ("new_object","finish_or_fail","human_command","idle","presence"):
+        if trig_type in ("new_object", "finish_or_fail", "human_command", "idle", "presence", "planner_trigger"):
             try:
-            
                 self._publish_context_capsule()
-                
                 pack = self._llm_sql_to_facts(proactive=True)
                 self.pub_facts.publish(StringMsg(data=json.dumps(pack)))
                 self._emit_sql_debug(pack)
             except Exception as e:
                 self.get_logger().warn(f"proactive run failed: {e}")
+
 
     def _on_comp_event(self, msg: StringMsg):
         try:
@@ -902,6 +921,12 @@ class BrokerNode(Node):
 
         # map composite rule id → trigger (use the same trigger_map param)
         trig_type = self.trigger_map.get(rid, "composite_hit")
+
+        # NEW: any composite rule whose id starts with the trigger prefix is a planner trigger
+        if rid.startswith(self.planner_trigger_prefix):
+            if trig_type == "composite_hit":
+                trig_type = "planner_trigger"
+
         self._current_trigger = {
             "type": trig_type,
             "ts": ts,
@@ -912,7 +937,7 @@ class BrokerNode(Node):
             self._current_trigger["zone"] = zone  # optional but handy
 
         # (optional) proactive run
-        if trig_type in ("new_object", "finish_or_fail", "human_command"):
+        if trig_type in ("new_object", "finish_or_fail", "human_command", "planner_trigger"):
             try:
                 self._current_trigger["trigger_event"] = o
                 self._publish_context_capsule()
@@ -922,6 +947,7 @@ class BrokerNode(Node):
                 self._emit_sql_debug(pack)
             except Exception as e:
                 self.get_logger().warn(f"proactive run (composite) failed: {e}")
+
 
 
     def _ingest_human3d(self, data: dict, envelope: dict):

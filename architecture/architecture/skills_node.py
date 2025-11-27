@@ -627,7 +627,13 @@ class SkillEngineV2:
         """
         fn = self.bindings.get(action)
         if not callable(fn):
-            raise KeyError(f"No binding for action '{action}'")
+            if self.logger:
+                self.logger.error(f"[SkillEngine] No binding for action '{action}' "
+                                  f"– completing step as no-op.")
+            h = StepHandle()
+            h.mark_done()
+            return h
+
 
         rendered = _render_params(params or {}, ctx, self.rules, self.defaults_window_ms)
 
@@ -1264,7 +1270,8 @@ class SkillsAgent(Node):
             "/tts_busy",
             self._cb_tts_busy,
             10,
-
+        )
+        
         self.get_logger().info("SkillsAgent ready.")
 
         # call engine.tick() ~10–20 Hz, lightweight

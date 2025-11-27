@@ -183,4 +183,20 @@ skills:
         on_complete: null
 
 
+  - name: sense.here
+    kind: state_machine
+    when: {}          # no gating; activates immediately when armed
+    until: {}         # no composite-level early stop
+    initial_state: wait_only
+    states:
+      - id: wait_only
+        type: wait
+        wait_for:
+          any_of:
+            # This rule will never exist; it's just there to define the timeout.
+            - rule_id: "sense_dummy"
+              within_ms: 5000      # 5 seconds
+        on_event: null             # ignore events (there won't be any)
+        on_timeout: null           # no next state -> skill finishes
+
 

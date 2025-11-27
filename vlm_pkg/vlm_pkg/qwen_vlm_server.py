@@ -35,6 +35,8 @@ from PIL import Image
 import io
 import numpy as np
 
+import re
+
 import torch
 from transformers import (
     AutoConfig,
@@ -98,6 +100,53 @@ def human_bytes(n: int) -> str:
             return f"{n:.2f} {unit}"
         n /= 1024
     return f"{n:.2f} PB"
+
+def extract_json_from_answer(answer: str, logger=None) -> str:
+    """
+    Try to extract a strict JSON object/array from a VLM answer.
+
+    - Prefer a ```json ... ``` fenced block.
+    - Fallback to the first {...} or [...] blob.
+    - Validate with json.loads, then re-dump to normalized JSON.
+    - Return "" if nothing valid is found.
+    """
+    if not answer:
+        return ""
+
+    cand = None
+
+    # 1) Prefer ```json fenced block
+    m = re.search(
+        r"```json\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```",
+        answer,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        cand = m.group(1).strip()
+    else:
+        # 2) Fallback: first {...} or [...] chunk
+        m = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", answer)
+        if m:
+            cand = m.group(1).strip()
+
+    if not cand:
+        return ""
+
+    try:
+        obj = json.loads(cand)
+    except Exception as e:
+        if logger is not None:
+            logger.warn(f"[vlm] JSON extraction failed: {e} from candidate: {cand[:160]!r}")
+        return ""
+
+    # Normalize to compact JSON string
+    try:
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    except Exception as e:
+        if logger is not None:
+            logger.warn(f"[vlm] JSON re-dump failed: {e}")
+        return ""
+
 
 # -----------------------------
 # VLM Loader (Qwen-friendly)
@@ -480,18 +529,33 @@ class QwenVLMServer(Node):
             f"answer_preview={answer[:160]!r})"
         )
 
+        # Try to extract strict JSON (if the prompt asked for it)
+        json_blob = ""
+        if ok and answer:
+            json_blob = extract_json_from_answer(answer, logger=self.get_logger())
+            if json_blob:
+                self.get_logger().info(
+                    f"[vlm] extracted JSON blob len={len(json_blob)} preview={json_blob[:160]!r}"
+                )
+            else:
+                # Optional: only log if answer *looks* like it should contain JSON
+                if "```json" in answer or "object_id" in answer:
+                    self.get_logger().warn(
+                        f"[vlm] no valid JSON extracted from answer (len={len(answer)})"
+                    )
+
         # Build JSON envelope expected by EventLayer/SkillsAgent
         envelope = {
             "id": req_id,
             "success": bool(ok),
             "raw_text": answer or "",
-            # For now we don't try to enforce output_schema; leave JSON empty.
-            "json_text": "",
+            "json_text": json_blob,        # ← NOW FILLED WHEN POSSIBLE
             "model_id": self.model_id,
             "lat_ms": dt_ms,
             "tag": tag or "",
             "ts": time.time(),
         }
+
 
         try:
             self.ans_pub.publish(RosString(data=json.dumps(envelope)))

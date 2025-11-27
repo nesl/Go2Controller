@@ -812,21 +812,39 @@ class STTFasterWhisperNode(Node):
         if (now - self._last_perf_publish) < self._perf_publish_period:
             return
         self._last_perf_publish = now
+
+        extra = extra or {}
+
+        # Build latency_ms dict in the order the broker likes.
+        # First key should be the "main" metric for audio_asr.
+        latency_ms = {}
+        if self.lat_asr_ms_ema is not None:
+            # main metric -> used by broker for EMA
+            latency_ms["utter_infer_mean"] = float(self.lat_asr_ms_ema)
+        if self.lat_gate_ms_ema is not None:
+            latency_ms["window_infer_mean"] = float(self.lat_gate_ms_ema)
+        if self.lat_e2e_ms_ema is not None:
+            latency_ms["e2e_mean"] = float(self.lat_e2e_ms_ema)
+
         payload = {
+            # task / model so broker can match task_registry: audio_asr + tiny/small/medium/large-v3
+            "task": "audio_asr",
+            "model": str(self.get_parameter("stt_model_size").value),
+
+            # the thing broker actually reads
+            "latency_ms": latency_ms,
+
+            # extra telemetry (nice to keep, broker mostly ignores)
             "stamp_wall": now,
-            "enable": {"stt": self.enable_stt, "gate": self.enable_gate},
-            "lat_ms_ema": {
-                "gate": self.lat_gate_ms_ema,
-                "asr":  self.lat_asr_ms_ema,
-                "e2e":  self.lat_e2e_ms_ema
-            },
-            "counters": {
-                "windows_processed": self.windows_processed,
-                "utterances_finalized": self.utterances_finalized
-            }
+            "windows_processed":    self.windows_processed,
+            "utterances_finalized": self.utterances_finalized,
+            "last_gate_lat_ms": extra.get("last_gate_lat_ms"),
+            "last_asr_lat_ms":  extra.get("last_asr_lat_ms"),
+            "last_e2e_ms":      extra.get("last_e2e_ms"),
+            "enable_stt":  self.enable_stt,
+            "enable_gate": self.enable_gate,
         }
-        if isinstance(extra, dict):
-            payload.update(extra)
+
         self.perf_pub.publish(String(data=json.dumps(payload)))
 
 
@@ -1054,26 +1072,38 @@ class STTFasterWhisperNode(Node):
             self.get_logger().info(f"BEFORE!!! {avg_lp} {max_nsp} {text} {is_speech}")            
 
             if is_speech:
-            
+
                 # NEW: summarize angle "so far" and publish a partial item
                 mode_deg, mean_deg, top_list = self._doa_summary()
+                ts_sec = t_end_ns * 1e-9  # or time.time(), but this lines up with window end
+
                 partial_payload = {
                     "kind": "partial_gate",
                     "t_start_ns": t_start_ns,
                     "t_end_ns":   t_end_ns,
                     "duration_ms": dur_ms,
-                    "text": text,                    # may be empty if model produced nothing this window
+                    "ts": ts_sec,                     # matches context field `ts`
+                    "text": text,
                     "avg_logprob": avg_lp,
                     "max_no_speech": max_nsp,
                     "lat_ms": lat_gate_ms,
+
+                    # 🔽 FLAT FIELDS to match task_registry
+                    "doa_angle_mode_deg": mode_deg,
+                    "doa_angle_mean_deg": mean_deg,
+
+                    # keep nested object too, if you still want it
                     "doa": {
                         "angle_mode_deg": mode_deg,
                         "angle_mean_deg": mean_deg,
-                        "top_angles": top_list
-                    }
+                        "top_angles": top_list,
+                    },
                 }
-                self.pub_partial.publish(String(data=json.dumps(partial_payload, ensure_ascii=False)))
-            
+
+                self.pub_partial.publish(
+                    String(data=json.dumps(partial_payload, ensure_ascii=False))
+                )
+
             
                 # start or continue utterance
                 angles_only = [dh[1] for dh in self.doa_hist]

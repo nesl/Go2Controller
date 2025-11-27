@@ -272,8 +272,8 @@ tasks:
             - { name: duration,    type: "float?", desc: "utterance duration in seconds (if set)" }
             - { name: ts,          type: "ts",     desc: "utterance end timestamp (derived from stamp)" }
 
-
       - id: perf.json
+        kind: perf
         ros: { msg: std_msgs/String, topic: "/stt_perf" }
         context:
           fields:
@@ -296,18 +296,46 @@ tasks:
         type: "rcl_interfaces/SetParameters"
 
     models:
-      - id: whisper
-        version: "hf-medium"
-        metrics: { latency_ms: { utter_infer_mean: 160.0 } }
-        resources: { device_pref: ["cuda","cpu"], memory_mb: 3200, vram_mb: 2400 }
-        parameters:
-          stt_model_size:
-            type: "string"
-            default: "medium"
-            enum: ["tiny","base","small","medium","large-v3"]
-          stt_chunk_s:
-            type: "float"
-            default: 30.0
+      - id: tiny
+        version: "tiny"
+        description: "Whisper tiny – lowest latency, lowest quality."
+        metrics:
+          latency_ms: { utter_infer_mean: 60.0 }   # ballpark, update from EMA later
+        resources:
+          device_pref: ["cuda","cpu"]
+          memory_mb: 800
+          vram_mb: 600
+
+      - id: small
+        version: "small"
+        description: "Whisper small – balance between speed and quality."
+        metrics:
+          latency_ms: { utter_infer_mean: 120.0 }
+        resources:
+          device_pref: ["cuda","cpu"]
+          memory_mb: 1600
+          vram_mb: 1200
+
+      - id: medium
+        version: "medium"
+        description: "Whisper medium – higher quality, higher latency."
+        metrics:
+          latency_ms: { utter_infer_mean: 160.0 }
+        resources:
+          device_pref: ["cuda","cpu"]
+          memory_mb: 3200
+          vram_mb: 2400
+
+      - id: large-v3
+        version: "large-v3"
+        description: "Whisper large – top quality, top latency."
+        metrics:
+          latency_ms: { utter_infer_mean: 180.0 }
+        resources:
+          device_pref: ["cuda","cpu"]
+          memory_mb: 2600
+          vram_mb: 1800
+
 
   bt_proximity:
     description: "Raw Bluetooth RSSI readings for objects (no TF/DB)."
@@ -789,9 +817,6 @@ tasks:
             - { name: ts,     type: "ts",     desc: "perf sample timestamp" }
 
     services:
-      enable:
-        name: "/hdt_node/enable"
-        type: "std_srvs/SetBool"
       update_now:
         name: "/hdt_node/update_profiles"
         type: "std_srvs/Trigger"

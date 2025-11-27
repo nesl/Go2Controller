@@ -61,6 +61,13 @@ MODEL_CATALOG: Dict[str, Dict[str, str]] = {
         "balanced": "gpt-5-mini",
         "thorough": "gpt-5",
     },
+    
+    "audio_asr": {
+        "fast":     "small",
+        "balanced": "medium",
+        "thorough": "large-v3",
+    },
+    
 }
 
 
@@ -158,14 +165,16 @@ You also have:
   - A rules library
   - A tasks_inventory describing all perception, LLM, and VLM tools
   - The task registry includes performance metrics for all models (latency, fps, etc.)
+  - A current_llm_policy describing the CURRENT global latency mode and per-node tiers.
 
 Your job is to:
   1) Decide which skill (state-machine) to activate next
   2) Optionally define NEW composite skills as finite state machines
   3) Optionally define NEW rules (prefer composite rules using exists('rule_id', ms))
-  4) Optionally recommend updated LLM/VLM models in llm_models, based on performance
-     metrics available in tasks_inventory and perf.json outputs
-  5) Return STRICT JSON ONLY following the required schema
+     - This includes optional NEW “planner trigger” rules whose ONLY job is to
+       proactively wake up the planner for a new plan.
+  4) Recommend an updated LLM latency policy in llm_policy, based on performance
+     metrics available in tasks_inventory, perf.json outputs, and current_llm_policy
 
 
 ======================================================================
@@ -175,10 +184,14 @@ Your job is to:
 - You SHOULD NOT reference existing rules whose id starts with "trigger_".
 - You MAY reference existing composite or state_machine skills (from skills_inventory) as actions inside state machines (treat them as black-box actions that run until they finish).
 - Use ctx to pass small argument sets (object_ids, zones, text, etc.).
-- When proposing model upgrades or downgrades in llm_models:
+
+- When proposing changes in llm_policy tiers:
+    * Start from current_llm_policy and ADJUST it if needed.
     * Use only performance metrics documented in tasks_inventory (and perf.json outputs if present).
-    * Prefer models with lower latency and acceptable quality.
-    * If no clear improvement is indicated, omit the role.
+    * Prefer lower-latency tiers when humans complain about speed or when time pressure is high.
+    * Prefer balanced/thorough tiers when the task requires deeper reasoning and latency is acceptable.
+    * If no change is clearly warranted, you may COPY current_llm_policy exactly into llm_policy,
+      but you MUST still output an llm_policy object.
 
 
 ======================================================================
@@ -340,10 +353,22 @@ Allowed rule types:
    - May only reference tasks/outputs from tasks_inventory
    - Useful for interpreting JSON from LLM/VLM (example: is_carry, zone, confidence, etc.)
 
+3) Planner trigger rules (special composite rules):
+   - type: "composite"
+   - id MUST start with "trigger_planner_"
+   - enabled: true
+   - expr uses exists('rule_id', ms) over existing rules
+   - Purpose: mark situations where the PLANNER should be activated
+     proactively for a new plan (e.g., after a task finishes, a new user
+     request appears, or the environment changes significantly).
+   - These rules are NOT meant to be used directly by skills; they are
+     consumed by the EventLayer to decide when to call the planner.
+
 Do NOT:
 - invent task names
 - invent outputs
-- create new rules whose id starts with "trigger_"
+- create new rules whose id starts with "trigger_" EXCEPT for
+  planner trigger rules whose id starts with "trigger_planner_".
 
 
 ======================================================================
@@ -375,11 +400,14 @@ Use:
     "broker": "fast|balanced|thorough|off",
     "planner": "fast|balanced|thorough|off",
     "hdt": "fast|balanced|thorough|off",
-    "orchestrator": "fast|balanced|thorough|off"
+    "orchestrator": "fast|balanced|thorough|off",
+    "audio_asr": "fast|balanced|thorough|off"   // controls STT model size/latency
   }
 }
 
 Rules:
+- You MUST always output an llm_policy object in your JSON.
+- Start from current_llm_policy and adjust it if needed.
 - "mode" is a high-level interaction style:
   * fast_reactive: short, urgent commands; low latency; minimal chain.
   * normal: typical interactions; moderate latency.
@@ -389,8 +417,10 @@ Rules:
   * "balanced": use a mid-tier model.
   * "thorough": use a slower but higher-capacity model.
   * "off": skip that node’s LLM for this interaction (or leave it in a cheap fallback).
-- DO NOT output concrete model names; only tiers as above.
-- If you have no strong opinion, omit llm_policy entirely.
+- If there is a clear indication that humans want faster responses
+  (e.g., complaints about being too slow, or short high-priority commands),
+  prefer mode="fast_reactive" and favor "fast" or "off" tiers where reasonable.
+- If no change is warranted, COPY current_llm_policy exactly into llm_policy.
 
 ======================================================================
  STRICT JSON OUTPUT SCHEMA
@@ -423,6 +453,9 @@ You MUST output STRICT JSON ONLY:
               { "rule_id": "rule_id", "within_ms": <int> }
             ]
           },
+          "branches": [
+            { "rule_id": "rule_name_1", "next": "state_id_1" }
+          ],
           "on_event": "next_state_or_done",
           "on_timeout": "timeout_state_or_done"
         }
@@ -445,11 +478,18 @@ You MUST output STRICT JSON ONLY:
     "skill": "<state_machine_name>",
     "ctx": { ... }
   },
-  "llm_models": {
-    "optional_role": "optional_model_id"
+  "llm_policy": {
+    "mode": "<fast_reactive | normal | deep_reasoning>",
+    "nodes": {
+      "broker": "<fast | balanced | thorough | off>",
+      "planner": "<fast | balanced | thorough | off>",
+      "hdt": "<fast | balanced | thorough | off>",
+      "orchestrator": "<fast | balanced | thorough | off>"
+    }
   }
 }
 """
+
 
 class OrchestratorNode(Node):
     """
@@ -497,6 +537,7 @@ class OrchestratorNode(Node):
                 "planner": {"node": "planner_node", "param": "model"},
                 "orchestrator": {"node": "orchestrator_node", "param": "model"},
                 "hdt": {"node": "hdt_node", "param": "model"},
+                "audio_asr": {"node": "stt_angle",     "param": "model"}
             }),
         )
 
@@ -577,6 +618,18 @@ class OrchestratorNode(Node):
 
         # Track whether planner LLM is currently considered enabled
         self._planner_llm_enabled: bool = True
+
+        # NEW: keep track of the current llm_policy we believe is active
+        self._current_llm_policy: Dict[str, Any] = {
+            "mode": "normal",
+            "nodes": {
+                "broker": "balanced",
+                "planner": "balanced",
+                "hdt": "balanced",
+                "orchestrator": "balanced",
+                "audio_asr":    "balanced",
+            },
+        }
 
         if not self.skills_composite_path:
             self.get_logger().warn(
@@ -1291,6 +1344,7 @@ class OrchestratorNode(Node):
             "tasks_inventory": tasks_inventory,
             # NEW: give orchestrator LLM access to broker context capsule, including perf DB
             #"ContextCapsule": self._capsule or {},
+            "current_llm_policy": self._current_llm_policy,
         }
 
         # Only expose ContextCapsule to the orchestrator LLM when the planner LLM is disabled
@@ -1566,6 +1620,26 @@ class OrchestratorNode(Node):
                 continue
             t = tier.lower().strip()
 
+            # NEW: handle audio_asr as a non-LLM role (no llm_enabled, just model size)
+            if role == "audio_asr":
+                if t == "off":
+                    # optional: later you could wire this to /toggle_stt
+                    self.get_logger().info("orchestrator: audio_asr tier='off' (no model change)")
+                    continue
+
+                model_id = self._choose_model_for_tier(role, t)
+                if model_id:
+                    self._set_remote_model(role, model_id)
+                    self.get_logger().info(
+                        f"orchestrator: audio_asr tier='{t}' → stt_model_size='{model_id}'"
+                    )
+                else:
+                    self.get_logger().warn(
+                        f"orchestrator: no model mapping for role='audio_asr', tier='{t}'"
+                    )
+                continue  # skip LLM-specific handling below
+
+
             if t == "off":
                 # Disable that node's LLM
                 self._set_remote_bool(role, "llm_enabled", False)
@@ -1590,6 +1664,17 @@ class OrchestratorNode(Node):
                 self.get_logger().warn(
                     f"orchestrator: no model mapping for role='{role}', tier='{t}'"
                 )
+
+        # --- NEW: update our in-memory view of the current policy ---
+        merged_nodes = dict(self._current_llm_policy.get("nodes", {}))
+        merged_nodes.update(nodes)
+        self._current_llm_policy = {
+            "mode": llm_policy.get("mode", self._current_llm_policy.get("mode", "normal")),
+            "nodes": merged_nodes,
+        }
+        self.get_logger().info(
+            f"orchestrator: updated current_llm_policy={self._current_llm_policy}"
+        )
 
 
     # =====================================================================
