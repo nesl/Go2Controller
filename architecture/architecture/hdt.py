@@ -14,6 +14,8 @@ from std_srvs.srv import Trigger, SetBool
 from openai import OpenAI
 from jsonschema import validate, ValidationError
 
+from groq import Groq
+
 # ---------- Profile JSON Schema (per human) ----------
 
 PROFILE_SCHEMA = {
@@ -38,8 +40,8 @@ PROFILE_SCHEMA = {
         "interaction_history": {
             "type": "object",
             "properties": {
-                "utterances_seen": {"type": "integer"},
-                "last_command_ts": {"type": "number"}
+                "utterances_seen": {"type": ["integer", "null"]},
+                "last_command_ts": {"type": ["number", "null"]}
             },
             "additionalProperties": True
         },
@@ -105,8 +107,8 @@ class HumanDigitalTwinNode(Node):
         # ----- Parameters -----
         self.declare_parameter("model", "gpt-5-mini")
         self.declare_parameter("temperature", 0.2)
-        self.declare_parameter("model_H1", "gpt-5-mini")
-        self.declare_parameter("model_H2", "gpt-5-mini")
+        self.declare_parameter("model_H1", "")
+        self.declare_parameter("model_H2", "")
         self.declare_parameter("capsule_topic", "/broker/context_capsule")
         self.declare_parameter("profiles_topic", "/profiles/summary")
         self.declare_parameter("perf_topic", "/llm/hdt_perf")
@@ -142,8 +144,6 @@ class HumanDigitalTwinNode(Node):
         self._last_robot_zone: Optional[str] = None
         self._active_human_id: Optional[str] = None   # "H1" or "H2"
 
-        # OpenAI client
-        self.client = OpenAI()
 
         # ROS I/O
         self.sub_capsule = self.create_subscription(
@@ -233,7 +233,11 @@ class HumanDigitalTwinNode(Node):
         # Trim trace length here if needed
         trace = cap.get("event_trace") or cap.get("trace") or []
         max_trace = 40
-        cap["event_trace"] = trace[-max_trace:]
+        if isinstance(trace, list):
+            cap["event_trace"] = trace[-max_trace:]
+        else:
+            # keep summaries as-is if not a list
+            cap["event_trace"] = trace
 
         # --- NEW: capture robot_zone from broker.world ---
         world = cap.get("world") or {}
@@ -324,26 +328,43 @@ class HumanDigitalTwinNode(Node):
             
                 self.get_logger().info("\n=== HDT PROMPT ===\n" + json.dumps(messages, indent=2))
             
-                resp = self.client.chat.completions.create(
-                    model=model_id,
-                    messages=messages,
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "HumanProfiles",
-                            "schema": PROFILES_SCHEMA,
+            
+                if "gpt-oss" in model_id:
+                    client = Groq()
+                        
+                    resp = client.chat.completions.create(
+                        model='openai/' + model_id,
+                        messages=messages,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "HumanProfiles",
+                                "schema": PROFILES_SCHEMA,
+                            },
                         },
-                    },
-                )
+                        reasoning_effort="medium",
+                        
+                    )
+                else:
+                    client = OpenAI()
+                    resp = client.chat.completions.create(
+                        model=model_id,
+                        messages=messages,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "HumanProfiles",
+                                "schema": PROFILES_SCHEMA,
+                            },
+                        },
+                    )
+                    
                 t1 = time.time()
                 lat_ms = (t1 - t0) * 1000.0
                 ok = True
 
-                
-                
-
                 content = resp.choices[0].message.content
-                self.get_logger().info("\n=== HDT LLM RAW RESPONSE ===\n" + content + "\n")
+                self.get_logger().info("\n=== HDT LLM RAW RESPONSE ===\n" + content + "\n" + "Latency: " + str(lat_ms) + '\n')
 
                 obj = json.loads(content)
                 

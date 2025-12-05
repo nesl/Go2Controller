@@ -1,8 +1,3 @@
-# skills.v2.yaml
-# Composite- and step-level `when` / `until` supported.
-# No base.search_person or new base primitives.
-# turn_search built from small relative movements (nav.move_relative).
-
 version: 2
 
 defaults:
@@ -15,18 +10,21 @@ skills:
 
   - name: tts.say
     kind: primitive
+    description: "Speak a short text utterance using the TTS pipeline."
     action: tts
     params:
       text: "{{ctx.text | default:'OK'}}"
 
   - name: gesture.greet
     kind: primitive
+    description: "Perform a simple greeting gesture toward nearby humans."
     action: gesture
     params:
       kind: "greet"
 
   - name: nav.move_relative
     kind: primitive
+    description: "Move the base by a relative azimuth (deg) and distance (m) from the current pose."
     action: move_relative
     params:
       azimuth_deg: "{{ctx.azimuth_deg | default:0}}"
@@ -34,6 +32,7 @@ skills:
 
   - name: nav.move_absolute
     kind: primitive
+    description: "Move the base to an absolute pose (x,y,yaw) in a given frame (usually 'map')."
     action: move_absolute
     params:
       frame: "{{ctx.frame | default:'map'}}"
@@ -43,12 +42,14 @@ skills:
 
   - name: db.query_top_beacons
     kind: primitive
+    description: "Ask the broker/DB for the top-N strongest beacons and store the result in ctx."
     action: query_beacons
     params:
       top_n: "{{ctx.top_n | default:3}}"
 
   - name: llm.check_speech
     kind: primitive
+    description: "Send the latest utterance to the LLM speech-check microservice for intent/labeling."
     action: llm_speech_check
     params:
       prompt: "{{ctx.prompt | default:''}}"
@@ -56,27 +57,26 @@ skills:
       text: "{{ctx.text | default:''}}"
       tag: "{{ctx.tag | default:'default_speech_check'}}"
 
-
   - name: vlm.run_query
     kind: primitive
+    description: "Send a prompt about the current camera frame to the VLM microservice."
     action: vlm_inference
     params:
       prompt: "{{ctx.prompt | default:''}}"
-      output_schema: "{{ctx.output_schema | default:''}}"   # optional but nice symmetry
+      output_schema: "{{ctx.output_schema | default:''}}"
       tag: "{{ctx.tag | default:'default_vlm'}}"
-      # you can keep 'mode' if you want, but it’s just metadata now
       mode: "{{ctx.mode | default:'generic'}}"
 
 
-
   # ─────────────────────────────
-  # STATE MACHINES (was: COMPOSITES)
+  # STATE MACHINES (COMPOSITES)
   # ─────────────────────────────
 
   # Turn search: rotate incrementally left and right using nav.move_relative
   # until either a presence is detected or the user interrupts (speech_final_any).
   - name: base.turn_search
     kind: state_machine
+    description: "Sweep left–right in place to visually search for humans or new stimuli."
     when: {}
     until:
       any:
@@ -116,6 +116,7 @@ skills:
   # Greet with presence; only speak if the person actually engages.
   - name: greet.with_presence
     kind: state_machine
+    description: "Wave to a detected human and offer help if they respond within a short window."
     when:
       all:
         - exists: pose_present_precise
@@ -152,18 +153,136 @@ skills:
         on_complete: null
 
 
-  # Beacon report: query DB then speak summary.
-  - name: beacons.report_top3
+
+
+  - name: sense.here
     kind: state_machine
+    description: "Stay idle and wait for a fixed duration; used as a cheap sensing/timeout segment."
+    when: {}
+    until: {}
+    initial_state: wait_only
+    states:
+      - id: wait_only
+        type: wait
+        wait_for:
+          any_of:
+            - rule_id: "sense_dummy"
+              within_ms: 5000
+        on_event: null
+        on_timeout: null
+
+
+  # ─────────────────────────────
+  # NEW SHORT-TERM / REACTIVE SKILLS
+  # ─────────────────────────────
+
+  - name: social.ack_name_ping
+    kind: state_machine
+    description: "Turn toward the last speaker and verbally acknowledge that Bob heard them."
+    when: {}
+    until: {}
+    initial_state: orient_toward_speaker
+    states:
+      - id: orient_toward_speaker
+        type: action
+        action:
+          use: nav.move_relative
+          with:
+            azimuth_deg: "{{ rule.speech_final_with_doa.azimuth_deg | default:0 }}"
+            dist_m: 0.0
+        on_complete: say_hello
+
+      - id: say_hello
+        type: action
+        action:
+          use: tts.say
+          with:
+            text: "Hi, I’m here and listening."
+        on_complete: done
+
+      - id: done
+        type: wait
+        wait_for:
+          any_of: []
+        on_event: null
+        on_timeout: null
+
+
+  - name: social.reply_greeting_and_ask
+    kind: state_machine
+    description: "Reply to a greeting and explicitly ask the human what they need."
+    when: {}
+    until: {}
+    initial_state: greet_back
+    states:
+      - id: greet_back
+        type: action
+        action:
+          use: tts.say
+          with:
+            text: "Hello! How can I help you?"
+        on_complete: wait_for_followup
+
+      - id: wait_for_followup
+        type: wait
+        wait_for:
+          any_of:
+            - rule_id: "speech_final_any"
+              within_ms: 6000
+        on_event: null
+        on_timeout: null
+
+
+  - name: social.greet_with_ping
+    kind: state_machine
+    description: "When human presence and a greeting co-occur, wave and greet them explicitly."
     when:
-      any:
-        - exists: speech_keyword
-          within_ms: 5000
-        - exists: speech_final_any
-          within_ms: 5000
-    until:
-      exists: speech_final_any
-      within_ms: 1
+      all:
+        - exists: human_ping_here
+          within_ms: 2500
+    until: {}
+    initial_state: gesture_then_greet
+    states:
+      - id: gesture_then_greet
+        type: action
+        action:
+          use: gesture.greet
+          with: {}
+        on_complete: say_hi
+
+      - id: say_hi
+        type: action
+        action:
+          use: tts.say
+          with:
+            text: "Hi! I see you here."
+        on_complete: null
+
+
+  - name: beacons.announce_strongest_here
+    kind: state_machine
+    description: "Announce the strongest beacon just observed by the BT proximity task."
+    when: {}
+    until: {}
+    initial_state: say_beacon
+    states:
+      - id: say_beacon
+        type: action
+        action:
+          use: tts.say
+          with:
+            text: >
+              "I’m sensing a strong beacon here,
+              object {{ rule.bt_rssi_seen.object_id | default:'unknown' }} with RSSI
+              {{ rule.bt_rssi_seen.rssi | default:'-inf' }}."
+        on_complete: null
+
+
+  - name: beacons.report_topn
+    kind: state_machine
+    description: "Query and report the top-N strongest beacons using DB-backed state."
+    when: {}
+    until: {}
     initial_state: query_db
     states:
       - id: query_db
@@ -171,7 +290,7 @@ skills:
         action:
           use: db.query_top_beacons
           with:
-            top_n: 3
+            top_n: "{{ ctx.top_n | default:3 }}"
         on_complete: speak
 
       - id: speak
@@ -179,24 +298,60 @@ skills:
         action:
           use: tts.say
           with:
-            text: "{{ctx.last_query_beacons_speech | default:'Beacon report complete.'}}"
+            text: "{{ ctx.last_query_beacons_speech | default:'I checked the nearby beacons.' }}"
         on_complete: null
 
 
-  - name: sense.here
+  - name: vlm.look_and_describe
     kind: state_machine
-    when: {}          # no gating; activates immediately when armed
-    until: {}         # no composite-level early stop
-    initial_state: wait_only
+    description: "Run a VLM query on the current scene and verbally describe what it sees."
+    when: {}
+    until: {}
+    initial_state: ask_vlm
     states:
-      - id: wait_only
+      - id: ask_vlm
+        type: action
+        action:
+          use: vlm.run_query
+          with:
+            prompt: "{{ ctx.prompt | default:'Describe what you see in front of me.' }}"
+            output_schema: "{{ ctx.output_schema | default:'' }}"
+            tag: "{{ ctx.tag | default:'scene_describe' }}"
+            mode: "{{ ctx.mode | default:'generic' }}"
+        on_complete: wait_answer
+
+      - id: wait_answer
         type: wait
         wait_for:
           any_of:
-            # This rule will never exist; it's just there to define the timeout.
-            - rule_id: "sense_dummy"
-              within_ms: 5000      # 5 seconds
-        on_event: null             # ignore events (there won't be any)
-        on_timeout: null           # no next state -> skill finishes
+            - rule_id: "vlm_scene_ready"
+              within_ms: 3000
+        on_event: say_scene
+        on_timeout: null
 
+      - id: say_scene
+        type: action
+        action:
+          use: tts.say
+          with:
+            text: >
+              "{{ rule.vlm_scene_ready.raw_text | default:'I could not interpret the scene.' }}"
+        on_complete: null
+
+
+  - name: nav.turn_to_speaker
+    kind: state_machine
+    description: "Rotate the base to face the direction of the last completed utterance."
+    when: {}
+    until: {}
+    initial_state: turn_once
+    states:
+      - id: turn_once
+        type: action
+        action:
+          use: nav.move_relative
+          with:
+            azimuth_deg: "{{ rule.speech_final_with_doa.azimuth_deg | default:0 }}"
+            dist_m: 0.0
+        on_complete: null
 

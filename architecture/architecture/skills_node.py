@@ -526,10 +526,31 @@ class SkillEngineV2:
         self.logger = logger
         self._active: List[SkillInstance] = []
         self.event_cb = event_cb  # function(event_dict) -> None
+        # NEW: skills that have thrown runtime errors in this process
+        self.bad_skills: set[str] = set()
 
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
+    
+    def _quarantine_skill(self, inst: SkillInstance, reason: str, exc: Exception | None = None):
+        name = inst.name
+        self.bad_skills.add(name)
+        if self.logger:
+            self.logger.error(
+                f"[SkillEngine] Quarantining skill '{name}' due to {reason}: {exc!r}"
+            )
+        # Emit an error event for observability
+        self._emit_event(
+            "skill_error",
+            inst,
+            {
+                "reason": reason,
+                "error": str(exc) if exc else "",
+            },
+        )
+
+    
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
 
@@ -695,6 +716,11 @@ class SkillEngineV2:
         if not s:
             raise KeyError(f"Unknown skill: {skill_name}")
 
+        if skill_name in getattr(self, "bad_skills", set()):
+            raise RuntimeError(
+                f"Skill '{skill_name}' is quarantined due to previous errors; refusing to arm."
+            )
+
         kind = s.get("kind")
         if kind != "state_machine":
             raise KeyError(f"Skill '{skill_name}' is not a state_machine (kind={kind})")
@@ -709,6 +735,8 @@ class SkillEngineV2:
             self.logger.info(f"[SkillEngine] Armed state_machine '{skill_name}' ctx={ctx}")
 
         return inst
+
+
         
     def _spawn_nested_child(self, parent: SkillInstance, skill_name: str, ctx: dict) -> StepHandle:
         """
@@ -914,163 +942,189 @@ class SkillEngineV2:
             if inst.done:
                 continue
 
-            skill = self.registry.get(inst.name) or {}
-            kind = skill.get("kind")
+            try:
+                skill = self.registry.get(inst.name) or {}
+                kind = skill.get("kind")
 
-            if kind != "state_machine":
-                # Should not happen, but guard anyway
-                inst.done = True
-                continue
+                if kind != "state_machine":
+                    # Should not happen, but guard anyway
+                    inst.done = True
+                    continue
 
-            comp_when = skill.get("when") or {}
-            comp_until = skill.get("until") or {}
+                comp_when = skill.get("when") or {}
+                comp_until = skill.get("until") or {}
 
-            # If not activated yet, wait for top-level "when"
-            if not inst.activated:
-                if _cond_pass(comp_when, self.rules, self.defaults_window_ms):
-                    inst.activated = True
-                    inst.started_ms = now_ms
+                # If not activated yet, wait for top-level "when"
+                if not inst.activated:
+                    if _cond_pass(comp_when, self.rules, self.defaults_window_ms):
+                        inst.activated = True
+                        inst.started_ms = now_ms
+                        if self.logger:
+                            self.logger.info(
+                                f"[SkillEngine] Activating state_machine '{inst.name}' "
+                                f"with ctx={inst.ctx}"
+                            )
+                        self._emit_event("skill_started", inst, {})
+
+                        if not inst.state_id:
+                            # Enter initial state
+                            init_id = skill.get("initial_state")
+                            st = self._find_state(skill, init_id)
+                            if not st and self.logger:
+                                self.logger.error(
+                                    f"[SkillEngine] Skill '{inst.name}' missing initial_state '{init_id}'"
+                                )
+                                # Quarantine this skill for future runs
+                                self._quarantine_skill(inst, "missing_initial_state", None)
+                                inst.done = True
+                                self._emit_event(
+                                    "skill_finished",
+                                    inst,
+                                    {"reason": "missing_initial_state"},
+                                )
+                                continue
+                            self._enter_state(inst, skill, st)
+                    else:
+                        # Still not activated
+                        continue
+
+                # Composite-level until: stop skill even if current state has not finished
+                if _cond_pass(comp_until, self.rules, self.defaults_window_ms, empty_means=False):
+                    # cancel running primitive if any
+                    if inst.handle is not None and not inst.handle.done():
+                        try:
+                            inst.handle.cancel()
+                        except Exception:
+                            pass
+                    inst.done = True
                     if self.logger:
                         self.logger.info(
-                            f"[SkillEngine] Activating state_machine '{inst.name}' "
-                            f"with ctx={inst.ctx}"
+                            f"[SkillEngine] Finished '{inst.name}' due to composite-level 'until'"
                         )
-                    self._emit_event("skill_started", inst, {})
+                    self._emit_event("skill_finished", inst, {"reason": "composite_until"})
+                    continue
 
-                    if not inst.state_id:
-                        # Enter initial state
-                        init_id = skill.get("initial_state")
-                        st = self._find_state(skill, init_id)
-                        if not st and self.logger:
-                            self.logger.error(
-                                f"[SkillEngine] Skill '{inst.name}' missing initial_state '{init_id}'"
+                # No current state? Nothing to do.
+                st = self._find_state(skill, inst.state_id)
+                if not st:
+                    inst.done = True
+                    # structural problem -> quarantine
+                    self._quarantine_skill(inst, "missing_state", None)
+                    self._emit_event("skill_finished", inst, {"reason": "no_state"})
+                    continue
+
+                st_type = st.get("type", "action")
+
+                # 1) Action states: wait for primitive handle to complete
+                if st_type == "action":
+                    if inst.handle is None:
+                        # We entered state but did not start primitive (should not happen)
+                        if self.logger:
+                            self.logger.warn(
+                                f"[SkillEngine] Skill '{inst.name}' state '{inst.state_id}' "
+                                "has no active handle; starting primitive now."
                             )
-                            inst.done = True
-                            self._emit_event(
-                                "skill_finished",
-                                inst,
-                                {"reason": "missing_initial_state"},
-                            )
-                            continue
                         self._enter_state(inst, skill, st)
-                else:
-                    # Still not activated
-                    continue
+                        continue
 
-            # Composite-level until: stop skill even if current state has not finished
-            if _cond_pass(comp_until, self.rules, self.defaults_window_ms, empty_means=False):
-                # cancel running primitive if any
-                if inst.handle is not None and not inst.handle.done():
-                    try:
-                        inst.handle.cancel()
-                    except Exception:
-                        pass
-                inst.done = True
-                if self.logger:
-                    self.logger.info(
-                        f"[SkillEngine] Finished '{inst.name}' due to composite-level 'until'"
-                    )
-                self._emit_event("skill_finished", inst, {"reason": "composite_until"})
-                continue
+                    if not inst.handle.done():
+                        # Still in progress
+                        continue
 
-            # No current state? Nothing to do.
-            st = self._find_state(skill, inst.state_id)
-            if not st:
-                inst.done = True
-                self._emit_event("skill_finished", inst, {"reason": "no_state"})
-                continue
-
-            st_type = st.get("type", "action")
-
-            # 1) Action states: wait for primitive handle to complete
-            if st_type == "action":
-                if inst.handle is None:
-                    # We entered state but did not start primitive (should not happen)
-                    # Start it now as a safety net.
                     if self.logger:
-                        self.logger.warn(
-                            f"[SkillEngine] Skill '{inst.name}' state '{inst.state_id}' "
-                            "has no active handle; starting primitive now."
+                        self.logger.info(
+                            f"[SkillEngine] Skill '{inst.name}' action state '{inst.state_id}' "
+                            "completed; selecting on_complete transition."
                         )
-                    
-                    self._enter_state(inst, skill, st)
+
+                    next_id = st.get("on_complete")
+                    self._transition_to(inst, skill, next_id)
                     continue
 
-                if not inst.handle.done():
-                    # Still in progress
+                # 2) Wait states: look for rule events or timeout
+                if st_type == "wait":
+                    wait_spec = st.get("wait_for") or {}
+                    any_of = wait_spec.get("any_of") or []
+
+                    # a) event fired?
+                    fired = False
+                    fired_rule = None
+                    for cond in any_of:
+                        rid = cond.get("rule_id")
+                        win = int(cond.get("within_ms") or self.defaults_window_ms)
+                        if rid and self.rules.exists(rid, win):
+                            fired = True
+                            fired_rule = rid
+                            break
+
+                    if fired:
+                        if self.logger:
+                            self.logger.info(
+                                f"[SkillEngine] Skill '{inst.name}' wait state '{inst.state_id}' "
+                                f"event fired (rule='{fired_rule}'); resolving branches/on_event."
+                            )
+                        next_id = self._resolve_wait_next_state(st, fired_rule)
+                        self._transition_to(inst, skill, next_id)
+                        continue
+
+                    # b) timeout?
+                    if any_of:
+                        max_wait = max(int(c.get("within_ms") or self.defaults_window_ms) for c in any_of)
+                    else:
+                        max_wait = self.defaults_window_ms
+
+                    if now_ms - inst.state_started_ms >= max_wait:
+                        if self.logger:
+                            self.logger.info(
+                                f"[SkillEngine] Skill '{inst.name}' wait state '{inst.state_id}' "
+                                f"timed out after {max_wait} ms; transitioning via on_timeout."
+                            )
+                        next_id = st.get("on_timeout")
+                        self._transition_to(inst, skill, next_id)
+                        continue
+
+                    # still waiting
                     continue
 
-                # Primitive finished -> choose transition
+                # 3) Unknown state type -> finish + quarantine
                 if self.logger:
-                    self.logger.info(
-                        f"[SkillEngine] Skill '{inst.name}' action state '{inst.state_id}' "
-                        "completed; selecting on_complete transition."
+                    self.logger.warn(
+                        f"[SkillEngine] Skill '{inst.name}' state '{inst.state_id}' has unknown type '{st_type}'"
                     )
+                inst.done = True
+                self._quarantine_skill(inst, "bad_state_type", None)
+                self._emit_event("skill_finished", inst, {"reason": "bad_state_type"})
 
-                # Primitive finished -> choose transition
-                next_id = st.get("on_complete")
+            except Exception as e:
+                # RUNTIME ERROR: quarantine for future runs,
+                # but for THIS instance try to advance to a reasonable next state.
+                if self.logger:
+                    self.logger.error(
+                        f"[SkillEngine] Runtime error in skill '{inst.name}' "
+                        f"state='{inst.state_id}': {e!r}"
+                    )
+                self._quarantine_skill(inst, "runtime_exception", e)
+
+                # Try to move to "next" state instead of killing the instance
+                skill = self.registry.get(inst.name) or {}
+                st = self._find_state(skill, inst.state_id)
+                st_type = st.get("type", "action") if st else "action"
+
+                next_id = None
+                if st_type == "action":
+                    # Prefer explicit on_failure, else fall back to on_complete
+                    next_id = st.get("on_failure") or st.get("on_complete")
+                elif st_type == "wait":
+                    # Prefer timeout path, else generic event path
+                    next_id = st.get("on_timeout") or st.get("on_event")
+
+                # If we couldn't find anything, finishing is still safe
                 self._transition_to(inst, skill, next_id)
-                continue
-
-            # 2) Wait states: look for rule events or timeout
-            if st_type == "wait":
-                wait_spec = st.get("wait_for") or {}
-                any_of = wait_spec.get("any_of") or []
-
-                # a) event fired?
-                fired = False
-                fired_rule = None
-                for cond in any_of:
-                    rid = cond.get("rule_id")
-                    win = int(cond.get("within_ms") or self.defaults_window_ms)
-                    if rid and self.rules.exists(rid, win):
-                        fired = True
-                        fired_rule = rid
-                        break
-
-                if fired:
-                    if self.logger:
-                        self.logger.info(
-                            f"[SkillEngine] Skill '{inst.name}' wait state '{inst.state_id}' "
-                            f"event fired (rule='{fired_rule}'); resolving branches/on_event."
-                        )
-
-                    # NEW: use branches if present, else fall back to on_event
-                    next_id = self._resolve_wait_next_state(st, fired_rule)
-                    self._transition_to(inst, skill, next_id)
-                    continue
-
-
-                # b) timeout?
-                if any_of:
-                    max_wait = max(int(c.get("within_ms") or self.defaults_window_ms) for c in any_of)
-                else:
-                    max_wait = self.defaults_window_ms
-
-                if now_ms - inst.state_started_ms >= max_wait:
-                    if self.logger:
-                        self.logger.info(
-                            f"[SkillEngine] Skill '{inst.name}' wait state '{inst.state_id}' "
-                            f"timed out after {max_wait} ms; transitioning via on_timeout."
-                        )
-                    next_id = st.get("on_timeout")
-                    self._transition_to(inst, skill, next_id)
-                    continue
-
-                # still waiting
-                continue
-
-
-            # 3) Unknown state type -> finish
-            if self.logger:
-                self.logger.warn(
-                    f"[SkillEngine] Skill '{inst.name}' state '{inst.state_id}' has unknown type '{st_type}'"
-                )
-            inst.done = True
-            self._emit_event("skill_finished", inst, {"reason": "bad_state_type"})
 
         # prune finished instances
         self._active = [i for i in self._active if not i.done]
+
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 #                          ROS RulesView + Orchestrator
@@ -1400,6 +1454,12 @@ class SkillsAgent(Node):
                 yaml_text = yaml.safe_dump(merged)
                 self.skill_engine.load_from_string(yaml_text)
 
+                # NEW: clear quarantines on reload (new definitions)
+                if hasattr(self.skill_engine, "bad_skills"):
+                    self.skill_engine.bad_skills.clear()
+                    self.get_logger().info("[SkillEngine] Cleared quarantined skills on reload.")
+
+
                 # update mtimes
                 self._skills_base_mtime = os.path.getmtime(self.skills_base_path) if os.path.isfile(self.skills_base_path) else None
                 self._skills_comp_mtime = os.path.getmtime(self.skills_composite_path) if os.path.isfile(self.skills_composite_path) else None
@@ -1451,7 +1511,6 @@ class SkillsAgent(Node):
         self.skill_engine.run(name, ctx or {})
 
 
-
     # Topic: /skills/execute
     def _on_execute_msg(self, msg: StringMsg):
         try:
@@ -1463,13 +1522,25 @@ class SkillsAgent(Node):
         try:
             name = str(obj["skill"])
             ctx  = obj.get("ctx") or {}
+
+            # NEW: orchestrator explicitly requested this skill → reset quarantine for it
+            if hasattr(self.skill_engine, "bad_skills"):
+                if name in self.skill_engine.bad_skills:
+                    self.get_logger().info(
+                        f"/skills/execute: clearing quarantine for skill '{name}' "
+                        f"due to explicit orchestrator request."
+                    )
+                    self.skill_engine.bad_skills.discard(name)
+
             self.skill_engine.arm(name, ctx)   # ← arm, don’t run once
-            self.get_logger().info(f"/skills/execute armed '{name}' (active={self.skill_engine.active_count()})")
+            self.get_logger().info(
+                f"/skills/execute armed '{name}' "
+                f"(active={self.skill_engine.active_count()})"
+            )
         except KeyError:
             self.get_logger().warn("execute: expected key 'skill'")
         except Exception as e:
             self.get_logger().error(f"execute error: {e}")
-
 
 
     # Topic: /skills/plan_req -> reply on /skills/plan_result

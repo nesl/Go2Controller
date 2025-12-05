@@ -59,6 +59,9 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'task_registry_path': os.path.join(pkg_share, 'config', 'task_registry.yaml'),
+                'model': 'gpt-4.1-nano',
+                'llm_enabled': True,
+                'event_summary_model': 'gpt-oss-20b'
             }]
         ),
         Node(
@@ -67,7 +70,8 @@ def generate_launch_description():
             name='planner_node',
             output='screen',
             parameters=[{
-                
+                'llm_enabled': True,
+                'model': 'gpt-5-nano'
             }]
         ),
         Node(
@@ -81,6 +85,7 @@ def generate_launch_description():
                 'registry_path': os.path.join(pkg_share, 'config', 'task_registry.yaml'),
                 'rules_path':    RULES_DYNAMIC_PATH,
                 'rules_init_path':    os.path.join(pkg_share, 'config', 'rules_init.yaml'),
+                'model': 'gpt-5-nano',
             }]
         ),
 
@@ -96,6 +101,19 @@ def generate_launch_description():
                 'human_ids': ['H1', 'H2'],
                 'update_period_s': 2.0,
                 'enabled': True,
+                'llm_enabled': True,
+                'model': 'gpt-4.1-nano',
+            }]
+        ),
+        
+        Node(
+            package='architecture',
+            executable='router_node',   # adjust if your console_script name differs
+            name='router_node',
+            output='screen',
+            parameters=[{
+                'model': 'gpt-oss-120b',
+                'llm_enabled': False,
             }]
         ),
     ])

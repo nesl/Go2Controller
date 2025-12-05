@@ -21,6 +21,7 @@ from .http_client import HttpClient, WebRTCHttpError
 from .data_decoder import WebRTCDataDecoder, DataDecodingError
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class Go2ConnectionError(Exception):
@@ -223,7 +224,7 @@ class Go2Connection:
                 "type": sdp_offer.type,
                 "token": self.token
             }
-            
+            logger.info(f"============SDP=====================\n{self.pc.localDescription.sdp}")
             new_sdp = json.dumps(sdp_offer_json)
             
             # Step 2: Get robot's public key
@@ -240,7 +241,7 @@ class Go2Connection:
                 data1 = decoded_json.get('data1')
                 if not data1:
                     raise Go2ConnectionError("No data1 field in public key response")
-                
+                                
                 # Extract the public key from 'data1'
                 public_key_pem = data1[10:len(data1)-10]
                 path_ending = PathCalculator.calc_local_path_ending(data1)

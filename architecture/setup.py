@@ -31,7 +31,8 @@ setup(
             'broker_node = architecture.broker_node:main',
             'planner_node = architecture.planner_node:main',
             'orchestrator_node = architecture.orchestrator_node:main',
-            'hdt_node = architecture.hdt:main'
+            'hdt_node = architecture.hdt:main',
+            'router_node = architecture.router_node:main',
         ],
     },
 )

@@ -20,7 +20,7 @@ from jsonschema import validate, ValidationError
 import yaml  # NEW
 from rclpy.parameter import Parameter          # NEW
 from rcl_interfaces.msg import SetParametersResult  # NEW
-
+from groq import Groq
 
 # LLM reply must be STRICT JSON like: {"sql":"SELECT ...", "params": {...}, "purpose":"..."}
 LLM_SQL_SCHEMA = {
@@ -40,6 +40,16 @@ LLM_SQL_SCHEMA = {
         "purpose": {
             "type": "string",
         },
+    },
+    "additionalProperties": False,
+}
+
+
+EVENT_SUMMARY_SCHEMA = {
+    "type": "object",
+    "required": ["summary"],
+    "properties": {
+        "summary": {"type": "string"},
     },
     "additionalProperties": False,
 }
@@ -107,9 +117,9 @@ class BrokerNode(Node):
         # Optional: mock LLM for offline dev (pass JSON {"sql": "...", "params": {...}, "purpose": "..."} in param)
         self.declare_parameter('llm_mock_json', '')
         
-        self.declare_parameter("llm_model", "gpt-5-nano")
-        self.client = OpenAI()
-        self.llm_model = self.get_parameter("llm_model").get_parameter_value().string_value
+        self.declare_parameter("model", "gpt-5-nano")
+
+        self.model = self.get_parameter("model").get_parameter_value().string_value
 
         self.declare_parameter("llm_perf_topic", "/llm/broker_perf")
         self.llm_perf_topic = (
@@ -138,6 +148,23 @@ class BrokerNode(Node):
             .get_parameter_value()
             .string_value
         )
+        
+        # --- Event-trace summarizer parameters ---
+        self.declare_parameter("event_summary_enabled", True)
+        self.declare_parameter("event_summary_model", "gpt-4o-mini")  # fast, cheap, small context
+
+        self.event_summary_enabled = (
+            self.get_parameter("event_summary_enabled")
+                .get_parameter_value()
+                .bool_value
+        )
+
+        self.event_summary_model = (
+            self.get_parameter("event_summary_model")
+                .get_parameter_value()
+                .string_value
+        )
+
         
         self.task_registry_path = (
             self.get_parameter("task_registry_path")
@@ -544,14 +571,23 @@ class BrokerNode(Node):
           ros2 param set /broker_node llm_enabled false
         """
         for p in params:
-            if p.name == "llm_model" and p.type_ == Parameter.Type.STRING:
-                self.llm_model = p.value
-                self.get_logger().info(f"[broker] llm_model changed to: {self.llm_model}")
+            if p.name == "model" and p.type_ == Parameter.Type.STRING:
+                self.model = p.value
+                self.get_logger().info(f"[broker] model changed to: {self.model}")
 
             # NEW: enable / disable broker LLM
             if p.name == "llm_enabled" and p.type_ == Parameter.Type.BOOL:
                 self.llm_enabled = bool(p.value)
                 self.get_logger().info(f"[broker] llm_enabled changed to: {self.llm_enabled}")
+
+            if p.name == "event_summary_enabled" and p.type_ == Parameter.Type.BOOL:
+                self.event_summary_enabled = bool(p.value)
+                self.get_logger().info(f"[broker] event_summary_enabled = {self.event_summary_enabled}")
+
+            if p.name == "event_summary_model" and p.type_ == Parameter.Type.STRING:
+                self.event_summary_model = p.value
+                self.get_logger().info(f"[broker] event_summary_model = {self.event_summary_model}")
+
 
         return SetParametersResult(successful=True, reason="ok")
 
@@ -577,7 +613,7 @@ class BrokerNode(Node):
 
         payload = {
             "node": "broker",
-            "model": self.llm_model,
+            "model": self.model,
             "lat_ms": lat_ms,
             "ok": bool(ok),
             "phase": phase,
@@ -880,6 +916,7 @@ class BrokerNode(Node):
         elif rule == self.human3d_rule_id:
             self._ingest_human3d(data, o)
 
+        '''
         # Proactive: if this event is a planning trigger, immediately run initial LLM-SQL
         if trig_type in ("new_object", "finish_or_fail", "human_command", "idle", "presence", "planner_trigger"):
             try:
@@ -889,7 +926,7 @@ class BrokerNode(Node):
                 self._emit_sql_debug(pack)
             except Exception as e:
                 self.get_logger().warn(f"proactive run failed: {e}")
-
+        '''
 
     def _on_comp_event(self, msg: StringMsg):
         try:
@@ -936,6 +973,7 @@ class BrokerNode(Node):
         if zone is not None:
             self._current_trigger["zone"] = zone  # optional but handy
 
+        '''
         # (optional) proactive run
         if trig_type in ("new_object", "finish_or_fail", "human_command", "planner_trigger"):
             try:
@@ -947,7 +985,7 @@ class BrokerNode(Node):
                 self._emit_sql_debug(pack)
             except Exception as e:
                 self.get_logger().warn(f"proactive run (composite) failed: {e}")
-
+        '''
 
 
     def _ingest_human3d(self, data: dict, envelope: dict):
@@ -1097,6 +1135,81 @@ class BrokerNode(Node):
         with self._lock:
             self._contam_cache[key] = {"ts": now, "contaminated": contaminated, "probability": probability}
 
+    def _summarize_event_trace(self, events: List[dict]) -> Optional[str]:
+        """
+        Summarize a chronological event list (oldest -> newest) into
+        a short one-sentence summary using the existing _chat_json helper.
+        """
+        if not events:
+            return None
+
+        # Keep only the most recent N events in the prompt
+        tail = events[-10:]
+        try:
+            tail_json = json.dumps(tail, ensure_ascii=False)
+        except Exception as e:
+            self.get_logger().warn(f"broker: failed to encode event_trace for summary: {e}")
+            return None
+
+        # If LLM summarization is disabled, do a trivial heuristic
+        if not getattr(self, "event_summary_enabled", True):
+            last = tail[-1]
+            text = last.get("text")
+            skill = last.get("skill")
+            zone = last.get("zone")
+            if text:
+                if zone:
+                    return f'Latest human utterance in zone {zone}: "{text}"'
+                else:
+                    return f'Latest human utterance: "{text}"'
+            if skill:
+                return f"Latest skill event: {skill} ({last.get('kind', '')})"
+            return None
+
+        # LLM-based summary via _chat_json
+        try:
+            system_msg = (
+                "You summarize event traces for a mobile robot.\n"
+                "- You receive an \"event_trace\" which is a JSON array of events.\n"
+                "- Each event may include fields like: rule, rule_id, ts, text, skill, kind, zone, etc.\n\n"
+                "Your task:\n"
+                "- Produce ONE SHORT SENTENCE summarizing the most important facts.\n"
+                "- Treat the LAST events as more important (they are more recent).\n"
+                "- Output should be natural language, but we will wrap it in JSON with key 'summary'.\n"
+                "- If you mention human speech, briefly paraphrase it but keep the intent and key phrases.\n"
+            )
+
+
+            user_msg = (
+                'Here is the event_trace (chronological, oldest first):\n'
+                f'{tail_json}\n\n'
+                "Remember: the last element is the most recent event.\n"
+                "Return a JSON object: {\"summary\": \"one short sentence\"}."
+            )
+
+            obj = self._chat_json(
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.2,
+                max_tokens=80,
+                retries=1,
+                schema=EVENT_SUMMARY_SCHEMA,
+                schema_name="EventSummary",
+                model=self.event_summary_model,
+                perf_phase="event_summary",
+            )
+
+            summary = (obj.get("summary") or "").strip()
+            return summary or None
+
+        except Exception as e:
+            self.get_logger().warn(f"broker: event summary LLM failed: {e}")
+            return None
+
+
+
     # ------------------------------ LLM SQL layer ------------------------------
     # Strict validators
     _SQL_BAD = re.compile(r'(--|/\*|\*/|;|\b(ATTACH|DETACH|ALTER|DROP|CREATE|INSERT|UPDATE|DELETE|REPLACE|VACUUM|PRAGMA|BEGIN|END|COMMIT|ROLLBACK)\b)', re.I)
@@ -1170,22 +1283,40 @@ class BrokerNode(Node):
             cc = dict(zip(["to_pick","in_basket","delivered_clean","delivered_contaminated"], counts))
         else:
             cc = {}
-        basket = [r[0] for r in self.conn.execute(
-            "SELECT node_id FROM nodes_state WHERE in_basket=1 LIMIT 8").fetchall()]
 
-        # NEW: robot_zone from last basic event (may be None)
+        basket = [r[0] for r in self.conn.execute(
+            "SELECT node_id FROM nodes_state WHERE in_basket=1 LIMIT 8"
+        ).fetchall()]
+
+        # NEW: robot_zone from last basic/composite event (may be None)
         robot_zone = self._last_robot_zone
 
+        # --- NEW: compute raw trace and optional summary ---
+        raw_trace = list(self._event_trace)[-20:]  # last N events
+
+        summary_text = None
+        if raw_trace and getattr(self, "event_summary_enabled", True):
+            try:
+                summary_text = self._summarize_event_trace(raw_trace)
+            except Exception as e:
+                self.get_logger().warn(
+                    f"[broker] event_trace summarization failed; using raw trace. Error: {e}"
+                )
+                summary_text = None
+
+        # If we have a summary, expose THAT as event_trace; keep raw under event_trace_raw
         return {
             "trigger": self._current_trigger,
             "profiles": self._profiles,
-            "event_trace": list(self._event_trace)[-20:],
+            "event_trace": summary_text if summary_text is not None else raw_trace,
+            "event_trace_raw": raw_trace,  # for debugging / offline analysis
             "world": {
                 "backlog_counts": cc,
                 "basket": basket,
-                "robot_zone": robot_zone,   # ← HDT & planner use this
-            }
+                "robot_zone": robot_zone,
+            },
         }
+
 
     def _ws_id(self) -> str:
         # one session per trigger time (coarse); override with planner-provided ws later if needed
@@ -1259,82 +1390,97 @@ class BrokerNode(Node):
         ]
 
 
-    def _chat_json(self, messages, temperature=0.2, max_tokens=300, retries=1):
-        """Call OpenAI chat.completions and enforce JSON + schema, with latency telemetry."""
+    def _chat_json(
+        self,
+        messages,
+        temperature: float = 0.2,
+        max_tokens: int = 300,
+        retries: int = 1,
+        schema: Optional[dict] = None,
+        schema_name: str = "BrokerSQL",
+        model: Optional[str] = None,
+        perf_phase: str = "sql_plan",
+    ):
+        """
+        Call chat.completions with JSON-SCHEMA response_format and validate output.
+
+        - `schema`: JSON schema to enforce (defaults to LLM_SQL_SCHEMA).
+        - `schema_name`: name used in response_format.
+        - `model`: override model (defaults to self.model).
+        - `perf_phase`: label for latency telemetry (e.g. 'sql_plan', 'event_summary').
+        """
         last_exc = None
+        used_schema = schema or LLM_SQL_SCHEMA
+        used_model = model or self.model
+
         for attempt in range(retries + 1):
             t0 = time.time()
             ok_api = False
             self.get_logger().info("\n=== LLM PROMPT ===\n" + json.dumps(messages, indent=2))
-            resp = self.client.chat.completions.create(
-                model=self.llm_model,
-                messages=messages,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "BrokerSQL",
-                        "schema": LLM_SQL_SCHEMA,
-                    },
-                },
-            )
-            dt_ms = int((time.time() - t0) * 1000)
-            ok_api = True
 
-            content = resp.choices[0].message.content
-            obj = json.loads(content)
-            validate(instance=obj, schema=LLM_SQL_SCHEMA)
-
-            self.get_logger().info(f"\n=== LLM RAW RESPONSE ===\n{content}\n")
-
-            # success → publish perf once and return
-            self._publish_llm_perf(dt_ms, ok=True, phase="sql_plan")
-            return obj
-            '''
             try:
-                resp = self.client.chat.completions.create(
-                    model=self.llm_model,
-                    messages=messages,
-                    max_completion_tokens=max_tokens,
-                    response_format={"type": "json_object"},
-                    temperature=temperature,
-                )
+                if "gpt-oss" in used_model:
+                    client = Groq()
+                    resp = client.chat.completions.create(
+                        model="openai/" + used_model,
+                        messages=messages,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": schema_name,
+                                "schema": used_schema,
+                            },
+                        },
+                        reasoning_effort="medium",
+                    )
+                else:
+                    client = OpenAI()
+                    resp = client.chat.completions.create(
+                        model=used_model,
+                        messages=messages,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": schema_name,
+                                "schema": used_schema,
+                            },
+                        },
+                    )
+
                 dt_ms = int((time.time() - t0) * 1000)
                 ok_api = True
 
                 content = resp.choices[0].message.content
                 obj = json.loads(content)
-                validate(instance=obj, schema=LLM_SQL_SCHEMA)
-                self.get_logger().info("\n=== LLM PROMPT ===\n" + json.dumps(messages, indent=2))
-                self.get_logger().info(f"\n=== LLM RAW RESPONSE ===\n{content}\n")
+                validate(instance=obj, schema=used_schema)
 
-                # success → publish perf once and return
-                self._publish_llm_perf(dt_ms, ok=True, phase="sql_plan")
+                self.get_logger().info(
+                    f"\n=== LLM RAW RESPONSE ({schema_name}) ===\n{content}\nLatency: {str(dt_ms)}\n"
+                )
+
+                # publish perf (using the broker model, not used_model, for now)
+                # If you want per-task metrics, you could add a separate publisher.
+                self._publish_llm_perf(dt_ms, ok=True, phase=perf_phase)
                 return obj
 
             except (json.JSONDecodeError, ValidationError) as e:
-                # API call worked but schema/json was bad
+                # schema/json error
                 dt_ms = int((time.time() - t0) * 1000)
-                self._publish_llm_perf(dt_ms, ok=False, phase="sql_plan_schema")
+                self._publish_llm_perf(dt_ms, ok=False, phase=perf_phase + "_schema")
                 last_exc = e
                 messages = messages + [{
                     "role": "system",
-                    "content": "Return ONLY valid JSON per the schema. No prose."
+                    "content": "Return ONLY valid JSON per the given schema. No prose.",
                 }]
-                
-
-                
                 continue
 
             except Exception as e:
-                # network / API error
                 dt_ms = int((time.time() - t0) * 1000)
-                self._publish_llm_perf(dt_ms, ok=False, phase="sql_plan_api")
+                self._publish_llm_perf(dt_ms, ok=False, phase=perf_phase + "_api")
                 last_exc = e
-                # no point retrying if it’s a hard error like auth/connection, but keep current behavior:
                 continue
-            '''
-        # last-resort fallback handled by caller
-        raise ValueError(f"LLM did not return valid JSON: {last_exc}")
+
+        raise ValueError(f"LLM did not return valid JSON ({schema_name}): {last_exc}")
 
 
     

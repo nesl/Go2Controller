@@ -106,6 +106,15 @@ class EventLayerNode(Node):
         self.declare_parameter('enabled', True)
         self.declare_parameter('rules_init_path', '')
 
+        # NEW: treat rules with this prefix as planner one-shot triggers
+        self.declare_parameter('planner_trigger_prefix', 'trigger_')
+        
+        # NEW: trigger rule ids that must NEVER be one-shot
+        # default includes trigger_speech_final
+        self.declare_parameter(
+            'always_on_trigger_ids_json',
+            '["trigger_speech_final"]'
+        )
 
         # NEW: paths to skills YAML (same idea as SkillsAgent)
         self.declare_parameter('skills_base_path', '')
@@ -120,6 +129,20 @@ class EventLayerNode(Node):
         self.rescan_period = float(self.get_parameter('rescan_period_s').value)
         self.enabled       = bool(self.get_parameter('enabled').value)
         self.rules_init_path = self.get_parameter('rules_init_path').get_parameter_value().string_value
+
+        # NEW
+        self.planner_trigger_prefix = (
+            self.get_parameter('planner_trigger_prefix')
+            .get_parameter_value()
+            .string_value
+        )
+
+        # NEW: parse always-on trigger ids
+        try:
+            ids_raw = self.get_parameter('always_on_trigger_ids_json').get_parameter_value().string_value
+            self.always_on_triggers = set(json.loads(ids_raw) or [])
+        except Exception:
+            self.always_on_triggers = {"trigger_speech_final"}
 
         # NEW: skills paths
         self.skills_base_path = self.get_parameter('skills_base_path').get_parameter_value().string_value
@@ -137,6 +160,8 @@ class EventLayerNode(Node):
         self.pub_basic = self.create_publisher(StringMsg, '/events/basic', 100)
         self.pub_comp  = self.create_publisher(StringMsg, '/events/composite', 100)
 
+        self.rules_status_pub = self.create_publisher(StringMsg, '/rules/status', 10)
+
         # runtime
         self._subs = {}
         self.rules_all = []
@@ -144,6 +169,8 @@ class EventLayerNode(Node):
         self._rule_state = {}     # rule_id -> bool (last satisfied)
         self._last_emit_ts = {}   # rule_id -> float (optional diag)
         self._edge_states = {}     # <-- ADD THIS
+        self.bad_rules = set()     # <-- ADD THIS
+        self._one_shot_fired = set()
         
         # NEW: maps for skill → rule deps etc.
         self._skill_rule_deps = {}      # composite_name -> set(rule_ids)
@@ -233,6 +260,43 @@ class EventLayerNode(Node):
         tf_ts = stamp.sec + stamp.nanosec * 1e-9
 
         return float(t.x), float(t.y), float(yaw), tf_ts
+
+
+    # ---------- one-shot (planner trigger) helpers ----------
+
+    def _is_one_shot_candidate(self, rule: dict) -> bool:
+        """
+        A rule is 'one-shot' if:
+          - YAML says one_shot: true, OR
+          - its id starts with planner_trigger_prefix.
+        """
+        rid = str(rule.get("id") or "")
+        if not rid:
+            return False
+
+        # NEW: some triggers must never be one-shot
+        if rid in getattr(self, "always_on_triggers", set()):
+            return False
+
+        if bool(rule.get("one_shot", False)):
+            return True
+
+        if self.planner_trigger_prefix and rid.startswith(self.planner_trigger_prefix):
+            return True
+
+        return False
+
+    def _has_one_shot_fired(self, rid: str) -> bool:
+        return rid in self._one_shot_fired
+
+    def _mark_one_shot_fired(self, rid: str):
+        """
+        Remember that this one-shot rule has fired; all future evaluations
+        (basic & composite) will ignore it.
+        """
+        self._one_shot_fired.add(str(rid))
+        self.get_logger().info(f"EventLayer: one-shot rule '{rid}' fired; disabling further events.")
+
 
 
     def _reset_rules_for_ids(self, rule_ids: set[str] | list[str]):
@@ -476,7 +540,9 @@ class EventLayerNode(Node):
 
         # NEW: fast lookup by id
         self._rules_by_id = {str(r.get("id")): r for r in self.rules_all if "id" in r}
+        self.bad_rules.clear()
 
+        self._one_shot_fired = set()    
 
         # Build desired topics from basic rules (type not composite)
         self.desired_topics = {}
@@ -497,6 +563,33 @@ class EventLayerNode(Node):
         self._reconcile_node_services()
         
 
+    def _quarantine_rule(self, rid: str, reason: str, exc: Exception | None, rtype: str):
+        """
+        Mark a rule as bad in this process and emit a status event so the
+        orchestrator (or any watcher) can remove it from rules.yaml.
+        rtype: "basic" | "composite"
+        """
+        rid = str(rid)
+        self.bad_rules.add(rid)
+        err_str = str(exc) if exc else ""
+        self.get_logger().error(
+            f"Quarantining {rtype} rule '{rid}' due to {reason}: {err_str}"
+        )
+
+        evt = {
+            "kind": "rule_error",
+            "rule_id": rid,
+            "rule_type": rtype,
+            "reason": reason,
+            "error": err_str,
+            "ts": self._now(),
+        }
+        try:
+            self.rules_status_pub.publish(StringMsg(data=json.dumps(evt)))
+        except Exception as e2:
+            self.get_logger().warn(
+                f"Failed to publish rule_error for '{rid}': {e2}"
+            )
 
 
 
@@ -814,16 +907,26 @@ class EventLayerNode(Node):
             if r.get("task") != task or r.get("output") != output:
                 continue
 
+            rid = str(r.get("id") or "")
+            if not rid:
+                continue
+
+            # NEW: skip quarantined rules
+            if rid in self.bad_rules:
+                continue
+
             expr = r.get("expr", "")
             try:
                 ok = bool(safe.eval(expr, ctx))
             except Exception as e:
-                self.get_logger().warn(
-                    f"Rule {r.get('id')} expr error: {e}, context {ctx}, task {task}, output {output}"
-                )
+                # NEW: quarantine on expression error
+                self._quarantine_rule(rid, "expr_error_basic", e, "basic")
                 continue
-
-            rid = r["id"]
+            
+            # NEW: if this rule is one-shot and has already fired, never evaluate again
+            if self._has_one_shot_fired(rid):
+                continue
+                
             prev = self._rule_state.get(rid, False)
             state = self._edge_states.setdefault(rid, EdgeState(active=prev))
 
@@ -893,6 +996,12 @@ class EventLayerNode(Node):
 
                 self._publish_basic(rid, payload)
                 self._last_emit_ts[rid] = now
+
+
+                # NEW: if this is a one-shot rule and we just fired an ON event,
+                # mark it so it never fires again.
+                if active_flag and self._is_one_shot_candidate(r):
+                    self._mark_one_shot_fired(rid)
 
 
             
@@ -1191,21 +1300,35 @@ class EventLayerNode(Node):
         for r in self.rules_enabled:
             if r.get("type") != "composite":
                 continue
+
+            rid = str(r.get("id") or "")
+            if not rid:
+                continue
+
+            # NEW: skip quarantined rules
+            if rid in self.bad_rules:
+                continue
+
+            # NEW: skip composites that are one-shot and already fired
+            if self._has_one_shot_fired(rid):
+                continue
+
             expr = r.get("expr", "")
             try:
                 ok = bool(safe.eval(expr, {}))
             except Exception as e:
-                self.get_logger().warn(f"Composite {r.get('id')} expr error: {e}")
+                # NEW: quarantine this composite rule on error
+                self._quarantine_rule(rid, "expr_error_composite", e, "composite")
                 continue
+
             if ok:
-                # NEW: attach current robot zone (and optionally pose) to composite events
+                # existing zone / composite event publishing logic...
                 zone = "unknown"
                 try:
                     pose_map = self._lookup_robot_pose_map()
                     if pose_map is not None:
                         rx, ry, ryaw, rts = pose_map
                         zone = self._zone_from_xy(rx, ry)
-                    # if pose_map is None, we leave zone="unknown"
                 except Exception as e:
                     self.get_logger().debug(f"Composite zone lookup failed: {e}")
 
@@ -1214,9 +1337,13 @@ class EventLayerNode(Node):
                     "rule": r["id"],
                     "expr": expr,
                     "ts": now,
-                    "zone": zone,        # ← NEW
+                    "zone": zone,
                 }
                 self.pub_comp.publish(StringMsg(data=json.dumps(evt)))
+
+                # NEW: mark one-shot composite triggers as fired
+                if self._is_one_shot_candidate(r):
+                    self._mark_one_shot_fired(rid)
 
 
         # 2) Edge rule timeouts → synthesize OFF when no hit for window
@@ -1229,6 +1356,11 @@ class EventLayerNode(Node):
                 continue
 
             rid = str(r["id"])
+            
+            # NEW: for one-shot rules, once they fired, don't bother creating OFF events
+            if self._has_one_shot_fired(rid):
+                continue
+            
             state = self._edge_states.get(rid)
             if not state or not state.active:
                 continue

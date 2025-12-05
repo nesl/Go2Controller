@@ -19,6 +19,7 @@ from std_srvs.srv import Trigger
 
 from openai import OpenAI
 from jsonschema import validate, ValidationError
+from groq import Groq
 
 # ---------- JSON Schemas ----------
 PLAN_SCHEMA = {
@@ -41,7 +42,7 @@ PLAN_SCHEMA = {
         },
         "plan_doc": {"type": "string"}
     },
-    "additionalProperties": False
+    "additionalProperties": True
 }
 
 NEEDS_SCHEMA = {
@@ -70,7 +71,7 @@ NEEDS_SCHEMA = {
 # ---------- Prompt snippets ----------
 SYSTEM_PLAN = (
 """
-You are the HIGH-LEVEL PLANNER for a mobile robot collaborating with two humans across areas A/B.
+You are the HIGH-LEVEL PLANNER for a mobile robot called Bob, collaborating with two humans across areas A/B.
 Objective: find all Bluetooth-tagged objects and place each into the correct bin (clean vs contaminated).
 Inputs:
  - ContextCapsule (trigger, budgets, recent event trace, phase/goals, allowed DB objects and example rows the broker can query)
@@ -239,8 +240,6 @@ class PlannerNode(Node):
         self._profiles: Dict[str, Any] = {}             # last profiles summary
         self._ws_id = 0                                 # simple counter for iterations
 
-        # --- OpenAI client ---
-        self.client = OpenAI()
 
         # --- ROS I/O ---
         self.sub_facts = self.create_subscription(StringMsg, self.facts_topic, self._on_facts, 40)
@@ -299,41 +298,57 @@ class PlannerNode(Node):
     # ---------- Fallbacks when LLM is disabled ----------
     def _fallback_plan(self) -> Dict[str, Any]:
         """
-        Build a minimal, schema-valid plan that delegates decision-making to the orchestrator
-        when the planner LLM is disabled.
+        Build a minimal, schema-valid plan that *forwards* the ContextCapsule
+        (and some basic hints) to the orchestrator when the planner LLM is disabled.
         """
         cap = self._capsule if isinstance(self._capsule, dict) else {}
         trigger = cap.get("trigger") or {}
         trig_type = trigger.get("type", "unknown")
+        trig_rule = trigger.get("rule", "unknown")
+        trig_text = trigger.get("text") or ""
 
+        # A simple objective that encodes the fact we're delegating
         objective = f"fallback_{trig_type}_delegated_to_orchestrator"
 
         header = {
             "objective": objective,
             "time_horizon": "short",
-            "priority": ["reactive_response", "delegate_to_orchestrator"],
-            "communication_policy": {},          # can stay empty, still schema-valid
+            "priority": [
+                "reactive_response",
+                "delegate_to_orchestrator",
+            ],
+            "communication_policy": {},          # schema-valid, orchestrator can ignore or fill in
             "risk_flags": ["planner_llm_disabled"],
             "assumptions": [],
-            "exploration_hint": "orchestrator decides detailed skill sequence"
+            "exploration_hint": (
+                "orchestrator uses forwarded ContextCapsule and recent Facts "
+                "to choose a simple skill sequence"
+            ),
         }
 
-        doc = (
-            "Situation: Planner LLM is disabled; using ContextCapsule and recent Facts only as background.\n"
-            f"Intent: Respect the current trigger.type={trig_type} and allow the orchestrator to choose a simple, "
-            "reactive skill sequence.\n"
-            "Action Sketch: The orchestrator should pick a short behavior (e.g., confirm the human command, approach "
-            "the speaker, or provide a brief status update) without long multi-step missions.\n"
-            "Evidence & Uncertainty: OPEN: full high-level plan narrative is unavailable because planner LLM is "
-            "disabled.\n"
-            "Coordination & Tone: Keep speech brief and reactive; avoid over-explaining.\n"
-            "Hard Constraints: Maintain safety; avoid long detours or complex missions while operating in fallback."
-        )
+        # Short textual summary for the orchestrator / logs
+        doc_lines = [
+            f"Situation: Planner LLM is disabled; forwarding ContextCapsule from trigger.rule={trig_rule}, "
+            f"type={trig_type}.",
+            f"Intent: Let the orchestrator decide a simple, reactive behavior based on the forwarded capsule "
+            f"and facts. Trigger text: {trig_text!r}",
+            "Action Sketch: Orchestrator should choose a short behavior (e.g., confirm the human command, "
+            "approach the speaker, or provide a brief status update) without long multi-step missions.",
+            "Evidence & Uncertainty: OPEN: detailed high-level planning is unavailable because the planner "
+            "LLM is disabled.",
+            "Coordination & Tone: Keep speech brief and reactive; avoid over-explaining.",
+            "Hard Constraints: Maintain safety; avoid long detours or complex missions in this fallback mode.",
+        ]
+        doc = "\n".join(doc_lines)
 
+        # IMPORTANT: actually forward the capsule so the orchestrator can inspect it.
+        # PLAN_SCHEMA has additionalProperties=True, so this extra field is allowed.
         return {
             "plan_header": header,
-            "plan_doc": doc
+            "plan_doc": doc,
+            "capsule": cap,   # <–– forwarded ContextCapsule
         }
+
 
     def _fallback_needs(self) -> Dict[str, Any]:
         """
@@ -422,14 +437,34 @@ class PlannerNode(Node):
         except Exception:
             return
 
-        # accept event_trace or trace
-        raw_trace = capsule.get("event_trace") or capsule.get("trace") or []
-        trace = _bound_list(raw_trace, self.max_trace)
+        # If broker sent a summarized string, keep it separately
+        summary = None
+        et = capsule.get("event_trace")
+        if isinstance(et, str):
+            summary = et
+
+        # Prefer raw list if available, fall back to legacy fields
+        raw_trace = (
+            capsule.get("event_trace_raw")  # new: full list from broker
+            or capsule.get("trace")         # legacy
+            or (et if isinstance(et, list) else [])  # only use event_trace as list if it *is* a list
+        )
+
+        if isinstance(raw_trace, list):
+            trace = _bound_list(raw_trace, self.max_trace)
+        else:
+            trace = []
 
         cap = dict(capsule)
+        # Overwrite event_trace with the (possibly truncated) list version
         cap["event_trace"] = trace
+        # Preserve the broker’s summary separately if it exists
+        if summary is not None:
+            cap["event_trace_summary"] = summary
+
         # NOTE: any perf info that the broker put under cap["perf"] is preserved
         self._capsule = cap
+
 
     def _on_profiles(self, msg: StringMsg):
         try:
@@ -552,17 +587,37 @@ class PlannerNode(Node):
             ok = False
             content = None
             try:
-                resp = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "PlannerOutput",
-                            "schema": schema     # ← your PLAN_SCHEMA or NEEDS_SCHEMA
-                        }
-                    },
-                )
+            
+                if "gpt-oss" in self.model:
+                    client = Groq()
+                        
+                    resp = client.chat.completions.create(
+                        model='openai/' + self.model,
+                        messages=messages,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "PlannerOutput",
+                                "schema": schema     # ← your PLAN_SCHEMA or NEEDS_SCHEMA
+                            }
+                        },
+                        reasoning_effort="medium",
+                        
+                    )
+                else:
+                    client = OpenAI()
+            
+                    resp = client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "PlannerOutput",
+                                "schema": schema     # ← your PLAN_SCHEMA or NEEDS_SCHEMA
+                            }
+                        },
+                    )
                 t1 = time.time()
                 lat_ms = (t1 - t0) * 1000.0
                 ok = True
@@ -575,7 +630,7 @@ class PlannerNode(Node):
                     self.get_logger().info("=== LLM PROMPT (non-JSON-printable) ===")
 
                 content = resp.choices[0].message.content
-                self.get_logger().info(f"\n=== LLM RAW RESPONSE ===\n{content}\n")
+                self.get_logger().info(f"\n=== LLM RAW RESPONSE ===\n{content}\nLatency: {str(lat_ms)}\n")
 
                 # Try to parse/validate
                 obj = json.loads(content)

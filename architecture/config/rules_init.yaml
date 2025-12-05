@@ -35,7 +35,7 @@ rules:
     enabled: true
     task: audio_asr
     output: text.final
-    model_id: "whisper"   
+    model_id: "small"   
     mode: "level"                       # Whisper ASR size
     expr: "text and len(text) >= 3"
 
@@ -43,14 +43,15 @@ rules:
     enabled: true
     task: audio_asr
     output: text.final
-    model_id: "whisper" 
+    model_id: "small" 
     mode: "level"                          
     expr: "text and any(x in text.lower() for x in ['bob'])"
 
-  - id: greet_with_presence
+  # Human greeting + presence co-occur (for nice social responses).
+  - id: human_ping_here
     enabled: true
     type: composite
-    expr: "exists('pose_present_precise', 2500) and exists('speech_keyword', 2500)"
+    expr: "exists('speech_final_any', 2500) and exists('human_detected_3d', 2500)"
     
   # --- Odometry deltas as basic events ---
   - id: odom_rot_delta
@@ -83,4 +84,21 @@ rules:
     output: skill.status
     mode: "level"
     expr: "kind == 'skill_finished' and done"
+    
+  # VLM scene answer available and parsed JSON exists.
+  - id: vlm_scene_ready
+    enabled: true
+    task: vlm_inference
+    output: answer.text
+    mode: "level"
+    expr: "success and json_text is not None and json_text != ''"
+    
+  # Same idea as speech_final_any, but from json.final so we can access azimuth_deg.
+  - id: speech_final_with_doa
+    enabled: true
+    task: audio_asr
+    output: json.final
+    model_id: "small"
+    mode: "level"
+    expr: "text and len(text) >= 3"
 

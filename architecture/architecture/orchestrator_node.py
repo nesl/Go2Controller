@@ -33,33 +33,36 @@ from rcl_interfaces.msg import (                  # NEW
 
 import yaml
 from openai import OpenAI
+from groq import Groq
+from pathlib import Path
 from jsonschema import validate, ValidationError
 
 # ---------- JSON schema for LLM output ----------
 
 # ---------- Deterministic latency tiers → concrete model ids ----------
 
+'''
 MODEL_CATALOG: Dict[str, Dict[str, str]] = {
     # role   → tier  → model_id
     "broker": {
-        "fast":     "gpt-5-nano",
-        "balanced": "gpt-5-mini",
-        "thorough": "gpt-5",   # or a bigger one if you want
+        "fast":     "gpt-4.1-nano",
+        "balanced": "gpt-5-nano",
+        "thorough": "gpt-5-mini",   # or a bigger one if you want
     },
     "planner": {
-        "fast":     "gpt-5-nano",
-        "balanced": "gpt-5-mini",
-        "thorough": "gpt-5",   # or e.g. "gpt-5"
+        "fast":     "gpt-4.1-nano",
+        "balanced": "gpt-5-nano",
+        "thorough": "gpt-5-mini",   # or e.g. "gpt-5"
     },
     "orchestrator": {
-        "fast":     "gpt-5-nano",
-        "balanced": "gpt-5-mini",
-        "thorough": "gpt-5",
+        "fast":     "gpt-4.1-nano",
+        "balanced": "gpt-5-nano",
+        "thorough": "gpt-5-mini",
     },
     "hdt": {
-        "fast":     "gpt-5-nano",
-        "balanced": "gpt-5-mini",
-        "thorough": "gpt-5",
+        "fast":     "gpt-4.1-nano",
+        "balanced": "gpt-5-nano",
+        "thorough": "gpt-5-mini",
     },
     
     "audio_asr": {
@@ -69,7 +72,7 @@ MODEL_CATALOG: Dict[str, Dict[str, str]] = {
     },
     
 }
-
+'''
 
 PLAN_PARSE_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -129,35 +132,13 @@ PLAN_PARSE_SCHEMA: Dict[str, Any] = {
             },
             "additionalProperties": True,
         },
-        # OLD: optional direct model overrides (we keep for backwards compat)
-        "llm_models": {
-            "type": "object",
-            "additionalProperties": {"type": "string"},
-        },
 
-        # NEW: latency-profile-based policy
-        "llm_policy": {
-            "type": "object",
-            "properties": {
-                "mode": {
-                    "type": "string",
-                    "enum": ["fast_reactive", "normal", "deep_reasoning"]
-                },
-                "nodes": {
-                    "type": "object",
-                    "additionalProperties": {
-                        "type": "string"   # "fast" | "balanced" | "thorough" | "off"
-                    }
-                }
-            },
-            "additionalProperties": True
-        },
     },
     "additionalProperties": False,
 }
 
 SYSTEM_PARSE = """
-You are the ORCHESTRATOR for a mobile robot collaborating with humans.
+You are the ORCHESTRATOR for a mobile robot called Bob collaborating with humans.
 
 The planner has already produced a high-level plan (plan_header, plan_doc, _hints).
 You also have:
@@ -165,7 +146,6 @@ You also have:
   - A rules library
   - A tasks_inventory describing all perception, LLM, and VLM tools
   - The task registry includes performance metrics for all models (latency, fps, etc.)
-  - A current_llm_policy describing the CURRENT global latency mode and per-node tiers.
 
 Your job is to:
   1) Decide which skill (state-machine) to activate next
@@ -173,8 +153,6 @@ Your job is to:
   3) Optionally define NEW rules (prefer composite rules using exists('rule_id', ms))
      - This includes optional NEW “planner trigger” rules whose ONLY job is to
        proactively wake up the planner for a new plan.
-  4) Recommend an updated LLM latency policy in llm_policy, based on performance
-     metrics available in tasks_inventory, perf.json outputs, and current_llm_policy
 
 
 ======================================================================
@@ -184,15 +162,6 @@ Your job is to:
 - You SHOULD NOT reference existing rules whose id starts with "trigger_".
 - You MAY reference existing composite or state_machine skills (from skills_inventory) as actions inside state machines (treat them as black-box actions that run until they finish).
 - Use ctx to pass small argument sets (object_ids, zones, text, etc.).
-
-- When proposing changes in llm_policy tiers:
-    * Start from current_llm_policy and ADJUST it if needed.
-    * Use only performance metrics documented in tasks_inventory (and perf.json outputs if present).
-    * Prefer lower-latency tiers when humans complain about speed or when time pressure is high.
-    * Prefer balanced/thorough tiers when the task requires deeper reasoning and latency is acceptable.
-    * If no change is clearly warranted, you may COPY current_llm_policy exactly into llm_policy,
-      but you MUST still output an llm_policy object.
-
 
 ======================================================================
  STATE-MACHINE SKILLS
@@ -363,6 +332,7 @@ Allowed rule types:
      request appears, or the environment changes significantly).
    - These rules are NOT meant to be used directly by skills; they are
      consumed by the EventLayer to decide when to call the planner.
+   - These rules are only triggered once and removed
 
 Do NOT:
 - invent task names
@@ -385,42 +355,6 @@ Requirements:
 - The selected skill must exist in skills_inventory or new_composites.
 - It must have top-level "when": {} to arm immediately.
 - Execution flow must be fully determined by its state-machine states.
-
-
-======================================================================
- LLM LATENCY POLICY (llm_policy)
-======================================================================
-Instead of choosing concrete model_ids, you choose a latency policy.
-
-Use:
-
-"llm_policy": {
-  "mode": "fast_reactive" | "normal" | "deep_reasoning",
-  "nodes": {
-    "broker": "fast|balanced|thorough|off",
-    "planner": "fast|balanced|thorough|off",
-    "hdt": "fast|balanced|thorough|off",
-    "orchestrator": "fast|balanced|thorough|off",
-    "audio_asr": "fast|balanced|thorough|off"   // controls STT model size/latency
-  }
-}
-
-Rules:
-- You MUST always output an llm_policy object in your JSON.
-- Start from current_llm_policy and adjust it if needed.
-- "mode" is a high-level interaction style:
-  * fast_reactive: short, urgent commands; low latency; minimal chain.
-  * normal: typical interactions; moderate latency.
-  * deep_reasoning: complex multi-step reasoning; higher latency allowed.
-- For each node:
-  * "fast": use the fastest acceptable model and keep that node enabled.
-  * "balanced": use a mid-tier model.
-  * "thorough": use a slower but higher-capacity model.
-  * "off": skip that node’s LLM for this interaction (or leave it in a cheap fallback).
-- If there is a clear indication that humans want faster responses
-  (e.g., complaints about being too slow, or short high-priority commands),
-  prefer mode="fast_reactive" and favor "fast" or "off" tiers where reasonable.
-- If no change is warranted, COPY current_llm_policy exactly into llm_policy.
 
 ======================================================================
  STRICT JSON OUTPUT SCHEMA
@@ -478,15 +412,6 @@ You MUST output STRICT JSON ONLY:
     "skill": "<state_machine_name>",
     "ctx": { ... }
   },
-  "llm_policy": {
-    "mode": "<fast_reactive | normal | deep_reasoning>",
-    "nodes": {
-      "broker": "<fast | balanced | thorough | off>",
-      "planner": "<fast | balanced | thorough | off>",
-      "hdt": "<fast | balanced | thorough | off>",
-      "orchestrator": "<fast | balanced | thorough | off>"
-    }
-  }
 }
 """
 
@@ -502,6 +427,13 @@ class OrchestratorNode(Node):
     broker ContextCapsule (passed into the prompt).
     """
 
+    _IGNORE_LLM_TASKS = {
+        "llm_broker",
+        "llm_planner",
+        "llm_orchestrator",
+        "llm_hdt",
+    }
+
     def __init__(self):
         super().__init__("orchestrator_node")
 
@@ -514,7 +446,7 @@ class OrchestratorNode(Node):
         self.declare_parameter("dynamic_prefix", "")
         self.declare_parameter("max_dynamic_skills", 10)
         self.declare_parameter("max_dynamic_rules", 20)
-        self.declare_parameter("model", "gpt-5-mini")
+        self.declare_parameter("model", "gpt-4.1-nano")
         self.declare_parameter("temperature", 0.1)
 
         # NEW: where to listen for broker context (which includes perf DB)
@@ -529,6 +461,7 @@ class OrchestratorNode(Node):
             "/broker/save_task_registry_with_perf",
         )
 
+        '''
         # NEW: mapping from logical roles to (node, param) for remote model changes
         self.declare_parameter(
             "llm_targets_json",
@@ -540,7 +473,8 @@ class OrchestratorNode(Node):
                 "audio_asr": {"node": "stt_angle",     "param": "model"}
             }),
         )
-
+        '''
+        
         self.skills_base_path: str = (
             self.get_parameter("skills_base_path")
             .get_parameter_value()
@@ -609,12 +543,30 @@ class OrchestratorNode(Node):
             .get_parameter_value()
             .string_value
         )
+        
+        
+        self.sub_skill_status = self.create_subscription(
+            StringMsg,
+            "/skills/status",
+            self._on_skill_status,
+            50,
+        )
+        
+        self.sub_rules_status = self.create_subscription(
+            StringMsg,
+            "/rules/status",
+            self._on_rules_status,
+            10,
+        )
+
+        
+        '''
         self.llm_targets: Dict[str, Any] = json.loads(
             self.get_parameter("llm_targets_json")
             .get_parameter_value()
             .string_value
         )
-
+        
 
         # Track whether planner LLM is currently considered enabled
         self._planner_llm_enabled: bool = True
@@ -630,7 +582,8 @@ class OrchestratorNode(Node):
                 "audio_asr":    "balanced",
             },
         }
-
+        '''
+        
         if not self.skills_composite_path:
             self.get_logger().warn(
                 "No skills_composite_path set; orchestrator cannot persist new composites."
@@ -639,9 +592,6 @@ class OrchestratorNode(Node):
             self.get_logger().warn(
                 "No rules_path set; orchestrator cannot persist new rules."
             )
-
-        # ---------------- OpenAI client ----------------
-        self.client = OpenAI()
 
         # ---------------- State ----------------
         self._capsule: Dict[str, Any] = {}  # NEW: last broker ContextCapsule
@@ -676,6 +626,7 @@ class OrchestratorNode(Node):
             Trigger, "/skills/cancel_all"
         )
 
+        '''
         # NEW: SetParameters clients for remote LLM model changes
         self._param_clients: Dict[str, Any] = {}
         for role, info in self.llm_targets.items():
@@ -686,7 +637,8 @@ class OrchestratorNode(Node):
             self._param_clients[role] = self.create_client(
                 SetParameters, srv_name
             )
-
+        '''
+        
         # NEW: allow dynamic change of THIS node's own model / temperature
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
@@ -696,6 +648,240 @@ class OrchestratorNode(Node):
             f"rules_init='{self.rules_init_path}' | rules='{self.rules_path}' | "
             f"model={self.model} | capsule_topic={self.capsule_topic} | perf_topic={self.perf_topic}"
         )
+
+
+    def _on_rules_status(self, msg: StringMsg):
+        try:
+            obj = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().warn(f"_on_rules_status: bad JSON: {e}")
+            return
+
+        kind = obj.get("kind")
+        rid = obj.get("rule_id")
+        rtype = obj.get("rule_type")
+        reason = obj.get("reason")
+
+        if kind != "rule_error" or not rid:
+            return
+
+        self.get_logger().warn(
+            f"orchestrator: rule_error for '{rid}' "
+            f"(type={rtype}, reason={reason}); removing from dynamic rules."
+        )
+        self._remove_rule_from_dynamic_yaml(rid)
+
+        # Optionally: ping /event_layer/reload_rules so EventLayer sees the change
+        if hasattr(self, "reload_rules_client"):
+            if self.reload_rules_client.wait_for_service(timeout_sec=1.0):
+                req = Trigger.Request()
+                fut = self.reload_rules_client.call_async(req)
+                # you can attach a done callback like we did for skills reload
+
+
+    def _remove_rule_from_dynamic_yaml(self, rule_id: str):
+        """
+        Remove a rule from the dynamic rules YAML (rules_path).
+        Base rules in rules_init.yaml are never touched.
+        """
+        rid = str(rule_id)
+        if not getattr(self, "rules_path", ""):
+            self.get_logger().warn(
+                f"cannot remove rule '{rid}': no rules_path set on orchestrator"
+            )
+            return
+
+        try:
+            doc = self._read_yaml_if_exists(self.rules_path) or {}
+        except Exception as e:
+            self.get_logger().warn(
+                f"orchestrator: failed to read dynamic rules yaml '{self.rules_path}': {e}"
+            )
+            return
+
+        rules = doc.get("rules") or []
+        before = len(rules)
+        new_rules = []
+        removed = False
+        for r in rules:
+            if not isinstance(r, dict):
+                new_rules.append(r)
+                continue
+            if str(r.get("id", "")) == rid:
+                removed = True
+                continue
+            new_rules.append(r)
+
+        if not removed:
+            self.get_logger().info(
+                f"orchestrator: rule '{rid}' not found in dynamic rules; nothing to remove."
+            )
+            return
+
+        doc["rules"] = new_rules
+        try:
+            with open(self.rules_path, "w") as f:
+                yaml.safe_dump(doc, f, sort_keys=False)
+            self.get_logger().warn(
+                f"orchestrator: removed rule '{rid}' from rules.yaml "
+                f"(rules: {before} → {len(new_rules)})"
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f"orchestrator: failed to write dynamic rules yaml after removing '{rid}': {e}"
+            )
+
+
+    def _remove_skill_from_composite_yaml(self, skill_name: str):
+        """
+        Remove a skill by name from skills_composite.yaml.
+
+        Only touches the *composite* YAML file; base skills remain immutable.
+        """
+        if not self.skills_composite_path:
+            self.get_logger().warn(
+                f"cannot remove skill '{skill_name}': no skills_composite_path set"
+            )
+            return
+
+        # Optional guard: only remove "dynamic" skills, not hand-written ones
+        if self.dynamic_prefix and not skill_name.startswith(self.dynamic_prefix):
+            self.get_logger().info(
+                f"skip removal of '{skill_name}' (no dynamic_prefix='{self.dynamic_prefix}')"
+            )
+            return
+
+        doc = self._ensure_composite_yaml()
+        skills = doc.get("skills") or []
+        before = len(skills)
+
+        new_skills = []
+        removed = False
+        for s in skills:
+            if not isinstance(s, dict):
+                new_skills.append(s)
+                continue
+            name = str(s.get("name", ""))
+            if name == skill_name:
+                removed = True
+                continue
+            new_skills.append(s)
+
+        if not removed:
+            self.get_logger().info(
+                f"skill '{skill_name}' not found in skills_composite.yaml; nothing to remove."
+            )
+            return
+
+        doc["skills"] = new_skills
+        if self._write_composite_yaml(doc):
+            self.get_logger().warn(
+                f"Removed dynamic skill '{skill_name}' from skills_composite.yaml "
+                f"(skills: {before} → {len(new_skills)})"
+            )
+        else:
+            self.get_logger().warn(
+                f"failed to write skills_composite.yaml while removing '{skill_name}'"
+            )
+
+    def _on_skill_status(self, msg: StringMsg):
+        """
+        Listen to /skills/status and remove any dynamic skills that crash.
+
+        SkillsAgent emits, e.g.:
+
+          kind == "skill_error":
+            {
+              "kind": "skill_error",
+              "skill": "foo.bar",
+              "reason": "runtime_exception" | "missing_initial_state" | ...,
+              "error": "Traceback...",
+              ...
+            }
+
+          kind == "skill_finished":
+            {
+              "kind": "skill_finished",
+              "skill": "foo.bar",
+              "reason": "missing_initial_state" | "missing_state" | "bad_state_type" | ...,
+              ...
+            }
+
+        We primarily key off kind=="skill_error", but we also treat certain
+        skill_finished reasons as structural problems.
+        """
+        try:
+            obj = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().warn(f"_on_skill_status: bad JSON: {e}")
+            return
+
+        kind = obj.get("kind")
+        skill_name = obj.get("skill")
+        reason = obj.get("reason")
+
+        if not skill_name:
+            return
+
+        # 1) Direct error events
+        if kind == "skill_error":
+            self.get_logger().warn(
+                f"orchestrator: skill_error from '{skill_name}' "
+                f"reason='{reason}' → removing from skills_composite.yaml"
+            )
+            self._remove_skill_from_composite_yaml(skill_name)
+            self._reload_skills_after_removal(skill_name)
+            return
+
+        # 2) Structural failures surfaced as skill_finished reasons
+        if kind == "skill_finished":
+            structural_reasons = {
+                "missing_initial_state",
+                "missing_state",
+                "bad_state_type",
+            }
+            if reason in structural_reasons:
+                self.get_logger().warn(
+                    f"orchestrator: skill '{skill_name}' finished with "
+                    f"structural failure reason='{reason}' → removing from YAML"
+                )
+                self._remove_skill_from_composite_yaml(skill_name)
+                self._reload_skills_after_removal(skill_name)
+
+
+    def _reload_skills_after_removal(self, skill_name: str):
+        """
+        Best-effort /skills/reload after we edit skills_composite.yaml.
+        """
+        if not self.reload_skills_client:
+            return
+
+        if self.reload_skills_client.wait_for_service(timeout_sec=1.0):
+            req = Trigger.Request()
+            future = self.reload_skills_client.call_async(req)
+
+            def _cb(fut):
+                try:
+                    res = fut.result()
+                    if res and res.success:
+                        self.get_logger().info(
+                            f"/skills/reload after removal of '{skill_name}' ok: {res.message}"
+                        )
+                    else:
+                        self.get_logger().warn(
+                            f"/skills/reload after removal of '{skill_name}' failed."
+                        )
+                except Exception as e:
+                    self.get_logger().warn(
+                        f"/skills/reload call error after removal of '{skill_name}': {e}"
+                    )
+
+            future.add_done_callback(_cb)
+        else:
+            self.get_logger().warn(
+                "reload_skills_client not available; YAML updated but "
+                "SkillsAgent will only see it on next explicit reload."
+            )
 
 
     # =====================================================================
@@ -792,12 +978,14 @@ class OrchestratorNode(Node):
                     continue
 
                 kind = str(s.get("kind", "")).strip() or "primitive"
+                description = str(s.get("description", "")).strip()
                 params_template = s.get("params") or {}
                 when_block = s.get("when") or {}
                 until_block = s.get("until") or {}
 
                 base_entry: Dict[str, Any] = {
                     "name": name,
+                    "description": description,
                     "kind": kind,
                     "params_template": params_template,
                     "param_keys": (
@@ -917,6 +1105,38 @@ class OrchestratorNode(Node):
 
         return {"rules": rules}
 
+    def _strip_planner_trigger_rules(
+        self, rules: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Remove *only* planner trigger rules from the dynamic rules list.
+
+        Planner trigger rules (by design in the prompt) have:
+          - type: "composite"
+          - id starting with "trigger_planner_"
+
+        We DO NOT touch:
+          - trigger_speech_final
+          - any other trigger_* rules
+        """
+        cleaned = []
+        for r in rules:
+            if not isinstance(r, dict):
+                cleaned.append(r)
+                continue
+
+            rid = str(r.get("id", ""))
+
+            # Only drop composite planner triggers like "trigger_planner_foo"
+            if rid.startswith("trigger_planner_"):
+                # old planner trigger → remove
+                continue
+
+            cleaned.append(r)
+        return cleaned
+
+
+
     def _prune_old_dynamic_rules(
         self, rules: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
@@ -991,6 +1211,11 @@ class OrchestratorNode(Node):
         out = []
 
         for tname, tdoc in (doc.get("tasks") or {}).items():
+        
+            # Skip LLM reasoning tasks that are now managed by the router
+            if tname in self._IGNORE_LLM_TASKS:
+                continue
+        
             # ---- Outputs as before ----
             outputs = []
             for o in tdoc.get("outputs") or []:
@@ -1004,8 +1229,6 @@ class OrchestratorNode(Node):
                 outputs.append(
                     {
                         "id": o.get("id"),
-                        "topic": (o.get("ros") or {}).get("topic"),
-                        "msg": (o.get("ros") or {}).get("msg"),
                         "fields": fields,
                     }
                 )
@@ -1087,9 +1310,18 @@ class OrchestratorNode(Node):
         for _ in range(retries + 1):
             t0 = time.time()
             try:
-                resp = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages)
+                
+                if "gpt-oss" in self.model:
+                    client = Groq()
+                    resp = client.chat.completions.create(
+                        model='openai/' + self.model,
+                        messages=messages,
+                        reasoning_effort="medium")
+                else:
+                    client = OpenAI()
+                    resp = client.chat.completions.create(
+                        model=self.model,
+                        messages=messages)
                 '''
                 response_format={
                     "type": "json_schema",
@@ -1109,7 +1341,7 @@ class OrchestratorNode(Node):
                 self.get_logger().info("\n=== LLM PROMPT ===\n" + json.dumps(messages, indent=2))
                 
                 self.get_logger().info(
-                    f"=== ORCHESTRATOR LLM RAW RESPONSE ===\n{content}\n"
+                    f"=== ORCHESTRATOR LLM RAW RESPONSE ===\n{content}\nLatency: {str(lat_ms)}\n"
                 )
                 try:
                     obj = json.loads(content)
@@ -1344,12 +1576,12 @@ class OrchestratorNode(Node):
             "tasks_inventory": tasks_inventory,
             # NEW: give orchestrator LLM access to broker context capsule, including perf DB
             #"ContextCapsule": self._capsule or {},
-            "current_llm_policy": self._current_llm_policy,
+            #"current_llm_policy": self._current_llm_policy,
         }
 
         # Only expose ContextCapsule to the orchestrator LLM when the planner LLM is disabled
-        if not self._planner_llm_enabled:
-            payload["ContextCapsule"] = self._capsule or {}
+        #if not self._planner_llm_enabled:
+        #    payload["ContextCapsule"] = self._capsule or {}
 
         '''
         return [
@@ -1430,6 +1662,7 @@ class OrchestratorNode(Node):
         new_rules = orchestrator_obj.get("new_rules") or []
         to_execute_obj = orchestrator_obj.get("to_execute") or {}
 
+        '''
         # Prefer new llm_policy; fall back to old llm_models if present.
         llm_policy = orchestrator_obj.get("llm_policy")
         if isinstance(llm_policy, dict):
@@ -1442,7 +1675,9 @@ class OrchestratorNode(Node):
                     if isinstance(model, str) and model:
                         self._set_remote_model(role, model)
 
-
+        '''
+        
+        
         # --- Update composite YAML only ---
         if new_composites and self.skills_composite_path:
             comp_doc = self._ensure_composite_yaml()
@@ -1474,20 +1709,32 @@ class OrchestratorNode(Node):
             rules_doc = self._ensure_rules_yaml()
             rules_list = rules_doc.get("rules", [])
 
+            # 1) Remove any previous planner trigger rules (but NOT trigger_speech_final)
+            rules_list = self._strip_planner_trigger_rules(rules_list)
+
+            # 2) Append freshly generated rules
             for r in new_rules:
                 rid = str(r.get("id", ""))
-                if self.dynamic_prefix and not rid.startswith(self.dynamic_prefix):
+                is_planner_trigger = rid.startswith("trigger_planner_")
+
+                # Do NOT prefix planner trigger ids; they must stay "trigger_planner_*"
+                if self.dynamic_prefix and not rid.startswith(self.dynamic_prefix) and not is_planner_trigger:
                     r["id"] = f"{self.dynamic_prefix}{rid}"
+                else:
+                    r["id"] = rid
+
                 # default type if missing
                 if "type" not in r:
                     r["type"] = "composite" if not r.get("task") else "basic"
                 if "enabled" not in r:
                     r["enabled"] = True
+
                 rules_list.append(r)
                 self.get_logger().info(
                     f"orchestrator: planning to append rule '{r['id']}'"
                 )
 
+            # 3) Prune old dynamic rules (but planner triggers have already been stripped explicitly)
             rules_list = self._prune_old_dynamic_rules(rules_list)
             rules_doc["rules"] = rules_list
 
@@ -1498,7 +1745,8 @@ class OrchestratorNode(Node):
                 return
 
             self.get_logger().info(
-                f"orchestrator: wrote {len(new_rules)} new rules to rules.yaml"
+                f"orchestrator: wrote {len(new_rules)} new rules to rules.yaml "
+                f"(after stripping old planner triggers)"
             )
 
         # Reload rules + skills, then execute
@@ -1508,173 +1756,6 @@ class OrchestratorNode(Node):
             to_execute_list = []
 
         self._reload_all_and_execute(to_execute_list)
-
-    # =====================================================================
-    # Remote LLM model changes
-    # =====================================================================
-
-    def _set_remote_model(self, role: str, model: str):
-        """Ask the target node to switch its LLM model param via SetParameters."""
-        info = self.llm_targets.get(role) or {}
-        node_name = info.get("node")
-        param_name = info.get("param", "model")
-        if not node_name:
-            self.get_logger().warn(f"no node mapping for role='{role}'")
-            return
-        client = self._param_clients.get(role)
-        if client is None:
-            self.get_logger().warn(f"no SetParameters client for role='{role}'")
-            return
-
-        if not client.wait_for_service(timeout_sec=0.5):
-            self.get_logger().warn(
-                f"SetParameters service not available for role='{role}' (node={node_name})"
-            )
-            return
-
-        req = SetParameters.Request()
-        p = ParamMsg()
-        p.name = param_name
-        pv = ParameterValue()
-        pv.type = ParameterType.PARAMETER_STRING   
-        pv.string_value = str(model)
-        p.value = pv
-        req.parameters.append(p)
-
-        self.get_logger().info(
-            f"orchestrator: requesting LLM model change role='{role}' node='{node_name}' param='{param_name}' -> '{model}'"
-        )
-        _ = client.call_async(req)
-
-    # =====================================================================
-    # Latency-profile → concrete models, and enable/disable
-    # =====================================================================
-
-    def _choose_model_for_tier(self, role: str, tier: str) -> Optional[str]:
-        """
-        Map a (role, tier) pair to a concrete model_id using MODEL_CATALOG.
-        Returns None if no mapping is found.
-        """
-        tier = (tier or "").lower()
-        table = MODEL_CATALOG.get(role, {})
-        return table.get(tier)
-
-    def _set_remote_bool(self, role: str, param_name: str, value: bool):
-        """
-        Set a boolean parameter on the target node for the given role
-        (e.g., llm_enabled).
-        """
-        info = self.llm_targets.get(role) or {}
-        node_name = info.get("node")
-        if not node_name:
-            self.get_logger().warn(f"no node mapping for role='{role}'")
-            return
-        client = self._param_clients.get(role)
-        if client is None:
-            self.get_logger().warn(f"no SetParameters client for role='{role}'")
-            return
-
-        if not client.wait_for_service(timeout_sec=0.5):
-            self.get_logger().warn(
-                f"SetParameters service not available for role='{role}' (node={node_name})"
-            )
-            return
-
-        req = SetParameters.Request()
-        p = ParamMsg()
-        p.name = param_name
-        pv = ParameterValue()
-        pv.type = ParameterType.PARAMETER_BOOL
-        pv.bool_value = bool(value)
-        p.value = pv
-        req.parameters.append(p)
-
-        self.get_logger().info(
-            f"orchestrator: setting bool param role='{role}' node='{node_name}' "
-            f"param='{param_name}' -> {value}"
-        )
-        _ = client.call_async(req)
-
-    def _apply_llm_policy(self, llm_policy: Dict[str, Any]):
-        """
-        Apply an llm_policy of the form:
-          {
-            "mode": "fast_reactive" | "normal" | "deep_reasoning",
-            "nodes": {
-              "broker": "fast|balanced|thorough|off",
-              "planner": "...",
-              "hdt": "...",
-              "orchestrator": "..."
-            }
-          }
-        """
-        if not isinstance(llm_policy, dict):
-            return
-
-        nodes = llm_policy.get("nodes") or {}
-        if not isinstance(nodes, dict):
-            return
-
-        for role, tier in nodes.items():
-            if not isinstance(tier, str):
-                continue
-            t = tier.lower().strip()
-
-            # NEW: handle audio_asr as a non-LLM role (no llm_enabled, just model size)
-            if role == "audio_asr":
-                if t == "off":
-                    # optional: later you could wire this to /toggle_stt
-                    self.get_logger().info("orchestrator: audio_asr tier='off' (no model change)")
-                    continue
-
-                model_id = self._choose_model_for_tier(role, t)
-                if model_id:
-                    self._set_remote_model(role, model_id)
-                    self.get_logger().info(
-                        f"orchestrator: audio_asr tier='{t}' → stt_model_size='{model_id}'"
-                    )
-                else:
-                    self.get_logger().warn(
-                        f"orchestrator: no model mapping for role='audio_asr', tier='{t}'"
-                    )
-                continue  # skip LLM-specific handling below
-
-
-            if t == "off":
-                # Disable that node's LLM
-                self._set_remote_bool(role, "llm_enabled", False)
-                self.get_logger().info(f"orchestrator: role='{role}' → LLM OFF")
-
-                if role == "planner":
-                    self._planner_llm_enabled = False
-                continue
-
-            # Otherwise: enable and set model
-            self._set_remote_bool(role, "llm_enabled", True)
-            if role == "planner":
-                self._planner_llm_enabled = True
-
-            model_id = self._choose_model_for_tier(role, t)
-            if model_id:
-                self._set_remote_model(role, model_id)
-                self.get_logger().info(
-                    f"orchestrator: role='{role}' tier='{t}' → model_id='{model_id}'"
-                )
-            else:
-                self.get_logger().warn(
-                    f"orchestrator: no model mapping for role='{role}', tier='{t}'"
-                )
-
-        # --- NEW: update our in-memory view of the current policy ---
-        merged_nodes = dict(self._current_llm_policy.get("nodes", {}))
-        merged_nodes.update(nodes)
-        self._current_llm_policy = {
-            "mode": llm_policy.get("mode", self._current_llm_policy.get("mode", "normal")),
-            "nodes": merged_nodes,
-        }
-        self.get_logger().info(
-            f"orchestrator: updated current_llm_policy={self._current_llm_policy}"
-        )
 
 
     # =====================================================================

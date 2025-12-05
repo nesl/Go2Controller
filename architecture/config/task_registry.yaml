@@ -417,6 +417,43 @@ tasks:
             - { name: ts,     type: "ts",     desc: "perf sample timestamp" }
 
     models:
+
+      - id: gpt-oss-120b
+        version: "gpt-oss-120b"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 1.0 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+
+      - id: gpt-oss-20b
+        version: "gpt-oss-20b"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 0.5 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+
+      - id: gpt-4.1-nano
+        version: "gpt-4.1-nano"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 10.0 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+        
+      - id: gpt-4.1-mini
+        version: "gpt-4.1-mini"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 20.0 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+    
       - id: gpt-5-nano
         version: "gpt-5.1-nano"
         role: "default"
@@ -471,6 +508,43 @@ tasks:
             - { name: ts,     type: "ts",     desc: "perf sample timestamp" }
 
     models:
+
+      - id: gpt-oss-120b
+        version: "gpt-oss-120b"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 1.0 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}    
+
+      - id: gpt-oss-20b
+        version: "gpt-oss-20b"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 0.5 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+
+      - id: gpt-4.1-nano
+        version: "gpt-4.1-nano"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 10.0 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+        
+      - id: gpt-4.1-mini
+        version: "gpt-4.1-mini"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 20.0 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+    
       - id: gpt-5-nano
         version: "gpt-5-nano"
         role: "default"
@@ -517,6 +591,43 @@ tasks:
             - { name: ts,     type: "ts",     desc: "perf sample timestamp" }
 
     models:
+   
+      - id: gpt-oss-120b
+        version: "gpt-oss-120b"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 1.0 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+    
+      - id: gpt-oss-20b
+        version: "gpt-oss-20b"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 0.5 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+    
+      - id: gpt-4.1-nano
+        version: "gpt-4.1-nano"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 10.0 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+        
+      - id: gpt-4.1-mini
+        version: "gpt-4.1-mini"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 20.0 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+    
       - id: gpt-5-mini
         version: "gpt-5-mini"
         role: "default"
@@ -827,6 +938,43 @@ tasks:
         type: "rcl_interfaces/SetParameters"
 
     models:
+    
+      - id: gpt-oss-120b
+        version: "gpt-oss-120b"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 1.0 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+        
+      - id: gpt-oss-20b
+        version: "gpt-oss-20b"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 0.5 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+    
+      - id: gpt-4.1-nano
+        version: "gpt-4.1-nano"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 10.0 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+        
+      - id: gpt-4.1-mini
+        version: "gpt-4.1-mini"
+        role: "default"
+        metrics:
+          latency_ms: { typical: 20.0 }
+        resources:
+          device_pref: ["cloud"]
+        parameters: {}
+    
       - id: gpt-5-nano
         version: "gpt-5-nano"
         role: "default"
