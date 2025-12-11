@@ -45,7 +45,7 @@ class SkillInstance:
 
     # Active primitive handle for action states
     handle: "StepHandle" | None = None
-
+    is_root: bool = True
     
     
 # ───────────────────────────────────────────────────────────────────────────────
@@ -572,6 +572,7 @@ class SkillEngineV2:
             "started_ms": inst.started_ms,
             "activated": inst.activated,
             "done": inst.done,
+            "is_root": getattr(inst, "is_root", True),
         }
         if extra:
             payload.update(extra)
@@ -601,11 +602,12 @@ class SkillEngineV2:
         )
         child_ctx = dict(parent_inst.ctx)
         child_ctx.update(with_overrides)
-
+        
         child = SkillInstance(
             name=ref_name,
             ctx=child_ctx,
             started_ms=self._now_ms(),
+            is_root=False,          # NEW
         )
         # State-machine specific fields: start inactive, no state yet
         child.activated = False
@@ -711,7 +713,7 @@ class SkillEngineV2:
     # ------------------------------------------------------------------
     # State-machine operations
     # ------------------------------------------------------------------
-    def arm(self, skill_name: str, ctx: dict):
+    def arm(self, skill_name: str, ctx: dict, is_root: bool = True):
         s = self.registry.get(skill_name)
         if not s:
             raise KeyError(f"Unknown skill: {skill_name}")
@@ -729,13 +731,13 @@ class SkillEngineV2:
             name=skill_name,
             ctx=dict(ctx or {}),
             started_ms=self._now_ms(),
+            is_root=is_root,        # ← NEW
         )
         self._active.append(inst)
         if self.logger:
             self.logger.info(f"[SkillEngine] Armed state_machine '{skill_name}' ctx={ctx}")
 
         return inst
-
 
         
     def _spawn_nested_child(self, parent: SkillInstance, skill_name: str, ctx: dict) -> StepHandle:
@@ -747,7 +749,7 @@ class SkillEngineV2:
         child_ctx = dict(parent.ctx)
         child_ctx.update(ctx or {})
 
-        child_inst = self.arm(skill_name, child_ctx)
+        child_inst = self.arm(skill_name, child_ctx, is_root=False)
 
         h = StepHandle()
 
@@ -1248,6 +1250,13 @@ class SkillsAgent(Node):
             10,
         )
         
+        self.sub_tts_immediate = self.create_subscription(
+            StringMsg,
+            "/skills/tts_immediate",
+            self._on_tts_immediate,
+            10,
+        )
+        
         self._llm_speech_pending = {}   # req_id -> {"handle": StepHandle, "ctx": dict}
         self._llm_speech_next_id = 1
 
@@ -1374,12 +1383,25 @@ class SkillsAgent(Node):
             "done": true/false
           }
         """
+        # publish status as before
         try:
             msg = StringMsg()
             msg.data = json.dumps(event, ensure_ascii=False)
             self.skill_status_pub.publish(msg)
         except Exception as e:
             self.get_logger().warn(f"Failed to publish skill status: {e}")
+
+        # NEW: say something when a high-level skill finishes
+        try:
+            if event.get("kind") == "skill_finished" and event.get("is_root", True):
+                reason = event.get("reason", "")
+                self.get_logger().info(
+                    f"[SkillsAgent] High-level skill '{event.get('skill')}' finished; announcing."
+                )
+                self.say("Execution ended.")
+        except Exception as e:
+            self.get_logger().warn(f"Failed to emit final TTS on skill_finished: {e}")
+
 
 
     def _cb_tts_busy(self, msg: Bool):
@@ -1511,6 +1533,32 @@ class SkillsAgent(Node):
         self.skill_engine.run(name, ctx or {})
 
 
+    def _on_tts_immediate(self, msg: StringMsg):
+        """
+        One-shot immediate TTS. Does NOT touch the SkillEngine at all.
+        Expected payload:
+          - either plain text (msg.data is the text)
+          - or JSON: {"text": "..."}
+        """
+        text = msg.data or ""
+        try:
+            # Try to parse JSON first
+            obj = json.loads(msg.data)
+            if isinstance(obj, dict) and "text" in obj:
+                text = str(obj["text"])
+        except Exception:
+            # Not JSON, treat as raw text
+            pass
+
+        if not text.strip():
+            self.get_logger().warn("[tts_immediate] empty text, ignoring.")
+            return
+
+        self.get_logger().info(f"[tts_immediate] saying: {text!r}")
+        # This uses the existing normalization + publish to /tts
+        self.say(text)
+
+
     # Topic: /skills/execute
     def _on_execute_msg(self, msg: StringMsg):
         try:
@@ -1638,31 +1686,44 @@ class SkillsAgent(Node):
         if req_id is None:
             return
 
-        key = str(req_id)                     # <<< normalize to string
-        pending = self._vlm_pending.pop(req_id, None)
+        key = str(req_id)  # normalize to string
+        pending = self._vlm_pending.pop(key, None)
         if not pending:
+            self.get_logger().warn(f"[VLM] response for unknown id={key!r}")
             return
 
         handle: StepHandle = pending["handle"]
         ctx = pending["ctx"]
 
-        # Mirror the llm_speech_check structure but for images
+        # Parse json_text into a Python object, if present
+        raw_json = obj.get("json_text", "") or ""
+        parsed = None
+        if raw_json:
+            try:
+                parsed = json.loads(raw_json)
+            except Exception as e:
+                self.get_logger().warn(f"[VLM] failed to parse json_text: {e} (snippet={raw_json[:160]!r})")
+
+        # Mirror llm_speech_check, but with parsed structure
         ctx["vlm"] = {
             "success":  bool(obj.get("success", False)),
             "raw_text": obj.get("raw_text", ""),
-            "json_text": obj.get("json_text", ""),
+            "json_text": raw_json,
+            "parsed":   parsed,                   # ← NEW: structured dict/list
             "model_id": obj.get("model_id", ""),
-            "lat_ms": float(obj.get("lat_ms", 0.0)),
-            "tag": obj.get("tag", ""),
+            "lat_ms":   float(obj.get("lat_ms", 0.0)),
+            "tag":      obj.get("tag", ""),
         }
 
         self.get_logger().info(
-            f"[VLM] id={req_id} tag={ctx['vlm']['tag']} "
+            f"[VLM] id={key} tag={ctx['vlm']['tag']} "
             f"success={ctx['vlm']['success']} "
-            f"lat={ctx['vlm']['lat_ms']:.1f} ms"
+            f"lat={ctx['vlm']['lat_ms']:.1f} ms "
+            f"has_parsed={parsed is not None}"
         )
 
         handle.mark_done()
+
 
 
     def say(self, text: str):

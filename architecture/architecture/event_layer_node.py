@@ -113,7 +113,7 @@ class EventLayerNode(Node):
         # default includes trigger_speech_final
         self.declare_parameter(
             'always_on_trigger_ids_json',
-            '["trigger_speech_final"]'
+            '["trigger_speech_final", "trigger_idle"]'
         )
 
         # NEW: paths to skills YAML (same idea as SkillsAgent)
@@ -142,7 +142,7 @@ class EventLayerNode(Node):
             ids_raw = self.get_parameter('always_on_trigger_ids_json').get_parameter_value().string_value
             self.always_on_triggers = set(json.loads(ids_raw) or [])
         except Exception:
-            self.always_on_triggers = {"trigger_speech_final"}
+            self.always_on_triggers = {"trigger_speech_final", "trigger_idle"}
 
         # NEW: skills paths
         self.skills_base_path = self.get_parameter('skills_base_path').get_parameter_value().string_value
@@ -218,8 +218,117 @@ class EventLayerNode(Node):
             10,
         )
       
+        # --- LLM/VLM call machinery ---
+        # rules that own an llm_call block
+        self.llm_call_rules = []
+        # per-rule last call time (sec)
+        self._last_llm_call_ts: Dict[str, float] = {}
+        # lazily-created publishers for request topics (e.g. /vlm/req, /llm/speech_check_req)
+        self._llm_req_pubs: Dict[str, Any] = {}
+
 
         self.get_logger().info("event_layer_node (expr) up")
+
+    def _publish_llm_request(self, llm_cfg: dict, envelope: dict):
+        """
+        Publish the envelope as JSON to the appropriate request topic.
+
+        Defaults:
+          task == 'vlm_inference'   -> /vlm/req
+          task == 'llm_speech_check'-> /llm/speech_check_req
+        You can override with llm_call.request_topic.
+        """
+        if not envelope:
+            return
+
+        task = llm_cfg.get("task", "")
+        topic = llm_cfg.get("request_topic")
+
+        if not topic:
+            if task == "vlm_inference":
+                topic = "/vlm/req"
+            elif task == "llm_speech_check":
+                topic = "/llm/speech_check_req"
+            else:
+                # fallback generic channel if you add one later
+                topic = "/llm/req"
+
+        # lazily create publisher per topic
+        pub = self._llm_req_pubs.get(topic)
+        if pub is None:
+            pub = self.create_publisher(StringMsg, topic, 10)
+            self._llm_req_pubs[topic] = pub
+            self.get_logger().info(f"EventLayer: created LLM/VLM req publisher on {topic}")
+
+        try:
+            pub.publish(StringMsg(data=json.dumps(envelope)))
+        except Exception as e:
+            self.get_logger().warn(f"EventLayer: failed to publish LLM/VLM request on {topic}: {e}")
+
+
+    def _build_llm_request_envelope(self, rule: dict, llm_cfg: dict) -> Optional[dict]:
+        """
+        Construct a JSON-serializable request envelope for an llm_call rule.
+
+        For now:
+          - task 'vlm_inference' -> /vlm/req (no text field required)
+          - task 'llm_speech_check' -> /llm/speech_check_req (needs 'text')
+        """
+        rid = str(rule.get("id") or "")
+        if not rid:
+            return None
+
+        now_ms = int(self._now() * 1000)
+        req_id = f"{rid}:{now_ms}"
+
+        prompt_template = llm_cfg.get("prompt_template", "") or ""
+        output_schema = llm_cfg.get("output_schema", "") or ""
+        tag = llm_cfg.get("tag", "") or rid
+
+        env = {
+            "id": req_id,
+            "prompt": prompt_template,
+            "output_schema": output_schema,
+            "tag": tag,
+            # 'mode' is optional; VLM ignores it, but it's handy for future routing
+            "mode": llm_cfg.get("mode", "generic"),
+            # also include the originating rule id for debugging
+            "rule_id": rid,
+        }
+
+        task = llm_cfg.get("task", "")
+
+        # For llm_speech_check, we MUST provide 'text'
+        if task == "llm_speech_check":
+            # Allow override; default to 'speech_final_any'
+            src_rule = llm_cfg.get("text_from_rule_id", "speech_final_any")
+            last_evt = self._latest_payload_for_rule(src_rule)
+            text = ""
+            if last_evt and isinstance(last_evt, dict):
+                # last_evt is the payload we gave to _publish_basic
+                data = last_evt.get("data") or last_evt
+                text = (data.get("text") or "").strip()
+            if not text:
+                # nothing to check, skip this call
+                self.get_logger().info(
+                    f"LLM call for rule '{rid}' skipped: no text from '{src_rule}'."
+                )
+                return None
+            env["text"] = text
+
+        # For VLM, just use prompt/metadata; no extra fields required by the server
+        return env
+
+
+    def _latest_payload_for_rule(self, rule_id: str) -> Optional[dict]:
+        """
+        Return the most recent payload for a given basic rule id, or None.
+        Uses self.rule_hits[rule_id], where entries are (ts, payload).
+        """
+        dq = self.rule_hits.get(str(rule_id))
+        if not dq:
+            return None
+        return dq[-1][1]  # (ts, payload) -> payload
 
 
     # ---------- utils ----------
@@ -557,6 +666,15 @@ class EventLayerNode(Node):
                     topic = ros.get("topic"); msg = ros.get("msg")
                     if topic and msg:
                         self.desired_topics[topic] = msg
+
+        # --- LLM/VLM call rules (those that declare llm_call: {...}) ---
+        self.llm_call_rules = [
+            r for r in self.rules_enabled
+            if isinstance(r.get("llm_call"), dict)
+        ]
+        # reset last-call timestamps when rules reload
+        self._last_llm_call_ts = {}
+
 
         self.get_logger().info(f"Enabled rules: {[r['id'] for r in self.rules_enabled]}")
         self.get_logger().info(f"Desired topics: {list(self.desired_topics.keys())}")
@@ -1345,8 +1463,49 @@ class EventLayerNode(Node):
                 if self._is_one_shot_candidate(r):
                     self._mark_one_shot_fired(rid)
 
+        # 2) NEW: LLM/VLM call rules (llm_call: {...})
+        for r in self.llm_call_rules:
+            rid = str(r.get("id") or "")
+            if not rid:
+                continue
 
-        # 2) Edge rule timeouts → synthesize OFF when no hit for window
+            if rid in self.bad_rules:
+                continue
+
+            # if rule is one-shot and already fired, do not call again
+            if self._has_one_shot_fired(rid):
+                continue
+
+            llm_cfg = r.get("llm_call") or {}
+            min_period_ms = int(llm_cfg.get("min_period_ms", 0))
+            last_ts = self._last_llm_call_ts.get(rid, 0.0)
+            if min_period_ms > 0 and (now - last_ts) * 1000.0 < min_period_ms:
+                # still in cooldown
+                continue
+
+            expr = r.get("expr", "")
+            try:
+                ok = bool(safe.eval(expr, {}))
+            except Exception as e:
+                self._quarantine_rule(rid, "expr_error_llm_call", e, "composite")
+                continue
+
+            if not ok:
+                continue
+
+            # Build request envelope (may return None if missing text, etc.)
+            env = self._build_llm_request_envelope(r, llm_cfg)
+            if not env:
+                continue
+
+            self._publish_llm_request(llm_cfg, env)
+            self._last_llm_call_ts[rid] = now
+
+            # Optionally treat llm_call rules as one-shot if marked
+            if self._is_one_shot_candidate(r):
+                self._mark_one_shot_fired(rid)
+
+        # 3) Edge rule timeouts → synthesize OFF when no hit for window
         for r in self.rules_enabled:
             if r.get("type") == "composite":
                 continue
@@ -1356,11 +1515,11 @@ class EventLayerNode(Node):
                 continue
 
             rid = str(r["id"])
-            
+
             # NEW: for one-shot rules, once they fired, don't bother creating OFF events
             if self._has_one_shot_fired(rid):
                 continue
-            
+
             state = self._edge_states.get(rid)
             if not state or not state.active:
                 continue
@@ -1385,8 +1544,7 @@ class EventLayerNode(Node):
             }
             self._publish_basic(rid, payload)
 
-                
-                
+ 
 def main():
     rclpy.init()
     node = EventLayerNode()

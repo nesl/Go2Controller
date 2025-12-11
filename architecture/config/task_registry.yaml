@@ -729,7 +729,6 @@ tasks:
           fields:
             - { name: id,        type: "string", desc: "Correlation id copied from request (if used)" }
             - { name: success,   type: "bool",   desc: "True if VLM call & JSON normalization succeeded" }
-            - { name: raw_text,  type: "string", desc: "Raw VLM completion text (may not be valid JSON)" }
             - { name: json_text, type: "string", desc: "Normalized STRICT JSON string, or empty if parse failed" }
             - { name: model_id,  type: "string", desc: "Model id used for this request" }
             - { name: lat_ms,    type: "float",  desc: "End-to-end latency in milliseconds" }

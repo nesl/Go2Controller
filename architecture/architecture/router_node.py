@@ -24,7 +24,7 @@ import json
 import time
 import os
 from collections import deque
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import yaml
 
@@ -109,6 +109,66 @@ ROUTER_SCHEMA: Dict[str, Any] = {
     },
     "additionalProperties": False,
 }
+
+FAST_SKILLS_LIST_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": ["skills"],
+    "properties": {
+        "name": {"type": "string"},  # optional custom name for the composite
+        "skills": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["use"],
+                "properties": {
+                    "use": {"type": "string"},
+                    "with": {"type": "object"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    "additionalProperties": False,
+}
+
+FAST_SKILLS_SYSTEM_PROMPT = """
+You are a FAST REACTIVE SEQUENCE SELECTOR for a mobile robot called Bob.
+
+You receive:
+  - router_capsule: trigger info
+  - skills_inventory: available skills (primitives + composites/state_machines),
+    each with:
+      * name, kind, description
+      * params_template: example/default parameters for that skill
+      * param_keys: list of allowed parameter names for that skill
+
+Your ONLY job is to propose a SHORT SEQUENCE of existing skills to execute
+immediately, in order.
+
+Requirements:
+- Each step must reference an EXISTING skill name from skills_inventory.
+- Do NOT invent skill names.
+- Keep the sequence short (1–3 steps).
+- Use "with" to pass small argument dicts only (e.g. {"text": "..."}).
+- When filling "with", only use keys that appear in param_keys for that skill,
+  and follow the structure suggested by params_template.
+
+Output STRICT JSON ONLY:
+
+{
+  "name": "reactive.<something>",   // optional, can be omitted
+  "skills": [
+    {
+      "use": "<existing_skill_name>",
+      "with": { ... optional params ... }
+    },
+    ...
+  ]
+}
+""".strip()
+
+
+
 
 
 # ─────────────────────────────
@@ -222,6 +282,7 @@ class RouterNode(Node):
             "trigger_map_json",
             json.dumps({
                 "trigger_speech_final": "human_command",
+                "trigger_idle": "idle"
             }),
         )
         self.trigger_map = json.loads(
@@ -305,6 +366,63 @@ class RouterNode(Node):
         }
 
 
+        # Client to reload skills after adding a fast composite
+        self.reload_skills_client = self.create_client(
+            Trigger,
+            "/skills/reload",
+        )
+
+
+        # --- Fast skills selector config (YAML paths like orchestrator) ---
+        self.declare_parameter("skills_base_path", "")
+        self.declare_parameter("skills_composite_path", "")
+        self.declare_parameter("rules_init_path", "")
+        self.declare_parameter("rules_path", "")
+
+        self.skills_base_path = (
+            self.get_parameter("skills_base_path")
+            .get_parameter_value()
+            .string_value
+        )
+        self.skills_composite_path = (
+            self.get_parameter("skills_composite_path")
+            .get_parameter_value()
+            .string_value
+        )
+        self.rules_init_path = (
+            self.get_parameter("rules_init_path")
+            .get_parameter_value()
+            .string_value
+        )
+        self.rules_path = (
+            self.get_parameter("rules_path")
+            .get_parameter_value()
+            .string_value
+        )
+
+        # Skill selector model (can be smaller than router model if you like)
+        self.declare_parameter("skill_selector_model", self.model)
+        self.skill_selector_model = (
+            self.get_parameter("skill_selector_model")
+            .get_parameter_value()
+            .string_value
+        )
+
+        # Publisher to ask SkillsAgent to execute a skill immediately
+        self.fast_execute_pub = self.create_publisher(
+            StringMsg,
+            "/skills/execute",
+            10,
+        )
+
+        # Prefix for auto-generated fast-reactive skills
+        self.declare_parameter("router_skill_prefix", "router_fast.")
+        self.router_skill_prefix = (
+            self.get_parameter("router_skill_prefix")
+            .get_parameter_value()
+            .string_value
+        )
+
         # Track recent event trace for context (only very compact info)
         self._event_trace = deque(maxlen=20)
 
@@ -318,6 +436,12 @@ class RouterNode(Node):
         )
         self.sub_comp = self.create_subscription(
             StringMsg, "/events/composite", self._on_comp_event, 500
+        )
+
+        self.skills_tts_pub = self.create_publisher(
+            StringMsg,
+            "/skills/tts_immediate",
+            10,
         )
 
         # Subscriptions: perf topics
@@ -716,6 +840,175 @@ class RouterNode(Node):
         role_dict[model] = ent
         self._perf_ema[role] = role_dict
 
+    # ─────────────────────────
+    # Skills / rules inventory for selector
+    # ─────────────────────────
+
+    def _build_skills_inventory(self) -> Dict[str, Any]:
+        """
+        Build a small skills inventory for the selector LLM.
+
+        We now expose:
+          - name
+          - kind
+          - description
+          - params_template (original 'params' dict from YAML)
+          - param_keys (list of parameter names)
+          - action (for primitives)
+        """
+        primitives: List[Dict[str, Any]] = []
+        composites: List[Dict[str, Any]] = []
+
+        # For the router's fast selector we only need base skills (not dynamic).
+        # If you want composites too, you can add self.skills_composite_path in the list.
+        for path in [self.skills_base_path]:
+            doc = self._read_yaml_if_exists(path) or {}
+            for s in doc.get("skills", []) or []:
+                if not isinstance(s, dict):
+                    continue
+
+                name = str(s.get("name", "")).strip()
+                if not name:
+                    continue
+
+                kind = str(s.get("kind", "")).strip() or "primitive"
+                description = str(s.get("description", "")).strip()
+                params_template = s.get("params") or {}
+
+                entry: Dict[str, Any] = {
+                    "name": name,
+                    "kind": kind,
+                    "description": description,
+                    "params_template": params_template,
+                    "param_keys": (
+                        list(params_template.keys())
+                        if isinstance(params_template, dict)
+                        else []
+                    ),
+                }
+
+                if kind == "primitive":
+                    # Expose underlying action as well
+                    entry["action"] = s.get("action", "")
+                    primitives.append(entry)
+                else:
+                    # For composites/state_machines we at least expose params;
+                    # if later you want states, you can add them here.
+                    composites.append(entry)
+
+        return {
+            "primitives": primitives,
+            "composites": composites,
+        }
+
+    def _build_rules_inventory(self) -> Dict[str, Any]:
+        """
+        Combined rules inventory for the selector LLM.
+        We expose only coarse info.
+        """
+        rules = []
+
+        for path in [self.rules_init_path, self.rules_path]:
+            doc = self._read_yaml_if_exists(path) or {}
+            for r in doc.get("rules", []) or []:
+                if not isinstance(r, dict):
+                    continue
+                rules.append(
+                    {
+                        "id": str(r.get("id", "")),
+                        "type": r.get("type", "basic"),
+                        "enabled": bool(r.get("enabled", True)),
+                    }
+                )
+
+        return {"rules": rules}
+
+    def _select_fast_skill(
+        self,
+        trig_type: str,
+        capsule: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Heuristic fast skills selector.
+
+        Returns:
+          {"skill": "<name>", "ctx": {...}}  or None if no good candidate.
+        """
+
+        # 1) Load skills inventory (base + composite)
+        skills_inv = self._build_skills_inventory()
+        all_skill_names = {
+            s["name"] for group in skills_inv.values() for s in group
+        }
+
+        if not all_skill_names:
+            self.get_logger().warn("[router] no skills found in YAML; fast selector disabled")
+            return None
+
+        # 2) Extract trigger text (if any) to pass into ctx
+        trig = capsule.get("trigger") or {}
+        text = str(trig.get("text") or "").strip()
+
+        # 3) Preferred "reactive skill" if present
+        if self.fast_reactive_skill_name in all_skill_names:
+            ctx = {}
+            # Special case: tts.say is a primitive we usually want to feed text into
+            if self.fast_reactive_skill_name == "tts.say":
+                ctx["text"] = text or "OK, working on it."
+            return {
+                "skill": self.fast_reactive_skill_name,
+                "ctx": ctx,
+            }
+
+        # 4) Fallback heuristics based on common patterns
+
+        # If there is any obvious "interact.*" state machine, prefer that
+        interact_candidates = [
+            name
+            for name in all_skill_names
+            if name.startswith("interact.") or name.startswith("reactive.")
+        ]
+        if interact_candidates:
+            chosen = sorted(interact_candidates)[0]
+            return {
+                "skill": chosen,
+                "ctx": {"text": text} if text else {},
+            }
+
+        # Last resort: if we at least have tts.say, use that
+        if "tts.say" in all_skill_names:
+            return {
+                "skill": "tts.say",
+                "ctx": {"text": text or "OK."},
+            }
+
+        # No suitable candidate
+        self.get_logger().info("[router] fast selector found no suitable skill")
+        return None
+
+    def _execute_fast_skill(self, entry: Dict[str, Any]):
+        """
+        Publish a /skills/execute command for a fast reactive skill.
+        """
+        try:
+            skill_name = str(entry.get("skill") or "")
+            if not skill_name:
+                return
+            ctx = entry.get("ctx") or {}
+            payload = {"skill": skill_name, "ctx": ctx}
+            self.fast_execute_pub.publish(
+                StringMsg(data=json.dumps(payload))
+            )
+            self.get_logger().info(
+                f"[router] FAST selector: armed skill '{skill_name}' with ctx={ctx}"
+            )
+        except Exception as e:
+            self.get_logger().error(
+                f"[router] FAST selector: failed to publish skill execute: {e}"
+            )
+
+
+
     def _perf_summary(self) -> Dict[str, Dict[str, Any]]:
         """
         Return a compact summary for the router LLM, combining:
@@ -798,6 +1091,27 @@ class RouterNode(Node):
             "perf": self._perf_summary(),
         }
 
+        # QUICK ACK: on human_command, ask SkillsAgent to say something immediately
+        if trig_type == "human_command":
+            ack_text = "I hear you. Give me a second."
+            # Optionally customize based on payload text:
+            # if text:
+            #     ack_text = f"I heard you say: {text}"
+
+            try:
+                payload_tts = {"text": ack_text}
+                self.skills_tts_pub.publish(
+                    StringMsg(data=json.dumps(payload_tts))
+                )
+                self.get_logger().info(
+                    f"[router] human_command: sent immediate TTS ack: {ack_text!r}"
+                )
+            except Exception as e:
+                self.get_logger().error(
+                    f"[router] failed to publish immediate TTS ack: {e}"
+                )
+
+
         # NEW: include compact HDT profiles if we have them
         if self._profiles_compact:
             router_capsule["humans"] = self._profiles_compact
@@ -817,8 +1131,14 @@ class RouterNode(Node):
             self.get_logger().info(
                 f"[router] router_capsule trigger={rule} type={trig_type}, calling LLM"
             )
+            
+            messages = [
+                {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(router_capsule, ensure_ascii=False)},
+            ]
+            
             try:
-                policy = self.call_router_llm(router_capsule)
+                policy = self.call_router_llm(messages)
             except Exception as e:
                 self.get_logger().error(
                     f"[router] LLM router call failed, falling back to default policy: {e}"
@@ -834,57 +1154,282 @@ class RouterNode(Node):
             )
             policy = self.default_policy(router_capsule)
 
+        if trig_type == "idle":
+            policy["latency_profile"] = "deliberative"
+            policy["nodes"] = {
+                "broker":       {"tier": "balanced"},
+                "planner":      {"tier": "thorough"},
+                "hdt":          {"tier": "balanced"},
+                "orchestrator": {"tier": "balanced"},
+            }
+
         self.apply_policy(policy)
 
+         # ─────────────────────────
+        # FAST reactive skills path (LLM-based)
+        # ─────────────────────────
+        used_fast_sequence = False
+        try:
+            latency_profile = policy.get("latency_profile")
+        except Exception:
+            latency_profile = None
 
-        # NEW: after we know the policy, decide whether to tell the broker to run
-        self._maybe_call_broker_run_initial(trig_type=trig_type, policy=policy)
+        if latency_profile == "fast_reactive" and trig_type == "human_command":
+            skills_obj = self.call_skill_selector_llm(
+                router_capsule=router_capsule,
+                trig_type=trig_type,
+            )
+            if skills_obj:
+                sm = self._skills_list_to_state_machine(
+                    skills_obj,
+                    rule=rule,
+                    trig_type=trig_type,
+                )
+                if sm:
+                    to_execute = {
+                        "skill": sm["name"],
+                        "ctx": {},  # optional: put trigger text or other info here
+                    }
+                    self._append_composite_and_reload(sm, to_execute)
+                    used_fast_sequence = True
+                else:
+                    self.get_logger().info(
+                        "[router] fast skills LLM returned list but no valid state_machine"
+                    )
+            else:
+                self.get_logger().info(
+                    "[router] fast skills LLM did not return a usable skills list"
+                )
+
+        # ─────────────────────────
+        # Broker: ONLY if we did NOT run a fast sequence
+        # ─────────────────────────
+        if not used_fast_sequence:
+            self._maybe_call_broker_run_initial(trig_type=trig_type, policy=policy)
+        else:
+            self.get_logger().info(
+                "[router] fast selector used; skipping broker initial run for this trigger"
+            )
+
+
+
+    def call_skill_selector_llm(self, router_capsule, trig_type):
+        
+        skills_inventory = self._build_skills_inventory()
+        #rules_inventory = self._build_rules_inventory()
+
+        context_capsule_fields = ['trigger', 'recent_events', 'humans']
+
+        payload = {
+            "trigger_type": trig_type,
+            "router_capsule": {r_field:router_capsule[r_field] for r_field in context_capsule_fields if r_field in router_capsule.keys()},
+            "skills_inventory": skills_inventory,
+        }
+
+        messages = [
+            {"role": "system", "content": FAST_SKILLS_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+
+        obj = self.call_router_llm(messages, model=self.skill_selector_model)
+
+        validate(instance=obj, schema=FAST_SKILLS_LIST_SCHEMA)
+        return obj
+
+    def _skills_list_to_state_machine(
+        self,
+        skills_obj: Dict[str, Any],
+        rule: str,
+        trig_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Turn {"name":?, "skills":[{use,with},...]} into a state_machine skill
+        that skills_node understands, with a router-specific name prefix.
+        """
+        skills = skills_obj.get("skills") or []
+        if not isinstance(skills, list) or not skills:
+            self.get_logger().warn(
+                "[router] fast skills list is empty; nothing to build"
+            )
+            return None
+
+        # Decide on a base name from LLM, if any
+        base_name = str(skills_obj.get("name") or "").strip()
+        suffix = int(time.time() * 1000)
+
+        if not base_name:
+            base_name = f"{trig_type}.{rule}.{suffix}"
+
+        # Enforce router prefix
+        prefix = getattr(self, "router_skill_prefix", "router_fast.")
+        if not base_name.startswith(prefix):
+            base_name = prefix + base_name
+
+        # Build states: one action per list item
+        states: List[Dict[str, Any]] = []
+        for idx, step in enumerate(skills):
+            use = str(step.get("use") or "").strip()
+            if not use:
+                continue
+            with_params = step.get("with") or {}
+            state_id = f"s{idx+1}"
+            next_state = f"s{idx+2}" if idx < len(skills) - 1 else None
+            states.append(
+                {
+                    "id": state_id,
+                    "type": "action",
+                    "action": {
+                        "use": use,
+                        "with": with_params,
+                    },
+                    "on_complete": next_state,
+                    "on_failure": None,
+                }
+            )
+
+        if not states:
+            self.get_logger().warn(
+                "[router] after filtering, no valid states in fast skills list"
+            )
+            return None
+
+        sm = {
+            "name": base_name,
+            "kind": "state_machine",
+            "description": (
+                f"auto-generated fast reactive sequence for {trig_type}/{rule}"
+            ),
+            "params_template": {},
+            "param_keys": [],
+            "when": {},          # arm immediately
+            "until": {},
+            "initial_state": states[0]["id"],
+            "states": states,
+        }
+        return sm
+
+
+    def _append_composite_and_reload(
+        self,
+        composite_skill: Dict[str, Any],
+        to_execute: Dict[str, Any],
+    ):
+        """
+        Append composite_skill to skills_composite.yaml, reload skills,
+        then execute to_execute via /skills/execute.
+        """
+        if not self.skills_composite_path:
+            self.get_logger().warn(
+                "[router] no skills_composite_path set; cannot persist fast sequence"
+            )
+            return
+
+        # Read or init doc
+        doc = self._read_yaml_if_exists(self.skills_composite_path) or {
+            "version": 2,
+            "defaults": {"window_ms": 3000},
+            "skills": [],
+        }
+        skills_list = doc.get("skills") or []
+        skills_list.append(composite_skill)
+        doc["skills"] = skills_list
+
+        try:
+            with open(self.skills_composite_path, "w") as f:
+                yaml.safe_dump(doc, f, sort_keys=False)
+            self.get_logger().info(
+                f"[router] wrote fast composite '{composite_skill['name']}' to skills_composite.yaml"
+            )
+        except Exception as e:
+            self.get_logger().error(
+                f"[router] failed to write skills_composite.yaml: {e}"
+            )
+            return
+
+        # Reload skills, then execute
+        def _after_reload(_future):
+            try:
+                res = _future.result()
+                if res and res.success:
+                    self.get_logger().info(
+                        f"[router] /skills/reload after fast sequence ok: {res.message}"
+                    )
+                else:
+                    self.get_logger().warn(
+                        "[router] /skills/reload after fast sequence failed or returned None"
+                    )
+            except Exception as e:
+                self.get_logger().warn(
+                    f"[router] /skills/reload call error after fast sequence: {e}"
+                )
+
+            self._execute_fast_skill(to_execute)
+
+        if self.reload_skills_client.wait_for_service(timeout_sec=1.0):
+            req = Trigger.Request()
+            fut = self.reload_skills_client.call_async(req)
+            fut.add_done_callback(_after_reload)
+        else:
+            self.get_logger().warn(
+                "[router] /skills/reload not available; executing fast sequence without reload"
+            )
+            self._execute_fast_skill(to_execute)
+
+
 
     # ─────────────────────────
     # LLM call
     # ─────────────────────────
 
-    def call_router_llm(self, capsule: Dict[str, Any]) -> Dict[str, Any]:
+    def call_router_llm(
+        self,
+        messages: list,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
-        Call mini router LLM and return a policy dict.
+        Generic LLM call wrapper. Reused for:
+          - router policy selection
+          - fast skill selection
+          - any other lightweight LLM call in router
         """
-        capsule_str = json.dumps(capsule, ensure_ascii=False)
 
-        messages = [
-                {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-                {"role": "user", "content": capsule_str},
-            ]
+        self.get_logger().info(
+            f'\n=== ROUTER LLM RAW PROMPT ===\n{messages}\n'
+        )
 
-        self.get_logger().info("\n=== ROUTER PROMPT ===\n" + json.dumps(messages, indent=2))
+        model = model or self.model
 
         t0 = time.time()
 
-        if "gpt-oss" in self.model:
+        if "gpt-oss" in model:
             client = Groq()
             resp = client.chat.completions.create(
-                model='openai/' + self.model,
+                model='openai/' + model,
                 messages=messages,
                 reasoning_effort="medium",
-                response_format={"type": "json_object"})  
+                response_format={"type": "json_object"},
+            )
         else:
             client = OpenAI()
             resp = client.chat.completions.create(
-                model=self.model,
+                model=model,
                 messages=messages,
                 response_format={"type": "json_object"},
             )
-        
-      
 
         t1 = time.time()
         lat_ms = (t1 - t0) * 1000.0
-        
+
         content = resp.choices[0].message.content
-        
-        self.get_logger().info("\n=== ROUTER LLM RAW RESPONSE ===\n" + content + "\n" + "Latency: " + str(lat_ms) + '\n')
-        
-        policy = json.loads(content)
-        return policy
+        self.get_logger().info(
+            "\n=== ROUTER LLM RAW RESPONSE ===\n" +
+            content +
+            "\nLatency: " +
+            str(lat_ms) +
+            "\n"
+        )
+
+        return json.loads(content)
 
     # ─────────────────────────
     # Fallback policy

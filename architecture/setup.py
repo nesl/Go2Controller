@@ -33,6 +33,10 @@ setup(
             'orchestrator_node = architecture.orchestrator_node:main',
             'hdt_node = architecture.hdt:main',
             'router_node = architecture.router_node:main',
+            'reactive_node = architecture.reactive_node:main',
+            'coordinator_node = architecture.coordinator_node:main',
+            'taskstatemonitor_node = architecture.taskstatemonitor_node:main',
+            'hdt2_node = architecture.hdt2_node:main',
         ],
     },
 )

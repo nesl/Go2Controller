@@ -76,13 +76,11 @@ skills:
   # until either a presence is detected or the user interrupts (speech_final_any).
   - name: base.turn_search
     kind: state_machine
-    description: "Sweep left–right in place to visually search for humans or new stimuli."
+    description: "Sweep left in place to visually search for humans or new stimuli."
     when: {}
     until:
       any:
         - exists: human_detected_3d
-        - exists: speech_final_any
-          within_ms: 1
     initial_state: turn_left_1
     states:
       - id: turn_left_1
@@ -91,15 +89,6 @@ skills:
           use: nav.move_relative
           with:
             azimuth_deg: 45.0
-            dist_m: 0.0
-        on_complete: turn_right
-
-      - id: turn_right
-        type: action
-        action:
-          use: nav.move_relative
-          with:
-            azimuth_deg: -90.0
             dist_m: 0.0
         on_complete: turn_left_2
 
@@ -110,7 +99,61 @@ skills:
           with:
             azimuth_deg: 45.0
             dist_m: 0.0
-        on_complete: null   # no next state -> finish
+        on_complete: turn_left_3
+
+      - id: turn_left_3
+        type: action
+        action:
+          use: nav.move_relative
+          with:
+            azimuth_deg: 45.0
+            dist_m: 0.0
+        on_complete: turn_left_4
+        
+      - id: turn_left_4
+        type: action
+        action:
+          use: nav.move_relative
+          with:
+            azimuth_deg: 45.0
+            dist_m: 0.0
+        on_complete: turn_left_5
+        
+      - id: turn_left_5
+        type: action
+        action:
+          use: nav.move_relative
+          with:
+            azimuth_deg: 45.0
+            dist_m: 0.0
+        on_complete: turn_left_6
+        
+      - id: turn_left_6
+        type: action
+        action:
+          use: nav.move_relative
+          with:
+            azimuth_deg: 45.0
+            dist_m: 0.0
+        on_complete: turn_left_7
+        
+      - id: turn_left_7
+        type: action
+        action:
+          use: nav.move_relative
+          with:
+            azimuth_deg: 45.0
+            dist_m: 0.0
+        on_complete: turn_left_8
+        
+      - id: turn_left_8
+        type: action
+        action:
+          use: nav.move_relative
+          with:
+            azimuth_deg: 45.0
+            dist_m: 0.0
+        on_complete: null
 
 
   # Greet with presence; only speak if the person actually engages.
@@ -157,7 +200,7 @@ skills:
 
   - name: sense.here
     kind: state_machine
-    description: "Stay idle and wait for a fixed duration; used as a cheap sensing/timeout segment."
+    description: "Sense the location where the robot is currently in."
     when: {}
     until: {}
     initial_state: wait_only
@@ -175,89 +218,6 @@ skills:
   # ─────────────────────────────
   # NEW SHORT-TERM / REACTIVE SKILLS
   # ─────────────────────────────
-
-  - name: social.ack_name_ping
-    kind: state_machine
-    description: "Turn toward the last speaker and verbally acknowledge that Bob heard them."
-    when: {}
-    until: {}
-    initial_state: orient_toward_speaker
-    states:
-      - id: orient_toward_speaker
-        type: action
-        action:
-          use: nav.move_relative
-          with:
-            azimuth_deg: "{{ rule.speech_final_with_doa.azimuth_deg | default:0 }}"
-            dist_m: 0.0
-        on_complete: say_hello
-
-      - id: say_hello
-        type: action
-        action:
-          use: tts.say
-          with:
-            text: "Hi, I’m here and listening."
-        on_complete: done
-
-      - id: done
-        type: wait
-        wait_for:
-          any_of: []
-        on_event: null
-        on_timeout: null
-
-
-  - name: social.reply_greeting_and_ask
-    kind: state_machine
-    description: "Reply to a greeting and explicitly ask the human what they need."
-    when: {}
-    until: {}
-    initial_state: greet_back
-    states:
-      - id: greet_back
-        type: action
-        action:
-          use: tts.say
-          with:
-            text: "Hello! How can I help you?"
-        on_complete: wait_for_followup
-
-      - id: wait_for_followup
-        type: wait
-        wait_for:
-          any_of:
-            - rule_id: "speech_final_any"
-              within_ms: 6000
-        on_event: null
-        on_timeout: null
-
-
-  - name: social.greet_with_ping
-    kind: state_machine
-    description: "When human presence and a greeting co-occur, wave and greet them explicitly."
-    when:
-      all:
-        - exists: human_ping_here
-          within_ms: 2500
-    until: {}
-    initial_state: gesture_then_greet
-    states:
-      - id: gesture_then_greet
-        type: action
-        action:
-          use: gesture.greet
-          with: {}
-        on_complete: say_hi
-
-      - id: say_hi
-        type: action
-        action:
-          use: tts.say
-          with:
-            text: "Hi! I see you here."
-        on_complete: null
-
 
   - name: beacons.announce_strongest_here
     kind: state_machine
@@ -325,7 +285,7 @@ skills:
         wait_for:
           any_of:
             - rule_id: "vlm_scene_ready"
-              within_ms: 3000
+              within_ms: 8000
         on_event: say_scene
         on_timeout: null
 
@@ -341,17 +301,16 @@ skills:
 
   - name: nav.turn_to_speaker
     kind: state_machine
-    description: "Rotate the base to face the direction of the last completed utterance."
+    description: "Use the generic turn search behavior to look for a human."
     when: {}
     until: {}
-    initial_state: turn_once
+    initial_state: search
     states:
-      - id: turn_once
+      - id: search
         type: action
         action:
-          use: nav.move_relative
-          with:
-            azimuth_deg: "{{ rule.speech_final_with_doa.azimuth_deg | default:0 }}"
-            dist_m: 0.0
+          use: base.turn_search
+          with: {}
         on_complete: null
+
 

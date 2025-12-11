@@ -130,7 +130,7 @@ class BrokerNode(Node):
         )
         
         # NEW: enable/disable use of LLM (everything else still works)
-        self.declare_parameter("llm_enabled", True)
+        self.declare_parameter("llm_enabled", False)
         self.llm_enabled = (
             self.get_parameter("llm_enabled")
             .get_parameter_value()
@@ -151,7 +151,7 @@ class BrokerNode(Node):
         )
         
         # --- Event-trace summarizer parameters ---
-        self.declare_parameter("event_summary_enabled", True)
+        self.declare_parameter("event_summary_enabled", False)
         self.declare_parameter("event_summary_model", "gpt-4o-mini")  # fast, cheap, small context
 
         self.event_summary_enabled = (
@@ -237,6 +237,16 @@ class BrokerNode(Node):
         self._event_trace = deque(maxlen=40)       # compact recent events
         self._current_trigger = None               # {"type": "...", "hints": {...}}
         self._ws = {}                               # ws_id -> {"hashes": set(), "iters": int}
+
+        # NEW: robot objective & timing for task state
+        self._robot_objective: Optional[str] = None
+        self._start_time = time.time()
+
+        # NEW: /task_state publisher
+        self.pub_task_state = self.create_publisher(StringMsg, "/task_state", 10)
+
+        # NEW: periodic TaskState tick (e.g., 2 Hz)
+        self.create_timer(0.5, self._tick_task_state)
 
         # NEW: last known robot zone (from event-layer)
         self._last_robot_zone: Optional[str] = None
@@ -916,6 +926,21 @@ class BrokerNode(Node):
             self._ingest_bt_reading(data, o)
         elif rule == self.human3d_rule_id:
             self._ingest_human3d(data, o)
+
+        # --- NEW: track robot_objective from skill status events (via EventLayer) ---
+        # Expect EventLayer skill_status payload to include fields like:
+        #   { "kind": "skill_started" | "skill_finished", "skill": "<name>", "done": bool, ... }
+        try:
+            if rule == "skill_started_any":
+                skill_name = (data.get("skill") or "").strip()
+                if skill_name:
+                    self._robot_objective = f"execute:{skill_name}"
+            elif rule == "skill_done_any":
+                # when a skill finishes, clear objective
+                if data.get("done", False):
+                    self._robot_objective = None
+        except Exception as e:
+            self.get_logger().debug(f"robot_objective update failed: {e}")
 
         '''
         # Proactive: if this event is a planning trigger, immediately run initial LLM-SQL
@@ -1734,6 +1759,235 @@ class BrokerNode(Node):
         res.success = True
         res.message = json.dumps(payload)
         return res
+
+    # ------------------------------ TaskState aggregation ------------------------------
+
+    def _compute_task_state(self) -> dict:
+        """
+        Build a compact TaskState snapshot from the DB + agent status + recent events.
+
+        Shape (approx):
+
+          {
+            "ts": ...,
+            "robot": { ... },
+            "agents": { "robot": {...}, "human_a": {...}, "human_b": {...} },
+            "zones": {
+              "A": { "total":..., "pending":..., "in_basket":..., "delivered_clean":..., "delivered_contaminated":..., "progress": ... },
+              "B": {...},
+              "unknown": {...}
+            },
+            "bottlenecks": [...],
+            "robot_objective": "execute:<skill>" or null,
+            "subgoals": { "collect_zone_A": {...}, ... },
+            "time": { "elapsed_sec": ..., "remaining_estimate_sec": null },
+            "bt_summary": {
+              "by_zone": { "A": {...}, "B": {...}, "unknown": {...} },
+              "objects": { "CNode001": {...}, ... }
+            },
+            "high_level_objective": {
+              "kind": "unknown",
+              "note": "planner may override / refine this"
+            }
+          }
+        """
+        now = time.time()
+
+        # --- Agents (robot + humans) from agent_status ---
+        agents: Dict[str, dict] = {}
+        try:
+            rows = self.conn.execute(
+                "SELECT agent_id, zone, x, y, ts FROM agent_status"
+            ).fetchall()
+            for agent_id, zone, x, y, ts_row in rows:
+                agents[agent_id] = {
+                    "zone": zone,
+                    "x": x,
+                    "y": y,
+                    "ts": ts_row,
+                }
+        except Exception as e:
+            self.get_logger().warn(f"[task_state] failed to read agent_status: {e}")
+
+        robot_agent = agents.get("robot", {})
+
+        # --- Zone-level progress from vw_object_sheet ---
+        zones: Dict[str, dict] = {
+            "A": {
+                "total": 0,
+                "pending": 0,
+                "in_basket": 0,
+                "delivered_clean": 0,
+                "delivered_contaminated": 0,
+                "progress": None,
+            },
+            "B": {
+                "total": 0,
+                "pending": 0,
+                "in_basket": 0,
+                "delivered_clean": 0,
+                "delivered_contaminated": 0,
+                "progress": None,
+            },
+            "unknown": {
+                "total": 0,
+                "pending": 0,
+                "in_basket": 0,
+                "delivered_clean": 0,
+                "delivered_contaminated": 0,
+                "progress": None,
+            },
+        }
+
+        try:
+            cur = self.conn.execute(
+                """
+                SELECT
+                  COALESCE(best_zone, current_zone, 'unknown') AS zone,
+                  disposed_to,
+                  in_basket
+                FROM vw_object_sheet
+                """
+            )
+            for zone, disposed_to, in_basket in cur:
+                z = zone if zone in zones else "unknown"
+                st = zones[z]
+                st["total"] += 1
+
+                if disposed_to == "none":
+                    # Still somewhere in the environment
+                    st["pending"] += 1
+                    if in_basket:
+                        st["in_basket"] += 1
+                elif disposed_to == "clean_bin":
+                    st["delivered_clean"] += 1
+                elif disposed_to == "contaminated_bin":
+                    st["delivered_contaminated"] += 1
+        except Exception as e:
+            self.get_logger().warn(f"[task_state] failed to read vw_object_sheet: {e}")
+
+        # Progress fraction per zone
+        for z, st in zones.items():
+            total = st["total"]
+            done = st["delivered_clean"] + st["delivered_contaminated"]
+            st["progress"] = (float(done) / float(total)) if total > 0 else None
+
+        # --- BT summary: by_zone + per-object from vw_object_sheet ---
+        bt_by_zone: Dict[str, dict] = {
+            "A": {"count": 0},
+            "B": {"count": 0},
+            "unknown": {"count": 0},
+        }
+        objects: Dict[str, dict] = {}
+
+        try:
+            cur2 = self.conn.execute(
+                """
+                SELECT
+                  node_id,
+                  in_basket,
+                  disposed_to,
+                  current_rssi,
+                  current_zone,
+                  best_rssi,
+                  best_zone
+                FROM vw_object_sheet
+                """
+            )
+            for (
+                node_id,
+                in_basket,
+                disposed_to,
+                current_rssi,
+                current_zone,
+                best_rssi,
+                best_zone,
+            ) in cur2:
+                zone = best_zone or current_zone or "unknown"
+                if zone not in bt_by_zone:
+                    zone = "unknown"
+                bt_by_zone[zone]["count"] = bt_by_zone[zone].get("count", 0) + 1
+
+                objects[node_id] = {
+                    "zone": zone,
+                    "in_basket": bool(in_basket),
+                    "disposed_to": disposed_to,
+                    "current_rssi": current_rssi,
+                    "best_rssi": best_rssi,
+                }
+        except Exception as e:
+            self.get_logger().warn(f"[task_state] failed to build bt_summary: {e}")
+
+        # --- Bottlenecks (heuristic) ---
+        bottlenecks: List[str] = []
+        for z, st in zones.items():
+            # backlog: lots of pending items and no completed ones
+            if st["pending"] > 0 and (st["delivered_clean"] + st["delivered_contaminated"] == 0):
+                if st["pending"] >= 3:
+                    bottlenecks.append(f"zone_{z}_backlog")
+
+            # "bins" almost full ≈ many in_basket items in this zone
+            if st["in_basket"] >= 5:
+                bottlenecks.append(f"bin_{z}_almost_full")
+
+        # --- Subgoal status per zone ---
+        subgoals: Dict[str, dict] = {}
+        for z, st in zones.items():
+            label = f"collect_zone_{z}"
+            if st["total"] == 0:
+                status = "pending"  # nothing there yet, but conceptually not done
+            elif st["pending"] == 0:
+                status = "done"
+            elif st["pending"] == st["total"]:
+                status = "pending"
+            else:
+                status = "in_progress"
+            subgoals[label] = {
+                "zone": z,
+                "status": status,
+                "progress": st["progress"],
+            }
+
+        # --- Time info ---
+        elapsed = now - self._start_time
+        time_info = {
+            "elapsed_sec": elapsed,
+            "remaining_estimate_sec": None,  # planner can override
+        }
+
+        # --- Robot objective (from skill events) ---
+        robot_objective = self._robot_objective
+
+        task_state = {
+            "ts": now,
+            "robot": robot_agent,
+            "agents": agents,
+            "zones": zones,
+            "bottlenecks": bottlenecks,
+            "robot_objective": robot_objective,
+            "subgoals": subgoals,
+            "time": time_info,
+            "bt_summary": {
+                "by_zone": bt_by_zone,
+                "objects": objects,
+            },
+            "high_level_objective": {
+                "kind": "unknown",
+                "note": "planner may override / refine this",
+            },
+        }
+        return task_state
+
+    def _tick_task_state(self):
+        """
+        Periodic publisher for /task_state.
+        """
+        try:
+            state = self._compute_task_state()
+            self.pub_task_state.publish(StringMsg(data=json.dumps(state)))
+        except Exception as e:
+            self.get_logger().warn(f"[task_state] tick failed: {e}")
+
 
     # ------------------------------ Shutdown ------------------------------
     def destroy_node(self):

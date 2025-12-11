@@ -51,7 +51,7 @@ rules:
   - id: human_ping_here
     enabled: true
     type: composite
-    expr: "exists('speech_final_any', 2500) and exists('human_detected_3d', 2500)"
+    expr: "exists('speech_final_any', 100000) and exists('human_detected_3d', 100000)"
     
   # --- Odometry deltas as basic events ---
   - id: odom_rot_delta
@@ -101,4 +101,144 @@ rules:
     model_id: "small"
     mode: "level"
     expr: "text and len(text) >= 3"
+    
+  - id: skill_started_any
+    enabled: true
+    task: skill_status
+    output: skill.status
+    mode: "level"
+    expr: "kind == 'skill_started'"
+
+  - id: trigger_idle
+    enabled: true
+    one_shot: true
+    type: composite
+    expr: >
+      exists('skill_done_any', 86400000) and
+      not exists('skill_done_any', 30000)
+      and not exists('skill_started_any', 30000)
+      and not exists('trigger_speech_final', 30000)
+      
+  # ───────── LLM: interpret human intent from final utterance ─────────
+  - id: llm_infer_intent
+    enabled: true
+    type: composite
+
+    # Trigger whenever we receive a final ASR utterance
+    expr: "exists('speech_final_any', 5000)"
+
+    llm_call:
+      task: "llm_speech_check"           # uses your LLM request/response path
+      output_id: "check.json"            # EventLayer already parses this
+      model_id: "gpt-5.1-mini"
+
+      # One call per utterance (no throttling)
+      min_period_ms: 0       
+
+      # Where the text should come from
+      text_from_rule_id: "speech_final_any"
+
+      tag: "intent_inference"
+
+      prompt_template: |
+        You are the cognitive layer for robot Bob.
+        Infer the user's intention from the utterance below.
+
+        Extract:
+        - **intent_class**: one of {command, question, greeting, request_help,
+          clarification, small_talk, refer_object, other}
+        - **target_object**: the object or CNode id (if mentioned or implied),
+          otherwise null
+        - **action**: a short verb phrase capturing what the user wants the robot
+          or another human to do (e.g., "pick up", "come here", "follow me")
+        - **parameters**: key parameters if present (e.g., location, zone, count)
+        - **certainty**: 0.0–1.0 measure of how confident you are
+        - **natural_summary**: 1–2 sentence explanation in natural language
+
+        Respond with STRICT JSON only.
+
+      output_schema: |
+        {
+          "type": "object",
+          "required": [
+            "intent_class",
+            "target_object",
+            "action",
+            "parameters",
+            "certainty",
+            "natural_summary"
+          ],
+          "properties": {
+            "intent_class": {
+              "type": "string",
+              "enum": [
+                "command","question","greeting","request_help",
+                "clarification","small_talk","refer_object","other"
+              ]
+            },
+            "target_object": { "type": ["string","null"] },
+            "action":        { "type": ["string","null"] },
+            "parameters":    { "type": "object" },
+            "certainty":     { "type": "number" },
+            "natural_summary": { "type": "string" }
+          }
+        }
+
+  # ───────── VLM: describe scene when humans are around (rate-limited) ─────────
+  - id: vlm_describe_scene_with_human
+    enabled: true
+    type: composite
+    # Only fire when we have a 3D human detection in the last 3 seconds
+    expr: "exists('human_detected_3d', 3000)"
+    llm_call:
+      task: "vlm_inference"                 # matches tasks.vlm_inference
+      output_id: "answer.text"
+      model_id: "Qwen/Qwen2.5-VL-7B-Instruct"
+      # Don't spam VLM: at most once every 15 seconds while humans are present
+      min_period_ms: 15000
+      tag: "scene_human_present"
+
+      prompt_template: |
+        You are the robot Bob looking at the current camera frame.
+
+        1. Briefly describe the scene.
+        2. List the people you see and where they are.
+        3. For each person, guess which nearby object they might be
+           interacting with or referring to, if any.
+
+        Respond ONLY with STRICT JSON matching the schema below.
+
+      output_schema: |
+        {
+          "type": "object",
+          "required": ["summary","people","objects"],
+          "properties": {
+            "summary": { "type": "string" },
+            "people": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id","description","likely_object_id","confidence"],
+                "properties": {
+                  "id":              { "type": "string" },
+                  "description":     { "type": "string" },
+                  "likely_object_id":{ "type": ["string","null"] },
+                  "confidence":      { "type": "number" }
+                }
+              }
+            },
+            "objects": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id","description"],
+                "properties": {
+                  "id":          { "type": "string" },
+                  "description": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+
 

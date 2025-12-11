@@ -461,6 +461,9 @@ class OrchestratorNode(Node):
             "/broker/save_task_registry_with_perf",
         )
 
+        # NEW: ignore any skills whose name starts with this prefix
+        self.declare_parameter("ignore_skills_prefix", "router_fast.")
+
         '''
         # NEW: mapping from logical roles to (node, param) for remote model changes
         self.declare_parameter(
@@ -531,6 +534,13 @@ class OrchestratorNode(Node):
         )
         self.temperature: float = float(
             self.get_parameter("temperature").value
+        )
+
+        # NEW: prefix for skills the orchestrator should ignore
+        self.ignore_skills_prefix: str = (
+            self.get_parameter("ignore_skills_prefix")
+            .get_parameter_value()
+            .string_value
         )
 
         self.capsule_topic: str = (
@@ -975,6 +985,13 @@ class OrchestratorNode(Node):
 
                 name = str(s.get("name", "")).strip()
                 if not name:
+                    continue
+
+                # NEW: ignore router-generated skills (or any prefix you choose)
+                if self.ignore_skills_prefix and name.startswith(self.ignore_skills_prefix):
+                    self.get_logger().debug(
+                        f"[orchestrator] ignoring skill '{name}' (prefix={self.ignore_skills_prefix})"
+                    )
                     continue
 
                 kind = str(s.get("kind", "")).strip() or "primitive"
