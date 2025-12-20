@@ -371,6 +371,14 @@ class RulesView:
         return cand[0]['payload']
 
 def _render_scalar(expr: str, ctx: dict, rules: RulesView, defaults_window_ms: int) -> str:
+
+    def _is_missing(v: Any) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, str) and v.strip() == "":
+            return True
+        return False
+
     # 1) Handle "| default:" first
     if "| default:" in expr:
         left, default_str = expr.split("| default:", 1)
@@ -392,18 +400,18 @@ def _render_scalar(expr: str, ctx: dict, rules: RulesView, defaults_window_ms: i
                 payload = rules.latest_payload(rid, defaults_window_ms)
                 if payload is not None:
                     val = _get_path(payload, field)
-                    if val is not None:
+                    if not _is_missing(val):
                         return str(val)
             return str(default_val)
 
         # ctx.<path>
         if left.startswith("ctx."):
             val = _get_path({"ctx": ctx}, left)
-            return str(val if val is not None else default_val)
+            return str(val) if not _is_missing(val) else str(default_val)
 
         # bare key → interpret as ctx.<key>
         val = _get_path({"ctx": ctx}, f"ctx.{left}")
-        return str(val if val is not None else default_val)
+        return str(val) if not _is_missing(val) else str(default_val)
 
     # 2) Legacy simple forms (no default)
     if expr.startswith("rule."):
@@ -1241,6 +1249,14 @@ class SkillsAgent(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, self.rotate_topic, 10)
         self.nav_client  = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
+        self.coverage_req_pub = self.create_publisher(StringMsg, "/coverage/req", 10)
+        self.coverage_status_sub = self.create_subscription(
+            StringMsg, "/coverage/status", self._cb_coverage_status, 10
+        )
+        self._coverage_pending = {}   # id -> {"handle": StepHandle, "ctx": dict}
+        self._coverage_next_id = 1
+
+
         # LLM speech_check req/resp
         self.llm_speech_req_pub = self.create_publisher(StringMsg, "/llm/speech_check_req", 10)
         self.llm_speech_resp_sub = self.create_subscription(
@@ -1364,6 +1380,27 @@ class SkillsAgent(Node):
         resp.message = f"Canceled {canceled} active skills."
         self.get_logger().info(resp.message)
         return resp
+
+
+    def _cancel_all_active(self, why: str = "") -> int:
+        canceled = 0
+        for inst in list(self.skill_engine._active):
+            if inst.done:
+                continue
+            # cancel running primitive if there is one
+            if inst.handle is not None and not inst.handle.done():
+                try:
+                    inst.handle.cancel()
+                except Exception as e:
+                    self.get_logger().warn(f"cancel_all({why}): handle cancel error: {e}")
+            inst.done = True
+            canceled += 1
+
+        # prune finished instances
+        self.skill_engine._active = [i for i in self.skill_engine._active if not i.done]
+        if canceled:
+            self.get_logger().info(f"[SkillsAgent] canceled {canceled} active skills ({why})")
+        return canceled
 
 
     # ───────────────────────────── Skills loading (base + composite) ─────────
@@ -1571,6 +1608,9 @@ class SkillsAgent(Node):
             name = str(obj["skill"])
             ctx  = obj.get("ctx") or {}
 
+            # NEW: cancel everything before starting the new skill
+            self._cancel_all_active(why=f"before_execute:{name}")
+
             # NEW: orchestrator explicitly requested this skill → reset quarantine for it
             if hasattr(self.skill_engine, "bad_skills"):
                 if name in self.skill_engine.bad_skills:
@@ -1640,6 +1680,34 @@ class SkillsAgent(Node):
 
     # ───────────────────────────── Basic Actions ──────────────────────────────
 
+    def _cb_coverage_status(self, msg: StringMsg):
+        try:
+            obj = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().warn(f"coverage/status bad JSON: {e}")
+            return
+
+        if obj.get("client") not in (None, "skills"):
+            return
+
+        req_id = obj.get("id")
+        if not req_id:
+            return
+
+        pending = self._coverage_pending.get(req_id)
+        if not pending:
+            return
+
+        ctx = pending["ctx"]
+        ctx["coverage"] = obj  # store latest status in ctx for debugging/introspection
+
+        state = obj.get("state", "")
+        if state in ("done", "canceled", "error"):
+            handle = pending["handle"]
+            self._coverage_pending.pop(req_id, None)
+            handle.mark_done()
+
+
     def _cb_llm_speech_resp(self, msg: StringMsg):
         try:
             obj = json.loads(msg.data)
@@ -1682,15 +1750,24 @@ class SkillsAgent(Node):
             self.get_logger().warn(f"vlm_resp bad JSON: {e}")
             return
 
-        req_id = obj.get("id")
-        if req_id is None:
+        client = obj.get("client")
+        if client not in (None, "skills"):
+            # Ignore responses from other callers (e.g., eventlayer)
             return
 
-        key = str(req_id)  # normalize to string
-        pending = self._vlm_pending.pop(key, None)
-        if not pending:
-            self.get_logger().warn(f"[VLM] response for unknown id={key!r}")
+
+        req_id = obj.get("id")
+        if not req_id:
             return
+
+        key = str(req_id)
+        pending = self._vlm_pending.pop(key, None)
+
+        if not pending:
+            self.get_logger().warn(f"[VLM] response for unknown id={key!r} (client={client!r}); pending={list(self._vlm_pending.keys())[:5]}")
+            return
+
+
 
         handle: StepHandle = pending["handle"]
         ctx = pending["ctx"]
@@ -2034,6 +2111,21 @@ class SkillsAgent(Node):
               - if we never see /tts_busy, fall back to immediate completion
                 so the state machine doesn't deadlock
             """
+            
+            raw_text = "" if text is None else str(text)
+
+            # Strip common “template produced quotes” artifacts
+            candidate = raw_text.strip()
+            if (candidate == '""') or (candidate == "''"):
+                candidate = ""
+
+            # If empty after cleanup: DO NOT publish, just advance state
+            if candidate.strip() == "":
+                self.get_logger().warn("[TTS] empty text; skipping publish and completing immediately.")
+                h = StepHandle()
+                h.mark_done()
+                return h
+            
             h = StepHandle()
             self.say(str(text))
 
@@ -2188,6 +2280,48 @@ class SkillsAgent(Node):
             self.llm_speech_req_pub.publish(StringMsg(data=json.dumps(payload)))
             return h
 
+        def coverage_wait(
+            spacing_m: float = 1.5,
+            visited_radius_m: float = 0.9,
+            dwell_sec: float = 2.0,
+            persist_path: str = "/tmp/coverage_wait_visited.json",
+            ctx: dict = None,
+        ):
+            h = StepHandle()
+            if ctx is None:
+                ctx = {}
+
+            ts_ms = int(time.time() * 1000)
+            req_id = f"skills:coverage:{ts_ms}:{self._coverage_next_id}"
+            self._coverage_next_id += 1
+
+            self._coverage_pending[req_id] = {"handle": h, "ctx": ctx}
+
+            payload = {
+                "id": req_id,
+                "client": "skills",
+                "cmd": "start",
+                "params": {
+                    "spacing_m": float(spacing_m),
+                    "visited_radius_m": float(visited_radius_m),
+                    "dwell_sec": float(dwell_sec),
+                    "persist_path": str(persist_path),
+                }
+            }
+            self.coverage_req_pub.publish(StringMsg(data=json.dumps(payload)))
+
+            # cancel hook sends cancel command
+            def _cancel():
+                try:
+                    cancel_payload = {"id": req_id, "client": "skills", "cmd": "cancel"}
+                    self.coverage_req_pub.publish(StringMsg(data=json.dumps(cancel_payload)))
+                finally:
+                    h.mark_done()
+
+            h._cancel = _cancel
+            return h
+
+
 
         def vlm_inference(prompt: str = "",
                           output_schema: str = "",
@@ -2202,21 +2336,22 @@ class SkillsAgent(Node):
             if ctx is None:
                 ctx = {}
 
-            self.get_logger().info(f"[VLM primitive] prompt={prompt!r}, tag={tag}, mode={mode}")
-            req_id = int(time.time() * 1000) ^ self._vlm_next_id
+            ts_ms = int(time.time() * 1000)
+            tag = tag or "vlm"
+            #Unique + traceable id
+            req_id = f"skills:{tag}:{ts_ms}:{self._vlm_next_id}"
             self._vlm_next_id += 1
-            req_id = str(req_id)   # <<< normalize to str
-            
-            self._vlm_pending[req_id] = {
-                "handle": h,
-                "ctx": ctx,
-            }
+
+            self._vlm_pending[req_id] = {"handle": h, "ctx": ctx}
+
+            self.get_logger().info(f"[VLM primitive] id={req_id} prompt={prompt!r}, tag={tag}, mode={mode}")
 
             payload = {
                 "id": req_id,
+                "client": "skills",                 # NEW
                 "prompt": prompt or "",
                 "output_schema": output_schema or "",
-                "tag": tag or "",
+                "tag": tag,
                 "mode": mode or "generic",
             }
             # Send to VLM node; it should look at the latest frame and respond.
@@ -2232,6 +2367,7 @@ class SkillsAgent(Node):
             'query_beacons': query_beacons,
             'llm_speech_check': llm_speech_check,
             'vlm_inference': vlm_inference,
+            'coverage_wait': coverage_wait,
         }
 
     def _move_relative_handle(self, az_deg: float, dist_m: float) -> StepHandle:

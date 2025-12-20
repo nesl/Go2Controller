@@ -249,7 +249,7 @@ class PlannerNode(Node):
 
         # ----- Parameters -----
         self.declare_parameter("llm_enabled", True)
-        self.declare_parameter("model", "gpt-5.1-mini")
+        self.declare_parameter("model", "gpt-5-mini")
         self.declare_parameter("groq_model_prefix", "gpt-oss")
 
         self.declare_parameter("trigger_prefix", "trigger_")
@@ -261,7 +261,7 @@ class PlannerNode(Node):
         )
 
         # Run periodically even if not idle (seconds)
-        self.declare_parameter("run_period_sec", 30.0)
+        self.declare_parameter("run_period_sec", 60.0)
 
         # Skills & rules paths (same shape as interaction loop)
         self.declare_parameter("skills_base_path", "")
@@ -272,8 +272,12 @@ class PlannerNode(Node):
         self.declare_parameter("profiles_topic", "/profiles/summary")
         self.declare_parameter("task_state_topic", "/task_state")
 
+        # NEW: broker context capsule (with global event summary)
+        self.declare_parameter("context_capsule_topic", "/broker/context_capsule")
+
+
         # Event trace length
-        self.declare_parameter("event_trace_len", 50)
+        self.declare_parameter("event_trace_len", 20)
 
         # ----- Read parameters -----
         self.llm_enabled = bool(self.get_parameter("llm_enabled").value)
@@ -292,6 +296,8 @@ class PlannerNode(Node):
 
         self.profiles_topic = self.get_parameter("profiles_topic").value
         self.task_state_topic = self.get_parameter("task_state_topic").value
+        self.context_capsule_topic = self.get_parameter("context_capsule_topic").value
+
 
         self.event_trace_len = int(self.get_parameter("event_trace_len").value)
 
@@ -300,6 +306,9 @@ class PlannerNode(Node):
         # ----- Internal state -----
         self._event_trace = deque(maxlen=self.event_trace_len)
 
+
+        # NEW: latest global event summary from Broker
+        self._last_event_summary: Optional[str] = None
         self._last_task_state: Dict[str, Any] = {}
         self._profiles_raw: Dict[str, Any] = {}
         self._profiles_compact: Dict[str, Any] = {}
@@ -322,6 +331,15 @@ class PlannerNode(Node):
         self.sub_task_state = self.create_subscription(
             StringMsg, self.task_state_topic, self._on_task_state, 20
         )
+
+        # NEW: broker context capsule (contains global event summary)
+        self.sub_context_capsule = self.create_subscription(
+            StringMsg,
+            self.context_capsule_topic,
+            self._on_context_capsule,
+            10,
+        )
+
 
         # HDT profiles
         self.sub_profiles = self.create_subscription(
@@ -398,7 +416,7 @@ class PlannerNode(Node):
         primitives: List[Dict[str, Any]] = []
         composites: List[Dict[str, Any]] = []
 
-        for path in [self.skills_base_path, self.skills_composite_path]:
+        for path in [self.skills_base_path]:
             doc = self._read_yaml_if_exists(path) or {}
             for s in doc.get("skills", []) or []:
                 if not isinstance(s, dict):
@@ -432,6 +450,43 @@ class PlannerNode(Node):
                     composites.append(entry)
 
         return {"primitives": primitives, "composites": composites}
+
+    def _on_context_capsule(self, msg: StringMsg):
+        """
+        Ingest Broker's context capsule to access the global event summary.
+
+        Expected shape from broker_node (roughly):
+          {
+            "trigger": {...},
+            "profiles": {...},
+            "event_trace": "<short summary>" OR [ ...raw events... ],
+            "world": {...}
+          }
+
+        We only care about event_trace here, and store it as a short string
+        under _last_event_summary so the planner LLM can see it.
+        """
+        try:
+            obj = json.loads(msg.data) if msg.data else {}
+        except Exception:
+            self.get_logger().warn(
+                f"[planner] bad JSON on {self.context_capsule_topic}: {msg.data}"
+            )
+            return
+
+        event_trace = obj.get("event_trace")
+
+        if isinstance(event_trace, str):
+            # LLM-generated short summary from broker
+            self._last_event_summary = event_trace.strip()
+        elif isinstance(event_trace, list):
+            # Fallback: compress the last few raw events into a small string
+            try:
+                s = json.dumps(event_trace[-5:], ensure_ascii=False)
+                self._last_event_summary = f"Recent events (raw): {s[:400]}"
+            except Exception:
+                self._last_event_summary = None
+
 
     # ---------- Ingestion: task_state ----------
     def _on_task_state(self, msg: StringMsg):
@@ -516,15 +571,35 @@ class PlannerNode(Node):
             entry["zone"] = zone
 
         txt = ""
+        parsed_json = None   # NEW
+
         if isinstance(data, dict):
+            # text snippet (as before)
             txt = str(
                 data.get("text")
                 or data.get("utterance")
                 or data.get("speech")
                 or ""
             )
+
+            # --- NEW: try to parse structured json_text from VLM/LLM ---
+            jt = data.get("json_text")
+            if isinstance(jt, str) and jt.strip():
+                try:
+                    parsed_json = json.loads(jt)
+                except Exception:
+                    parsed_json = None
+
         if txt:
             entry["text_snippet"] = txt[:80]
+
+        # --- NEW: attach parsed JSON (or a short snippet) if available ---
+        if parsed_json is not None:
+            entry["json"] = parsed_json
+        elif isinstance(data, dict):
+            jt = data.get("json_text")
+            if isinstance(jt, str) and jt.strip():
+                entry["json_text_snippet"] = jt[:160]
 
         self._event_trace.append(entry)
 
@@ -548,6 +623,7 @@ class PlannerNode(Node):
             self._run_planner(trigger_ctx=self._last_trigger_ctx, idle_invocation=True)
 
 
+
     def _on_comp_event(self, msg: StringMsg):
         try:
             evt = json.loads(msg.data)
@@ -564,6 +640,7 @@ class PlannerNode(Node):
         expr = evt.get("expr") or ""
         ts = float(evt.get("ts") or self._now())
         zone = evt.get("zone")
+        data = evt.get("data") or {}   # NEW: in case composites start carrying payloads
 
         entry = {
             "kind": "composite",
@@ -574,6 +651,23 @@ class PlannerNode(Node):
             entry["zone"] = zone
         if expr:
             entry["expr_snippet"] = str(expr)[:120]
+
+        # --- NEW: if composite carries json_text, parse and store it ---
+        parsed_json = None
+        if isinstance(data, dict):
+            jt = data.get("json_text")
+            if isinstance(jt, str) and jt.strip():
+                try:
+                    parsed_json = json.loads(jt)
+                except Exception:
+                    parsed_json = None
+
+        if parsed_json is not None:
+            entry["json"] = parsed_json
+        elif isinstance(data, dict):
+            jt = data.get("json_text")
+            if isinstance(jt, str) and jt.strip():
+                entry["json_text_snippet"] = jt[:160]
 
         self._event_trace.append(entry)
 
@@ -597,6 +691,7 @@ class PlannerNode(Node):
             self._run_planner(trigger_ctx=self._last_trigger_ctx, idle_invocation=True)
 
 
+
     # ---------- Timer ----------
     def _on_timer_tick(self):
         """
@@ -618,6 +713,11 @@ class PlannerNode(Node):
         }
         if self._profiles_compact:
             capsule["humans"] = self._profiles_compact
+            
+
+        # NEW: attach global event summary from Broker if available
+        if self._last_event_summary:
+            capsule["event_summary"] = self._last_event_summary
 
         payload_for_llm = {"planner_capsule": capsule}
 

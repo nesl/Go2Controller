@@ -67,6 +67,12 @@ skills:
       tag: "{{ctx.tag | default:'default_vlm'}}"
       mode: "{{ctx.mode | default:'generic'}}"
 
+  - name: explore.coverage_wait
+    kind: primitive
+    description: "Visit closest unvisited free-space points and dwell at each; resumes after interruption."
+    action: coverage_wait
+    params: {}
+
 
   # ─────────────────────────────
   # STATE MACHINES (COMPOSITES)
@@ -160,12 +166,7 @@ skills:
   - name: greet.with_presence
     kind: state_machine
     description: "Wave to a detected human and offer help if they respond within a short window."
-    when:
-      all:
-        - exists: pose_present_precise
-          within_ms: 2500
-        - exists: speech_keyword
-          within_ms: 2500
+    when: {}
     until: {}
     initial_state: greet
     states:
@@ -200,7 +201,7 @@ skills:
 
   - name: sense.here
     kind: state_machine
-    description: "Sense the location where the robot is currently in."
+    description: "Sense for objects in the location where the robot is currently in."
     when: {}
     until: {}
     initial_state: wait_only
@@ -231,7 +232,7 @@ skills:
         action:
           use: tts.say
           with:
-            text: >
+            text: 
               "I’m sensing a strong beacon here,
               object {{ rule.bt_rssi_seen.object_id | default:'unknown' }} with RSSI
               {{ rule.bt_rssi_seen.rssi | default:'-inf' }}."
@@ -278,24 +279,15 @@ skills:
             output_schema: "{{ ctx.output_schema | default:'' }}"
             tag: "{{ ctx.tag | default:'scene_describe' }}"
             mode: "{{ ctx.mode | default:'generic' }}"
-        on_complete: wait_answer
-
-      - id: wait_answer
-        type: wait
-        wait_for:
-          any_of:
-            - rule_id: "vlm_scene_ready"
-              within_ms: 8000
-        on_event: say_scene
-        on_timeout: null
+        on_complete: say_scene
 
       - id: say_scene
         type: action
         action:
           use: tts.say
           with:
-            text: >
-              "{{ rule.vlm_scene_ready.raw_text | default:'I could not interpret the scene.' }}"
+            text: 
+              "{{ ctx.vlm.raw_text | default:'I could not interpret the scene.' }}"
         on_complete: null
 
 

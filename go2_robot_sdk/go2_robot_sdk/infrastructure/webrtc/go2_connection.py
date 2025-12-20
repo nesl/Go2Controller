@@ -21,7 +21,7 @@ from .http_client import HttpClient, WebRTCHttpError
 from .data_decoder import WebRTCDataDecoder, DataDecodingError
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+#logger.setLevel(logging.INFO)
 
 
 class Go2ConnectionError(Exception):

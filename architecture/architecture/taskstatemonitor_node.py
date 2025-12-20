@@ -151,20 +151,33 @@ class BrokerNode(Node):
         )
         
         # --- Event-trace summarizer parameters ---
-        self.declare_parameter("event_summary_enabled", False)
+        self.declare_parameter("event_summary_enabled", True)
         self.declare_parameter("event_summary_model", "gpt-4o-mini")  # fast, cheap, small context
+        self.declare_parameter("event_summary_batch_size", 8)         # run summary after N events
 
         self.event_summary_enabled = (
             self.get_parameter("event_summary_enabled")
-                .get_parameter_value()
-                .bool_value
+            .get_parameter_value()
+            .bool_value
         )
 
         self.event_summary_model = (
             self.get_parameter("event_summary_model")
-                .get_parameter_value()
-                .string_value
+            .get_parameter_value()
+            .string_value
         )
+
+        self.event_summary_batch_size = int(
+            self.get_parameter("event_summary_batch_size").value
+        )
+
+        # Async running event summary state
+        self._event_summary_text: Optional[str] = None      # last full running summary
+        self._event_summary_ts: Optional[float] = None      # ts of last event included
+        self._unsummarized_events: List[dict] = []          # events since last summary
+        self._events_since_summary: int = 0                 # counter since last summary
+        self._event_summary_running: bool = False           # background worker in flight?
+        self._event_summary_lock = threading.Lock()
 
         
         self.task_registry_path = (
@@ -237,6 +250,10 @@ class BrokerNode(Node):
         self._event_trace = deque(maxlen=40)       # compact recent events
         self._current_trigger = None               # {"type": "...", "hints": {...}}
         self._ws = {}                               # ws_id -> {"hashes": set(), "iters": int}
+
+
+        self._last_published_summary_fp = None
+
 
         # NEW: robot objective & timing for task state
         self._robot_objective: Optional[str] = None
@@ -577,9 +594,7 @@ class BrokerNode(Node):
     def _on_set_parameters(self, params):
         """
         React to dynamic parameter updates, in particular llm_model and llm_enabled.
-        This allows you to call:
-          ros2 param set /broker_node llm_model gpt-4.1-mini
-          ros2 param set /broker_node llm_enabled false
+        ...
         """
         for p in params:
             if p.name == "model" and p.type_ == Parameter.Type.STRING:
@@ -599,8 +614,17 @@ class BrokerNode(Node):
                 self.event_summary_model = p.value
                 self.get_logger().info(f"[broker] event_summary_model = {self.event_summary_model}")
 
+            if p.name == "event_summary_batch_size" and p.type_ in (
+                Parameter.Type.INTEGER,
+                Parameter.Type.DOUBLE,
+            ):
+                self.event_summary_batch_size = int(p.value)
+                self.get_logger().info(
+                    f"[broker] event_summary_batch_size = {self.event_summary_batch_size}"
+                )
 
         return SetParametersResult(successful=True, reason="ok")
+
 
 
 
@@ -636,10 +660,10 @@ class BrokerNode(Node):
             self.get_logger().warn(f"broker: failed to publish llm perf: {e}")
 
 
-    def _publish_context_capsule(self):
-        cap = self._context_capsule()
-        cap["schema_card"] = self._schema_card()
+    def _publish_context_capsule(self, summary_only: bool = False):
+        cap = self._context_capsule(summary_only=summary_only)
         self.pub_capsule.publish(StringMsg(data=json.dumps(cap)))
+
 
 
     # ------------------------------ Schema ------------------------------
@@ -891,14 +915,39 @@ class BrokerNode(Node):
         ts   = float(o.get("ts") or time.time())
         zone = o.get("zone")  # NEW: top-level zone from EventLayer
         
-        # compact trace entry
-        trace_entry = {"rule": rule, "ts": ts}
-        if isinstance(data, dict):
-            trace_entry.update(data)
+        # compact trace entry with json_text support
+        trace_entry = {
+            "rule": rule,
+            "ts": ts,
+        }
+
         if zone is not None:
-            trace_entry["zone"] = zone          # NEW: keep zone in trace
-            
+            trace_entry["zone"] = zone
+
+        if isinstance(data, dict):
+            trace_entry["data"] = {}  # keep data nested, not flattened
+
+            for k, v in data.items():
+                # 1. If this is json_text → keep both raw and parsed
+                if k == "json_text" and isinstance(v, str):
+                    trace_entry["data"]["json_text"] = v
+
+                    # Try parsing to structured JSON
+                    try:
+                        parsed = json.loads(v)
+                        trace_entry["data"]["json"] = parsed   # structured JSON
+                    except Exception:
+                        pass  # keep raw only if parsing fails
+
+                # 2. Keep small scalar fields
+                elif isinstance(v, (str, int, float, bool)):
+                    trace_entry["data"][k] = v
+
         self._event_trace.append(trace_entry)
+        
+        # Feed running event summary (async)
+        self._record_event_for_summary(trace_entry, ts)
+
 
         # remember last robot zone for capsule
         if zone is not None:
@@ -964,7 +1013,8 @@ class BrokerNode(Node):
         rid  = str(o.get("rule") or "")
         ts   = float(o.get("ts") or time.time())
         expr = o.get("expr") or ""
-        zone = o.get("zone")  # NEW: zone stamped by EventLayer composite
+        zone = o.get("zone")  # zone stamped by EventLayer composite
+        data = o.get("data") or {}
 
         # trace entry (keep expr + mark composite; add zone if present)
         trace_entry = {
@@ -974,18 +1024,64 @@ class BrokerNode(Node):
             "expr": expr[:160],
         }
         if zone is not None:
-            trace_entry["zone"] = zone      # NEW
+            trace_entry["zone"] = zone
 
+        # --- 1) If composite message already has data, treat it like a basic event ---
+        if isinstance(data, dict):
+            trace_entry["data"] = {}
+            for k, v in data.items():
+                # Special handling for json_text: keep both raw + parsed
+                if k == "json_text" and isinstance(v, str):
+                    trace_entry["data"]["json_text"] = v
+                    try:
+                        parsed = json.loads(v)
+                        trace_entry["data"]["json"] = parsed
+                    except Exception:
+                        # if parsing fails, we still keep raw json_text
+                        pass
+                # Keep small scalar fields
+                elif isinstance(v, (str, int, float, bool)):
+                    trace_entry["data"][k] = v
+
+            # If the data dict ended up empty, remove it to keep the trace clean
+            if not trace_entry["data"]:
+                trace_entry.pop("data", None)
+
+        # --- 2) If this is an LLM/VLM composite, try to copy json_text from recent basic events ---
+        needs_json = rid.startswith("llm_") or rid.startswith("vlm_")
+        if needs_json:
+            has_json_already = (
+                isinstance(trace_entry.get("data"), dict)
+                and "json_text" in trace_entry["data"]
+            )
+            if not has_json_already:
+                # Walk backward through the existing trace looking for the last event
+                # with the same rule id that has json_text (from /events/basic).
+                for e in reversed(self._event_trace):
+                    if e.get("rule") != rid:
+                        continue
+                    edata = e.get("data")
+                    if not isinstance(edata, dict):
+                        continue
+                    if "json_text" in edata:
+                        trace_entry.setdefault("data", {})
+                        trace_entry["data"]["json_text"] = edata["json_text"]
+                        if "json" in edata:
+                            trace_entry["data"]["json"] = edata["json"]
+                        break  # stop at the first match
+
+        # Now store + feed summary
         self._event_trace.append(trace_entry)
+        self._record_event_for_summary(trace_entry, ts)
 
         # remember last robot zone for capsule
         if zone is not None:
-            self._last_robot_zone = zone    # NEW
+            self._last_robot_zone = zone
 
         # map composite rule id → trigger (use the same trigger_map param)
         trig_type = self.trigger_map.get(rid, "composite_hit")
 
-        # NEW: any composite rule whose id starts with the trigger prefix is a planner trigger
+        # any composite rule whose id starts with the trigger prefix is a planner trigger
         if rid.startswith(self.planner_trigger_prefix):
             if trig_type == "composite_hit":
                 trig_type = "planner_trigger"
@@ -999,19 +1095,7 @@ class BrokerNode(Node):
         if zone is not None:
             self._current_trigger["zone"] = zone  # optional but handy
 
-        '''
-        # (optional) proactive run
-        if trig_type in ("new_object", "finish_or_fail", "human_command", "planner_trigger"):
-            try:
-                self._current_trigger["trigger_event"] = o
-                self._publish_context_capsule()
-
-                pack = self._llm_sql_to_facts(proactive=True)
-                self.pub_facts.publish(StringMsg(data=json.dumps(pack)))
-                self._emit_sql_debug(pack)
-            except Exception as e:
-                self.get_logger().warn(f"proactive run (composite) failed: {e}")
-        '''
+        # (proactive runs are still commented out)
 
 
     def _ingest_human3d(self, data: dict, envelope: dict):
@@ -1161,6 +1245,156 @@ class BrokerNode(Node):
         with self._lock:
             self._contam_cache[key] = {"ts": now, "contaminated": contaminated, "probability": probability}
 
+    # ---------- Async running event summary ----------
+
+    def _record_event_for_summary(self, trace_entry: dict, ts: float):
+        """
+        Track events for the running summary and schedule an async LLM update
+        every `event_summary_batch_size` events.
+
+        This is cheap and called from the event callbacks.
+        """
+        if not self.event_summary_enabled:
+            return
+
+        batch_to_run: Optional[List[dict]] = None
+        last_ts_for_batch: Optional[float] = None
+
+        with self._event_summary_lock:
+            self._unsummarized_events.append(trace_entry)
+            self._events_since_summary += 1
+
+            # Trigger a batch when we hit the threshold and no worker is running.
+            if (
+                not self._event_summary_running
+                and self._events_since_summary >= self.event_summary_batch_size
+                and self._unsummarized_events
+            ):
+                batch_to_run = self._unsummarized_events
+                last_ts_for_batch = batch_to_run[-1].get("ts", ts)
+
+                # Reset buffer & counter for future events
+                self._unsummarized_events = []
+                self._events_since_summary = 0
+                self._event_summary_running = True
+
+        # Run LLM outside the lock in a background thread
+        if batch_to_run:
+            threading.Thread(
+                target=self._event_summary_worker,
+                args=(batch_to_run, last_ts_for_batch),
+                daemon=True,
+            ).start()
+
+    def _event_summary_worker(self, batch_events: List[dict], last_ts: Optional[float]):
+        """
+        Background worker that updates the running event summary by combining
+        the previous summary with a batch of new events.
+        """
+        try:
+            with self._event_summary_lock:
+                prev_summary = self._event_summary_text
+
+            new_summary = self._build_running_event_summary(prev_summary, batch_events)
+            if not new_summary:
+                return
+
+            with self._event_summary_lock:
+                self._event_summary_text = new_summary
+                if last_ts is not None:
+                    self._event_summary_ts = float(last_ts)
+
+        except Exception as e:
+            self.get_logger().warn(f"[broker] async event summary worker failed: {e}")
+        finally:
+            with self._event_summary_lock:
+                self._event_summary_running = False
+                
+        try:
+            fp = hashlib.sha256((new_summary or "").encode("utf-8")).hexdigest()
+            if fp != self._last_published_summary_fp:
+                self._last_published_summary_fp = fp
+                self._publish_context_capsule(summary_only=True)
+        except Exception as e:
+            self.get_logger().warn(f"[broker] publish-on-change failed: {e}")
+
+
+    def _build_running_event_summary(
+        self,
+        previous_summary: Optional[str],
+        new_events: List[dict],
+    ) -> Optional[str]:
+        """
+        Build/refresh a *running* summary.
+
+        LLM sees:
+          - previous_summary: the last global summary (or null)
+          - new_events: the latest batch (chronological list)
+
+        Returns updated single-sentence summary (or None).
+        """
+        if not new_events:
+            return previous_summary
+
+        # Keep only a tail of the batch to avoid prompt blow-up
+        tail = new_events[-10:]
+        try:
+            tail_json = json.dumps(tail, ensure_ascii=False)
+        except Exception as e:
+            self.get_logger().warn(f"[broker] failed to encode new_events for running summary: {e}")
+            return previous_summary
+
+        if not self.event_summary_enabled:
+            return previous_summary
+
+        try:
+            system_msg = (
+                "You maintain a RUNNING SUMMARY of a mobile robot's recent events. The name of the robot is Bob.\n"
+                "- You receive the previous summary (may be null) and a batch of NEW events.\n"
+                "- Events are JSON objects with fields like rule, ts, text, skill, zone, etc.\n\n"
+                "Your job:\n"
+                "- Produce ONE SHORT SENTENCE that summarizes the overall recent situation,\n"
+                "  updating or refining the previous summary using the new events.\n"
+                "- Prioritize the NEW events but keep any still-relevant context from the old summary.\n"
+                "- If nothing important changed, you may return a very similar summary.\n"
+                "- Output will be wrapped in JSON with key 'summary'.\n"
+            )
+
+            user_payload = {
+                "previous_summary": previous_summary,
+                "new_events": tail,
+            }
+
+            obj = self._chat_json(
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Here is the previous summary and the latest batch of events. "
+                            'Return a JSON object: {"summary": "one short sentence"}.'
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+                ],
+                temperature=0.2,
+                max_tokens=80,
+                retries=1,
+                schema=EVENT_SUMMARY_SCHEMA,
+                schema_name="EventRunningSummary",
+                model=self.event_summary_model,
+                perf_phase="event_summary",
+            )
+
+            summary = (obj.get("summary") or "").strip()
+            return summary or previous_summary
+
+        except Exception as e:
+            self.get_logger().warn(f"[broker] running event summary LLM failed: {e}")
+            return previous_summary
+
+
+
     def _summarize_event_trace(self, events: List[dict]) -> Optional[str]:
         """
         Summarize a chronological event list (oldest -> newest) into
@@ -1195,7 +1429,7 @@ class BrokerNode(Node):
         # LLM-based summary via _chat_json
         try:
             system_msg = (
-                "You summarize event traces for a mobile robot.\n"
+                "You summarize event traces for a mobile robot whose name is Bob.\n"
                 "- You receive an \"event_trace\" which is a JSON array of events.\n"
                 "- Each event may include fields like: rule, rule_id, ts, text, skill, kind, zone, etc.\n\n"
                 "Your task:\n"
@@ -1335,45 +1569,32 @@ class BrokerNode(Node):
                 pass
         return {"objects": objects, "samples": samples}
 
-    def _context_capsule(self) -> dict:
-        counts = self.conn.execute("SELECT * FROM vw_backlog_counts").fetchone()
-        if counts:
-            cc = dict(zip(["to_pick","in_basket","delivered_clean","delivered_contaminated"], counts))
-        else:
-            cc = {}
+    def _context_capsule(self, summary_only: bool = True) -> dict:
+        with self._event_summary_lock:
+            summary_text = self._event_summary_text
+            summary_ts = self._event_summary_ts
 
-        basket = [r[0] for r in self.conn.execute(
-            "SELECT node_id FROM nodes_state WHERE in_basket=1 LIMIT 8"
-        ).fetchall()]
+        event_summary = None
+        if summary_text is not None:
+            event_summary = {
+                "summary": summary_text,
+                "last_event_ts": summary_ts,
+            }
 
-        # NEW: robot_zone from last basic/composite event (may be None)
-        robot_zone = self._last_robot_zone
+        if summary_only:
+            # capsule is ONLY the summary (plus a ts so downstream can reason about freshness)
+            return {
+                "ts": time.time(),
+                "event_summary": event_summary,
+            }
 
-        # --- NEW: compute raw trace and optional summary ---
-        raw_trace = list(self._event_trace)[-20:]  # last N events
 
-        summary_text = None
-        if raw_trace and getattr(self, "event_summary_enabled", True):
-            try:
-                summary_text = self._summarize_event_trace(raw_trace)
-            except Exception as e:
-                self.get_logger().warn(
-                    f"[broker] event_trace summarization failed; using raw trace. Error: {e}"
-                )
-                summary_text = None
 
-        # If we have a summary, expose THAT as event_trace; keep raw under event_trace_raw
         return {
-            "trigger": self._current_trigger,
-            "profiles": self._profiles,
-            "event_trace": summary_text if summary_text is not None else raw_trace,
-            #"event_trace_raw": raw_trace,  # for debugging / offline analysis
-            "world": {
-                "backlog_counts": cc,
-                "basket": basket,
-                "robot_zone": robot_zone,
-            },
+            "event_trace": summary_text,
+
         }
+
 
 
     def _ws_id(self) -> str:

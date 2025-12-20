@@ -80,7 +80,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'llm_enabled': True,
-                'model': 'gpt-5-nano',
+                'model': 'gpt-5-mini',
                 'skills_base_path': os.path.join(pkg_share, 'config', 'skills.yaml'),
                 'skills_composite_path': SKILLS_COMPOSITE_PATH,
             }]

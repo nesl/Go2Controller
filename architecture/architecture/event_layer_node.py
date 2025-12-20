@@ -201,6 +201,15 @@ class EventLayerNode(Node):
         self.map_frame = "map"
         self.base_frame = "base_link"   # or "base_link" depending on your tree
 
+        self._last_text_fingerprint: Dict[str, str] = {}
+
+        # --- LLM/VLM call machinery ---
+        # rules that own an llm_call block
+        self.llm_call_rules = []
+        # per-rule last call time (sec)
+        self._last_llm_call_ts: Dict[str, float] = {}
+        # lazily-created publishers for request topics (e.g. /vlm/req, /llm/speech_check_req)
+        self._llm_req_pubs: Dict[str, Any] = {}
 
         # timers
         #self.create_timer(self.rescan_period, self._resubscribe_if_needed)
@@ -217,15 +226,6 @@ class EventLayerNode(Node):
             self._cb_skill_status,
             10,
         )
-      
-        # --- LLM/VLM call machinery ---
-        # rules that own an llm_call block
-        self.llm_call_rules = []
-        # per-rule last call time (sec)
-        self._last_llm_call_ts: Dict[str, float] = {}
-        # lazily-created publishers for request topics (e.g. /vlm/req, /llm/speech_check_req)
-        self._llm_req_pubs: Dict[str, Any] = {}
-
 
         self.get_logger().info("event_layer_node (expr) up")
 
@@ -274,6 +274,9 @@ class EventLayerNode(Node):
           - task 'vlm_inference' -> /vlm/req (no text field required)
           - task 'llm_speech_check' -> /llm/speech_check_req (needs 'text')
         """
+
+
+        
         rid = str(rule.get("id") or "")
         if not rid:
             return None
@@ -658,6 +661,9 @@ class EventLayerNode(Node):
         for r in self.rules_enabled:
             if r.get("type") == "composite":
                 continue
+                
+            if isinstance(r.get("llm_call"), dict):
+                continue
             task = r.get("task"); out_id = r.get("output")
             tdoc = self.tasks_doc.get(task, {})
             for o in tdoc.get("outputs", []):
@@ -675,6 +681,9 @@ class EventLayerNode(Node):
         # reset last-call timestamps when rules reload
         self._last_llm_call_ts = {}
 
+        self.get_logger().info(
+            f"LLM/VLM call rules: {[r.get('id') for r in self.llm_call_rules]}"
+        )
 
         self.get_logger().info(f"Enabled rules: {[r['id'] for r in self.rules_enabled]}")
         self.get_logger().info(f"Desired topics: {list(self.desired_topics.keys())}")
@@ -963,7 +972,7 @@ class EventLayerNode(Node):
             return self._cb_bt_reading                      # NEW
         if topic == "/vlm/answer":
             return self._cb_vlm_answer
-        if topic == "/llm/speech_check":
+        if topic == "/llm/speech_check_resp":
             return self._cb_llm_speech_check
         #if topic == "/skills/status":              # NEW
         #    return self._cb_skill_status          # NEW
@@ -1112,8 +1121,13 @@ class EventLayerNode(Node):
                 if active_flag:
                     self._emit_hit(rid, payload)
 
-                self._publish_basic(rid, payload)
-                self._last_emit_ts[rid] = now
+                # NEW: allow internal-only rules
+                if bool(r.get("publish", True)):
+                    self._publish_basic(rid, payload)
+                    self._last_emit_ts[rid] = now
+                else:
+                    # still track emit time for diagnostics / cooldown-like behavior
+                    self._last_emit_ts[rid] = now
 
 
                 # NEW: if this is a one-shot rule and we just fired an ON event,
@@ -1405,6 +1419,8 @@ class EventLayerNode(Node):
 
     # ---------- composites ----------
     def _tick(self):
+    
+    
         if not self.enabled:
             return
         now = self._now()
@@ -1421,6 +1437,9 @@ class EventLayerNode(Node):
 
             rid = str(r.get("id") or "")
             if not rid:
+                continue
+
+            if isinstance(r.get("llm_call"), dict):
                 continue
 
             # NEW: skip quarantined rules
@@ -1457,30 +1476,38 @@ class EventLayerNode(Node):
                     "ts": now,
                     "zone": zone,
                 }
-                self.pub_comp.publish(StringMsg(data=json.dumps(evt)))
+                
+                self._emit_hit(rid, evt) #To allow for composite rule hits internally
+                if bool(r.get("publish", True)):
+                    self.pub_comp.publish(StringMsg(data=json.dumps(evt)))
 
                 # NEW: mark one-shot composite triggers as fired
                 if self._is_one_shot_candidate(r):
                     self._mark_one_shot_fired(rid)
 
+
         # 2) NEW: LLM/VLM call rules (llm_call: {...})
         for r in self.llm_call_rules:
+        
+        
+        
             rid = str(r.get("id") or "")
             if not rid:
                 continue
 
             if rid in self.bad_rules:
+                self.get_logger().info(f"LLM/VLM rule {rid} is quarantined; skipping.")
                 continue
 
-            # if rule is one-shot and already fired, do not call again
             if self._has_one_shot_fired(rid):
+                self.get_logger().info(f"LLM/VLM rule {rid} already fired (one-shot); skipping.")
                 continue
 
             llm_cfg = r.get("llm_call") or {}
             min_period_ms = int(llm_cfg.get("min_period_ms", 0))
             last_ts = self._last_llm_call_ts.get(rid, 0.0)
             if min_period_ms > 0 and (now - last_ts) * 1000.0 < min_period_ms:
-                # still in cooldown
+                self.get_logger().debug(f"LLM/VLM rule {rid} in cooldown.")
                 continue
 
             expr = r.get("expr", "")
@@ -1488,22 +1515,46 @@ class EventLayerNode(Node):
                 ok = bool(safe.eval(expr, {}))
             except Exception as e:
                 self._quarantine_rule(rid, "expr_error_llm_call", e, "composite")
+                self.get_logger().debug(f"something is happening")
                 continue
 
             if not ok:
+                # helpful to see this at least once when debugging
+                self.get_logger().debug(f"LLM/VLM rule {rid} expr={expr!r} -> False")
                 continue
 
-            # Build request envelope (may return None if missing text, etc.)
             env = self._build_llm_request_envelope(r, llm_cfg)
             if not env:
+                self.get_logger().warn(f"LLM/VLM rule {rid} built no envelope; skipping.")
                 continue
 
+            # --- NEW: dedupe speech-based calls so each utterance is processed once ---
+            if llm_cfg.get("task") == "llm_speech_check":
+                text = (env.get("text") or "").strip()
+
+                # robust-ish fingerprint: content + the source event ts if available
+                src_rule = llm_cfg.get("text_from_rule_id", "speech_final_any")
+                last_evt = self._latest_payload_for_rule(src_rule) or {}
+                src_ts = ""
+                if isinstance(last_evt, dict):
+                    src_ts = str(last_evt.get("ts") or last_evt.get("inner_ts") or "")
+
+                fp = f"{src_rule}|{src_ts}|{text}"
+
+                prev_fp = self._last_text_fingerprint.get(rid)
+                if fp == prev_fp:
+                    # same utterance still within exists() window -> skip
+                    continue
+                self._last_text_fingerprint[rid] = fp
+
+
+            self.get_logger().info(f"LLM/VLM rule {rid} sending request on task={llm_cfg.get('task')}")
             self._publish_llm_request(llm_cfg, env)
             self._last_llm_call_ts[rid] = now
 
-            # Optionally treat llm_call rules as one-shot if marked
             if self._is_one_shot_candidate(r):
                 self._mark_one_shot_fired(rid)
+
 
         # 3) Edge rule timeouts → synthesize OFF when no hit for window
         for r in self.rules_enabled:
@@ -1512,6 +1563,8 @@ class EventLayerNode(Node):
             if r.get("mode", "edge") != "edge":
                 continue
             if not r.get("emit_off", False):
+                continue
+            if isinstance(r.get("llm_call"), dict):
                 continue
 
             rid = str(r["id"])

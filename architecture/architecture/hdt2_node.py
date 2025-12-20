@@ -130,9 +130,9 @@ Your job:
 You MUST output a JSON object matching PROFILE_SCHEMA with at least:
   - id, short_name
   - style: free-text description of their interaction style
-  - helpfulness: how willing they seem to help or collaborate
-  - risk_aversion: how cautious or bold they are (especially about contamination)
-  - contamination_bias: how they seem to classify objects (e.g., "overcautious",
+  - helpfulness: text description of how willing they seem to help or collaborate
+  - risk_aversion: text description of how cautious or bold they are (especially about contamination)
+  - contamination_bias: text description of how they seem to classify objects (e.g., "overcautious",
     "underestimates risk", "roughly calibrated")
   - recent_frustration: a number (0.0–1.0) representing how frustrated they seem lately
   - proactivity_preference: a number (0.0–1.0) for how much proactive help they like
@@ -177,17 +177,18 @@ class HumanDigitalTwinNode(Node):
 
         # --------- Parameters ---------
         self.declare_parameter("llm_enabled", True)
-        self.declare_parameter("model", "gpt-5.1-mini")
+        self.declare_parameter("model", "gpt-5-mini")
         self.declare_parameter("groq_model_prefix", "gpt-oss")
         self.declare_parameter("publish_period_s", 1.0)
-        self.declare_parameter("profile_update_period_s", 20.0)
+        self.declare_parameter("profile_update_period_s", 30.0)
         self.declare_parameter("frustration_alpha", 0.3)
         self.declare_parameter("help_alpha", 0.3)
         self.declare_parameter("utterance_alpha", 0.3)
         self.declare_parameter("default_language", "en")
 
         # NEW: how many events to keep per human for event traces
-        self.declare_parameter("event_trace_max_len", 50)
+        self.declare_parameter("event_trace_max_len", 10)
+
 
         self.llm_enabled = self.get_parameter("llm_enabled").value
         self.model = self.get_parameter("model").value
@@ -218,6 +219,11 @@ class HumanDigitalTwinNode(Node):
         # _event_traces[human_id] = [ {ts, src, rule, zone, data_excerpt, ...}, ... ]
         self._event_traces: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
+        # NEW: last global event summary from broker/context_capsule
+        # Typically this is a short sentence summarizing recent events
+        self._last_event_summary: Optional[str] = None
+
+
         # --------- ROS I/O ---------
         self.sub_events_basic = self.create_subscription(
             StringMsg, "/events/basic", self._on_event_basic, 50
@@ -229,9 +235,15 @@ class HumanDigitalTwinNode(Node):
             StringMsg, "/task_state", self._on_task_state, 10
         )
 
+        # NEW: global event summary / context capsule from Broker
+        self.sub_context_capsule = self.create_subscription(
+            StringMsg, "/broker/context_capsule", self._on_context_capsule, 10
+        )
+
         self.pub_profiles = self.create_publisher(
             StringMsg, "/profiles/summary", 10
         )
+        
 
         self.create_timer(self.publish_period_s, self._publish_profiles_summary)
 
@@ -294,6 +306,11 @@ class HumanDigitalTwinNode(Node):
         """
         Store a slimmed-down version of an event for later LLM contextualization.
         Assumes human_id has already been inferred (e.g., from zone).
+
+        Also special-cases LLM/VLM outputs:
+          - If evt.data.json_text exists, we try to parse it and store the parsed
+            JSON under "json" in the data excerpt. If parsing fails, we fall back
+            to a truncated json_text string.
         """
         if not human_id or human_id == "human_unknown":
             return
@@ -304,24 +321,43 @@ class HumanDigitalTwinNode(Node):
         data = evt.get("data") or {}
         etype = evt.get("type")  # for composite events
 
+        # Try to parse any structured json_text (from VLM/LLM) if present
+        parsed_json = None
+        if isinstance(data, dict):
+            jt = data.get("json_text")
+            if isinstance(jt, str) and jt.strip():
+                try:
+                    parsed_json = json.loads(jt)
+                except Exception:
+                    parsed_json = None
+
         # Build a small data excerpt to avoid massive payloads
         data_excerpt: Dict[str, Any] = {}
         if isinstance(data, dict):
             for k, v in data.items():
+                # Special handling for json_text
+                if k == "json_text":
+                    if parsed_json is not None:
+                        # Prefer a compact parsed object
+                        data_excerpt["json"] = parsed_json
+                    else:
+                        # Fall back to truncated raw string
+                        data_excerpt["json_text"] = v[:160]
+                    continue
+
                 # keep small scalar fields; truncate strings
                 if isinstance(v, str):
                     data_excerpt[k] = v[:160]
                 elif isinstance(v, (int, float, bool)):
                     data_excerpt[k] = v
-                # keep small nested dicts with simple scalars if you like
-                # else ignore to keep things compact
+                # (optionally add tiny nested dict handling here if needed)
 
         trace_entry = {
             "ts": ts,
-            "src": src,
+            "src": src,        # "basic" or "composite"
             "rule": rule_id,
             "zone": zone,
-            "type": etype,
+            "type": etype,     # for composites, usually "composite"
             "data": data_excerpt,
         }
 
@@ -329,8 +365,8 @@ class HumanDigitalTwinNode(Node):
         buf.append(trace_entry)
         # enforce max length
         if len(buf) > self.event_trace_max_len:
-            # drop oldest entries
             del buf[0 : len(buf) - self.event_trace_max_len]
+
 
     def _get_event_trace(self, human_id: str) -> List[Dict[str, Any]]:
         """
@@ -347,6 +383,42 @@ class HumanDigitalTwinNode(Node):
             return
         if isinstance(obj, dict):
             self._last_task_state = obj
+
+    def _on_context_capsule(self, msg: StringMsg):
+        """
+        Ingest Broker's context capsule, primarily to read the global event summary.
+
+        Broker publishes JSON like:
+          {
+            "trigger": {...},
+            "profiles": {...},
+            "event_trace": "<short summary string>" OR [ ... raw events ... ],
+            "world": {...}
+          }
+        We only care about event_trace here.
+        """
+        try:
+            obj = json.loads(msg.data)
+        except Exception:
+            self.get_logger().warn(f"[hdt] bad JSON on /broker/context_capsule: {msg.data}")
+            return
+
+        event_trace = obj.get("event_trace")
+
+        # In your Broker, event_trace is either:
+        #   - a short summary string (preferred), or
+        #   - a raw list of recent events if summarization failed.
+        if isinstance(event_trace, str):
+            # This is the LLM-generated one-sentence summary
+            self._last_event_summary = event_trace.strip()
+        elif isinstance(event_trace, list):
+            # Fallback: keep a compact stringified version
+            try:
+                s = json.dumps(event_trace[-5:], ensure_ascii=False)
+                self._last_event_summary = f"Recent events (raw): {s[:400]}"
+            except Exception:
+                self._last_event_summary = None
+
 
     # ---------- BASIC events ----------
     def _on_event_basic(self, msg: StringMsg):
@@ -375,6 +447,12 @@ class HumanDigitalTwinNode(Node):
         if isinstance(zone, str) and zone:
             self._robot_zone = zone
 
+        # Define "trigger" for HDT
+        is_trigger = (
+            rule_id.startswith("trigger_")
+            or rule_id in ("speech_final_any", "trigger_speech_final")
+        )
+
         # Link this basic event to a human based on explicit ids or zone
         human_id = self._guess_human_id_from_event(evt)
         if human_id:
@@ -383,6 +461,10 @@ class HumanDigitalTwinNode(Node):
             f["last_ts"] = ts
             # record the event in their trace
             self._record_event_for_human(human_id, evt, src="basic")
+
+            # If this is a trigger, force an immediate LLM update for that human
+            if is_trigger:
+                self._maybe_update_profile_with_llm(human_id, force=True)
 
         # Mark "active human" on final speech events that are commands to Bob
         if rule_id in ("speech_final_any", "trigger_speech_final"):
@@ -395,6 +477,7 @@ class HumanDigitalTwinNode(Node):
         if "kind" in data and "intent" in data:
             # use zone and ts we already parsed
             self._ingest_speech_meta_event(rule_id, data, ts, zone)
+
 
     # ---------- COMPOSITE events ----------
     def _on_event_composite(self, msg: StringMsg):
@@ -422,12 +505,19 @@ class HumanDigitalTwinNode(Node):
         if isinstance(zone, str) and zone:
             self._robot_zone = zone
 
+        # Define "trigger" for composites (any trigger_* rule)
+        is_trigger = rule_id.startswith("trigger_")
+
         # Link composite event to a human via zone (one human per zone assumption)
         human_id = self._guess_human_id_from_event(evt)
         if human_id:
             f = self._ensure_human(human_id)
             f["last_ts"] = ts
             self._record_event_for_human(human_id, evt, src="composite")
+
+            # Force LLM update on composite triggers
+            if is_trigger:
+                self._maybe_update_profile_with_llm(human_id, force=True)
 
         # Example: human_ping_here represents a nonverbal “ping” from a human
         if rule_id == "human_ping_here":
@@ -500,10 +590,12 @@ class HumanDigitalTwinNode(Node):
         f["help_accept_ema"] = self._ewma_update(old, val, self.help_alpha)
 
     # ---------- LLM profile refinement ----------
-    def _maybe_update_profile_with_llm(self, human_id: str):
+    def _maybe_update_profile_with_llm(self, human_id: str, force: bool = False):
         now = self._now()
         last = self._last_profile_update_ts.get(human_id, 0.0)
-        if now - last < self.profile_update_period_s:
+
+        # If not forced, respect the periodic cooldown
+        if not force and now - last < self.profile_update_period_s:
             return
 
         feats = self.features.get(human_id)
@@ -524,8 +616,10 @@ class HumanDigitalTwinNode(Node):
             "recent_features": feats,
             "task_state": self._last_task_state,
             "old_profile": old_profile,
-            "event_trace": event_trace,  # NEW: pass per-human event trace to LLM
+            "event_trace": event_trace,                 # per-human trace
+            "global_event_summary": self._last_event_summary,  # NEW: team-level story from Broker
         }
+
 
         messages = [
             {"role": "system", "content": PROFILE_SYSTEM_PROMPT},
@@ -544,6 +638,7 @@ class HumanDigitalTwinNode(Node):
             self._last_profile_update_ts[human_id] = now
         except Exception as e:
             self.get_logger().warn(f"[hdt] LLM profile update error for {human_id}: {e}")
+
 
     def _heuristic_profile(
         self,
@@ -632,13 +727,13 @@ class HumanDigitalTwinNode(Node):
                 model="openai/" + model,
                 messages=messages,
                 response_format={"type": "json_object"},
+                reasoning_effort="medium",
             )
         else:
             client = OpenAI()
             resp = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                reasoning_effort="medium",
                 response_format={"type": "json_object"},
             )
 

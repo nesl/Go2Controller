@@ -27,6 +27,14 @@ from visualization_msgs.msg import Marker
 import bisect
 import math
 
+import os
+import soundfile as sf
+from resemblyzer import VoiceEncoder, preprocess_wav
+from std_srvs.srv import Trigger
+
+
+
+
 from rcl_interfaces.msg import SetParametersResult
 
 def now_to_msg(clock):
@@ -96,6 +104,11 @@ def _build_torch_whisper_gate(model_id: str, device_str: str, language: str, tra
         task=("translate" if translate else "transcribe")
     )
     return processor, model, forced_ids, device
+
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    a = a.astype(np.float32); b = b.astype(np.float32)
+    return float(np.dot(a, b) / ((np.linalg.norm(a) + 1e-12) * (np.linalg.norm(b) + 1e-12)))
+
 
 class HFWhisperWorker(threading.Thread):
     def __init__(self, asr_pipeline, gen_kwargs, translate, language, out_queue, logger):
@@ -444,8 +457,7 @@ class STTFasterWhisperNode(Node):
         self._last_perf_publish = time.time()
         self._perf_publish_period = 2.0  # seconds
 
-        
-
+       
         self.wg_window_ms = int(self.get_parameter("wg_window_ms").value)
         self.wg_hop_ms = int(self.get_parameter("wg_hop_ms").value)
         self.wg_end_silence_ms = int(self.get_parameter("wg_end_silence_ms").value)
@@ -453,6 +465,42 @@ class STTFasterWhisperNode(Node):
         self.wg_min_chars = int(self.get_parameter("wg_min_chars").value)
         self.wg_min_avg_logprob = float(self.get_parameter("wg_min_avg_logprob").value)
         self.wg_max_no_speech = float(self.get_parameter("wg_max_no_speech").value)
+
+        # --- Speaker ID / enrollment ---
+        self.declare_parameter("spk_profiles_dir", "/tmp/spk_profiles")
+        self.declare_parameter("spk_threshold", 0.85)   # tune later
+        self.declare_parameter("spk_save_wav", True)
+
+        self.profiles_dir = str(self.get_parameter("spk_profiles_dir").value)
+        os.makedirs(self.profiles_dir, exist_ok=True)
+
+        self.spk_threshold = float(self.get_parameter("spk_threshold").value)
+        self.spk_save_wav = bool(self.get_parameter("spk_save_wav").value)
+
+        # Embedding model (Resemblyzer)
+        self.spk_encoder = VoiceEncoder()
+
+        # State machine: idle | enroll(person) | verify(person)
+        self._spk_mode = "verify"
+        self._spk_target = "human_a"
+
+        self.pub_spk = self.create_publisher(String, "/audio/speaker_match", 10)
+
+        self.create_service(Trigger, "/speaker/enroll", self._srv_enroll)
+        self.create_service(Trigger, "/speaker/verify", self._srv_verify)
+        self.create_service(Trigger, "/speaker/cancel", self._srv_cancel)
+        self.declare_parameter("speaker_id", "human_a")
+
+        # ---- Annotate STT output with speaker verification ----
+        self.declare_parameter("stt_text_annotate_verify", True)
+        self.declare_parameter("stt_text_verify_format", "[spk:{id} score={score:.2f} {'OK' if match else 'NO'}] ")
+        self.declare_parameter("stt_text_verify_ttl_ms", 2500)
+
+        self.stt_text_annotate_verify = bool(self.get_parameter("stt_text_annotate_verify").value)
+        self.stt_text_verify_format = str(self.get_parameter("stt_text_verify_format").value)
+        self.stt_text_verify_ttl_ms = int(self.get_parameter("stt_text_verify_ttl_ms").value)
+
+        self._last_spk = None  # {"id":..., "score":..., "match":..., "ts_ns":..., "threshold":...}
 
 
         # Load params
@@ -629,6 +677,35 @@ class STTFasterWhisperNode(Node):
             f"STT node: lane={self.pick_lane} fs={self.fs} TC={self.TC} "
           
         )
+
+    def _srv_enroll(self, req, resp):
+        # person id comes from a parameter for simplicity
+        # (Trigger has no request fields)
+        pid = str(self.get_parameter("speaker_id").value) if self.has_parameter("speaker_id") else "person"
+        self._spk_mode = "enroll"
+        self._spk_target = pid
+        resp.success = True
+        resp.message = f"Enrollment armed for '{pid}'. Say a sentence now."
+        self.get_logger().info(resp.message)
+        return resp
+
+    def _srv_verify(self, req, resp):
+        pid = str(self.get_parameter("speaker_id").value) if self.has_parameter("speaker_id") else "person"
+        self._spk_mode = "verify"
+        self._spk_target = pid
+        resp.success = True
+        resp.message = f"Verification armed for '{pid}'. Speak now."
+        self.get_logger().info(resp.message)
+        return resp
+
+    def _srv_cancel(self, req, resp):
+        self._spk_mode = "idle"
+        self._spk_target = None
+        resp.success = True
+        resp.message = "Speaker operation cancelled."
+        self.get_logger().info(resp.message)
+        return resp
+
 
     def _rebuild_asr(self, model_size=None, device=None, chunk_s=None, batch=None, language=None, translate=None):
         """Recreate the HF pipeline worker safely."""
@@ -1002,11 +1079,14 @@ class STTFasterWhisperNode(Node):
         az = math.radians(latest_angle[0][0])                   # NEW
 
         
+        # ---- speaker verify/enroll FIRST so drain_outputs can annotate ----
+        self._speaker_process_final(audio_i16, stamp_msg)
+
         if self.enable_stt:
             self.worker.submit(audio_i16, stamp_msg, latest_angle[0][0])
         else:
             self.get_logger().info("STT disabled: dropping finalized utterance audio")
-        
+
         # reset
         self._utt_active = False
         self._utt_start_time_ns = None
@@ -1015,6 +1095,97 @@ class STTFasterWhisperNode(Node):
         self._last_speech_time_ns = None
         self.utterances_finalized += 1
         self._maybe_publish_perf()
+
+
+    def _speaker_process_final(self, audio_i16: np.ndarray, stamp_msg: TimeMsg):
+        if self._spk_mode == "idle" or not self._spk_target:
+            return
+
+        pid = self._spk_target
+        ts_ns = int(stamp_msg.sec) * 1_000_000_000 + int(stamp_msg.nanosec)
+
+        # Save wav (optional)
+        wav_path = os.path.join(self.profiles_dir, f"{pid}_{ts_ns}.wav")
+        if self.spk_save_wav:
+            sf.write(wav_path, audio_i16.astype(np.int16), self.fs, subtype="PCM_16")
+
+        # Compute embedding (Resemblyzer wants float wav at 16k; preprocess_wav can read file)
+        # If we saved wav, we can just read it via preprocess_wav; otherwise convert directly.
+        if self.spk_save_wav:
+            wav = preprocess_wav(wav_path)
+        else:
+            wav = (audio_i16.astype(np.float32) / 32768.0)
+        emb = self.spk_encoder.embed_utterance(wav)
+
+        prof_path = os.path.join(self.profiles_dir, f"{pid}.npz")
+
+        if self._spk_mode == "enroll":
+            np.savez(prof_path, emb=emb.astype(np.float32), fs=self.fs, created_ns=ts_ns)
+            
+            # cache latest speaker status (for annotating text)
+            self._last_spk = {
+                "id": pid,
+                "score": 1.0,
+                "match": True,
+                "threshold": float(self.spk_threshold),
+                "ts_ns": ts_ns,
+                "kind": "enroll_done",
+            }
+            
+            payload = {
+                "kind": "enroll_done",
+                "speaker_id": pid,
+                "profile_path": prof_path,
+                "wav_path": wav_path if self.spk_save_wav else None,
+                "stamp": {"sec": stamp_msg.sec, "nanosec": stamp_msg.nanosec},
+            }
+            self.pub_spk.publish(String(data=json.dumps(payload)))
+            self.get_logger().info(f"[spk] Enrolled '{pid}' -> {prof_path}")
+
+        elif self._spk_mode == "verify":
+            if not os.path.exists(prof_path):
+                payload = {
+                    "kind": "verify_error",
+                    "speaker_id": pid,
+                    "error": "profile_not_found",
+                    "profile_path": prof_path,
+                }
+                self.pub_spk.publish(String(data=json.dumps(payload)))
+                self.get_logger().warn(f"[spk] Profile not found: {prof_path}")
+            else:
+                ref = np.load(prof_path)["emb"].astype(np.float32)
+                score = _cosine(emb, ref)
+                is_match = bool(score >= self.spk_threshold)
+
+                # cache latest verification result (for annotating text)
+                self._last_spk = {
+                    "id": pid,
+                    "score": float(score),
+                    "match": bool(is_match),
+                    "threshold": float(self.spk_threshold),
+                    "ts_ns": ts_ns,
+                    "kind": "verify_done",
+                }
+
+
+
+                payload = {
+                    "kind": "verify_done",
+                    "speaker_id": pid,
+                    "score": float(score),
+                    "threshold": float(self.spk_threshold),
+                    "match": is_match,
+                    "wav_path": wav_path if self.spk_save_wav else None,
+                    "stamp": {"sec": stamp_msg.sec, "nanosec": stamp_msg.nanosec},
+                }
+                self.pub_spk.publish(String(data=json.dumps(payload)))
+                self.get_logger().info(f"[spk] Verify '{pid}' score={score:.3f} match={is_match}")
+
+        # Disarm after one utterance
+        if self._spk_mode == "enroll":
+            self._spk_mode = "idle"
+            self._spk_target = None
+
 
 
     def _wg_tick(self):
@@ -1357,8 +1528,27 @@ class STTFasterWhisperNode(Node):
             duration = item.get("duration")
 
             # Publish plain text
-            if text:
-                self.pub_text.publish(String(data=text))
+            out_text = text
+
+            if self.stt_text_annotate_verify and text:
+                spk = self._last_spk
+                if spk is not None:
+                    now_ns = self.get_clock().now().nanoseconds
+                    age_ms = (now_ns - int(spk.get("ts_ns", 0))) / 1e6
+                    if age_ms <= self.stt_text_verify_ttl_ms:
+                        try:
+                            prefix = self.stt_text_verify_format.format(
+                                id=spk.get("id", "unknown"),
+                                score=float(spk.get("score", 0.0)),
+                                match=bool(spk.get("match", False)),
+                            )
+                        except Exception:
+                            prefix = f"[spk:{spk.get('id','unknown')} score={float(spk.get('score',0.0)):.2f} {'OK' if spk.get('match') else 'NO'}] "
+                        out_text = prefix + text
+
+            if out_text:
+                self.pub_text.publish(String(data=out_text))
+
 
             
             # Publish JSON w/ angle + metadata

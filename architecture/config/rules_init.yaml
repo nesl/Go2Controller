@@ -50,6 +50,7 @@ rules:
   # Human greeting + presence co-occur (for nice social responses).
   - id: human_ping_here
     enabled: true
+    publish: false
     type: composite
     expr: "exists('speech_final_any', 100000) and exists('human_detected_3d', 100000)"
     
@@ -57,6 +58,7 @@ rules:
   - id: odom_rot_delta
     enabled: true
     task: odometry_tracking
+    publish: false
     output: odom
     mode: "level"
     # fire on every >= 3° change; payload carries dyaw_deg
@@ -64,6 +66,7 @@ rules:
 
   - id: odom_dist_delta
     enabled: true
+    publish: false
     task: odometry_tracking
     output: odom
     mode: "level"
@@ -91,6 +94,13 @@ rules:
     task: vlm_inference
     output: answer.text
     mode: "level"
+    expr: "success and json_text is not None and json_text != ''"
+    
+  - id: speech_intent_inferred
+    enabled: true
+    type: basic
+    task: llm_speech_check
+    output: check.json
     expr: "success and json_text is not None and json_text != ''"
     
   # Same idea as speech_final_any, but from json.final so we can access azimuth_deg.
@@ -130,7 +140,6 @@ rules:
     llm_call:
       task: "llm_speech_check"           # uses your LLM request/response path
       output_id: "check.json"            # EventLayer already parses this
-      model_id: "gpt-5.1-mini"
 
       # One call per utterance (no throttling)
       min_period_ms: 0       
@@ -193,7 +202,6 @@ rules:
     llm_call:
       task: "vlm_inference"                 # matches tasks.vlm_inference
       output_id: "answer.text"
-      model_id: "Qwen/Qwen2.5-VL-7B-Instruct"
       # Don't spam VLM: at most once every 15 seconds while humans are present
       min_period_ms: 15000
       tag: "scene_human_present"
@@ -240,5 +248,8 @@ rules:
             }
           }
         }
+        
+
+
 
 

@@ -29,7 +29,7 @@ class LlmSpeechCheckNode(Node):
         super().__init__("llm_speech_check")
 
         # Parameters (runtime-changeable via set_parameters)
-        self.declare_parameter("model_id", "gpt-5.1-mini")
+        self.declare_parameter("model_id", "gpt-5-mini")
         self.declare_parameter("temperature", 0.2)
         self.declare_parameter("max_tokens", 256)
 

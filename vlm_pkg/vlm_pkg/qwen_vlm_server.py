@@ -250,22 +250,23 @@ class VLM:
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
 
+        input_len = inputs["input_ids"].shape[-1]
+
         out_ids = self.model.generate(**inputs, **gen_kwargs)
 
-        if hasattr(self.processor, "batch_decode"):
-            text = self.processor.batch_decode(out_ids, skip_special_tokens=True)[0]
+        # Slice off the prompt tokens
+        gen_ids = out_ids[0][input_len:]
+
+        if hasattr(self.processor, "decode"):
+            text = self.processor.decode(gen_ids, skip_special_tokens=True)
+        elif hasattr(self.processor, "batch_decode"):
+            text = self.processor.batch_decode([gen_ids], skip_special_tokens=True)[0]
         else:
             tok = self.tokenizer
-            if tok is None:
-                tok = AutoTokenizer.from_pretrained(self.model.config._name_or_path, trust_remote_code=True)
-            text = tok.decode(out_ids[0], skip_special_tokens=True)
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            peak = torch.cuda.max_memory_allocated()
-            print(f"[VLM] peak VRAM: {human_bytes(peak)}")
+            text = tok.decode(gen_ids, skip_special_tokens=True)
 
         return text.strip()
+
 
 # -----------------------------
 # ROS2 Node
@@ -354,6 +355,7 @@ class QwenVLMServer(Node):
             self.get_logger().warn(f"[vlm] bad JSON on /vlm/req: {e}")
             return
 
+        client = obj.get("client") or ""
         req_id = obj.get("id")
         prompt = obj.get("prompt") or "Describe the scene."
         tag = obj.get("tag") or "default_vlm"
@@ -369,6 +371,7 @@ class QwenVLMServer(Node):
             tag=tag,
             phase="run_trigger",   # distinguish from service calls
             req_id=req_id,
+            client=client
         )
 
         if ok:
@@ -444,7 +447,8 @@ class QwenVLMServer(Node):
         self.current_prompt = msg.data
         self.get_logger().info(f"Prompt updated: {self.current_prompt!r}")
 
-    def _run_vlm_once(self, *, prompt: str, tag: str = "", phase: str, req_id=None):
+    def _run_vlm_once(self, *, prompt: str, tag: str = "", phase: str, req_id=None, client: str = ""):
+
         """
         Shared helper: runs VLM on latest image and publishes JSON envelope to /vlm/answer.
 
@@ -457,6 +461,7 @@ class QwenVLMServer(Node):
             )
             return False, "", 0, {
                 "id": req_id,
+                "client": client,
                 "success": False,
                 "raw_text": "",
                 "json_text": "",
@@ -472,6 +477,7 @@ class QwenVLMServer(Node):
             )
             return False, "", 0, {
                 "id": req_id,
+                "client": client,
                 "success": False,
                 "raw_text": "",
                 "json_text": "",
@@ -547,6 +553,7 @@ class QwenVLMServer(Node):
         # Build JSON envelope expected by EventLayer/SkillsAgent
         envelope = {
             "id": req_id,
+            "client": client,
             "success": bool(ok),
             "raw_text": answer or "",
             "json_text": json_blob,        # ← NOW FILLED WHEN POSSIBLE

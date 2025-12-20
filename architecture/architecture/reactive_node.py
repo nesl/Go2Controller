@@ -9,7 +9,7 @@ Interaction Loop / Skill Selector node.
     /events/composite  (std_msgs/String, JSON: {"rule":..., "expr":..., "ts":..., "zone":...})
     /task_state        (std_msgs/String, JSON: task progress & robot objective)
     /profiles/summary  (std_msgs/String, JSON: HDT human profiles)
-    /planner/proposal  (std_msgs/String, JSON: high-level proposals from planner)  <-- NEW
+    /planner/proposal  (std_msgs/String, JSON: high-level proposals from planner)
 
 - On any "trigger" rule (rule id in trigger_map or starting with trigger_prefix),
   it builds a "loop_capsule" that includes:
@@ -20,8 +20,10 @@ Interaction Loop / Skill Selector node.
     * latest planner proposal (if any)
 
 - When a planner proposal is received on /planner/proposal, it is immediately
-  converted into a concrete skill sequence and executed (published to
-  /skills/execute_plan) WITHOUT calling the LLM.
+  converted into a concrete skill *state_machine* and executed by:
+    1) appending it to skills_composite.yaml
+    2) calling /skills/reload
+    3) publishing {"skill": "<name>", "ctx": {...}} on /skills/execute
 
 - For other triggers (e.g., human speech), it calls a small LLM (fast) to pick
   a SHORT sequence of existing skills:
@@ -34,7 +36,8 @@ Interaction Loop / Skill Selector node.
       ]
     }
 
-- Publishes this plan to /skills/execute_plan (std_msgs/String, JSON).
+- That list is similarly turned into a state_machine and executed via
+  /skills/execute in the exact same format as router_node.py.
 """
 
 import json
@@ -51,6 +54,7 @@ from rclpy.parameter import Parameter
 from rcl_interfaces.msg import SetParametersResult
 
 from std_msgs.msg import String as StringMsg
+from std_srvs.srv import Trigger  # ### NEW
 
 from jsonschema import validate, ValidationError
 from openai import OpenAI
@@ -192,9 +196,11 @@ class InteractionLoopNode(Node):
 
     - Listens for trigger events.
     - Ingests task_state, HDT profiles, and planner proposals.
-    - For idle triggers, executes the planner proposal directly (if available).
-    - Otherwise, uses LLM (or heuristic fallback) to choose a skill sequence.
-    - Publishes the plan to /skills/execute_plan.
+    - For planner proposals, converts them into a state_machine and executes it.
+    - For other triggers, uses LLM (or fallback) to choose a skills list,
+      converts it into a state_machine, and executes it.
+    - Execution is done by publishing to /skills/execute in the SAME FORMAT
+      as router_node: {"skill": "<name>", "ctx": {...}}.
     """
 
     def __init__(self):
@@ -202,7 +208,7 @@ class InteractionLoopNode(Node):
 
         # ----- Parameters -----
         self.declare_parameter("llm_enabled", True)
-        self.declare_parameter("model", "gpt-5.1-mini")
+        self.declare_parameter("model", "gpt-5-mini")
         self.declare_parameter("groq_model_prefix", "gpt-oss")
         self.declare_parameter("trigger_prefix", "trigger_")
         self.declare_parameter(
@@ -221,11 +227,12 @@ class InteractionLoopNode(Node):
 
         self.declare_parameter("profiles_topic", "/profiles/summary")
         self.declare_parameter("task_state_topic", "/task_state")
-        # NEW: planner proposals
         self.declare_parameter("planner_proposal_topic", "/planner/proposal")
+        self.declare_parameter("context_capsule_topic", "/broker/context_capsule")
+
 
         # How many recent events to keep in memory
-        self.declare_parameter("event_trace_len", 20)
+        self.declare_parameter("event_trace_len", 10)
 
         # Parameters → attributes
         self.llm_enabled = bool(self.get_parameter("llm_enabled").value)
@@ -242,6 +249,8 @@ class InteractionLoopNode(Node):
         self.profiles_topic = self.get_parameter("profiles_topic").value
         self.task_state_topic = self.get_parameter("task_state_topic").value
         self.planner_proposal_topic = self.get_parameter("planner_proposal_topic").value
+        self.context_capsule_topic = self.get_parameter("context_capsule_topic").value
+
 
         self.event_trace_len = int(self.get_parameter("event_trace_len").value)
 
@@ -250,12 +259,15 @@ class InteractionLoopNode(Node):
         # ----- Internal state -----
         self._event_trace = deque(maxlen=self.event_trace_len)
 
+        # NEW: latest global event summary from Broker
+        self._last_event_summary: Optional[str] = None
+
         # Latest task_state snapshot
         self._last_task_state: Dict[str, Any] = {}
 
         # Latest planner proposal (raw object)
-        self._last_planner_proposal: Dict[str, Any] = {}    # NEW
-        self._last_planner_proposal_ts: float = 0.0         # NEW
+        self._last_planner_proposal: Dict[str, Any] = {}
+        self._last_planner_proposal_ts: float = 0.0
 
         # Latest HDT profiles (raw + compact)
         self._profiles_raw: Dict[str, Any] = {}
@@ -277,19 +289,34 @@ class InteractionLoopNode(Node):
             StringMsg, self.task_state_topic, self._on_task_state, 20
         )
 
+        # NEW: broker context capsule (contains event summary)
+        self.sub_context_capsule = self.create_subscription(
+            StringMsg,
+            self.context_capsule_topic,
+            self._on_context_capsule,
+            10,
+        )
+
+
         # HDT profiles
         self.sub_profiles = self.create_subscription(
             StringMsg, self.profiles_topic, self._on_profiles, 10
         )
 
-        # Planner proposals  <-- NEW
+        # Planner proposals
         self.sub_proposal = self.create_subscription(
             StringMsg, self.planner_proposal_topic, self._on_planner_proposal, 20
         )
 
-        # Skill plan publisher (for skills_node)
-        self.pub_execute_plan = self.create_publisher(
-            StringMsg, "/skills/execute_plan", 10
+        # Skills: reload + execute (MATCH router_node)
+        self.reload_skills_client = self.create_client(  # ### NEW
+            Trigger,
+            "/skills/reload",
+        )
+        self.skills_execute_pub = self.create_publisher(  # ### NEW
+            StringMsg,
+            "/skills/execute",
+            10,
         )
 
         self.get_logger().info("interaction_loop_node initialized")
@@ -336,7 +363,7 @@ class InteractionLoopNode(Node):
         primitives: List[Dict[str, Any]] = []
         composites: List[Dict[str, Any]] = []
 
-        for path in [self.skills_base_path, self.skills_composite_path]:
+        for path in [self.skills_base_path]:
             doc = self._read_yaml_if_exists(path) or {}
             for s in doc.get("skills", []) or []:
                 if not isinstance(s, dict):
@@ -383,31 +410,46 @@ class InteractionLoopNode(Node):
         if isinstance(obj, dict):
             self._last_task_state = obj
 
+    def _on_context_capsule(self, msg: StringMsg):
+        """
+        Ingest Broker's context capsule to access the global event summary.
+
+        Expected shape (from broker_node._context_capsule):
+          {
+            "trigger": {...},
+            "profiles": {...},
+            "event_trace": "<short summary>" OR [ ...raw events... ],
+            "world": {...}
+          }
+        We only care about event_trace here.
+        """
+        try:
+            obj = json.loads(msg.data) if msg.data else {}
+        except Exception:
+            self.get_logger().warn(
+                f"[interaction_loop] bad JSON on {self.context_capsule_topic}: {msg.data}"
+            )
+            return
+
+        event_trace = obj.get("event_trace")
+
+        if isinstance(event_trace, str):
+            # LLM-generated short summary
+            self._last_event_summary = event_trace.strip()
+        elif isinstance(event_trace, list):
+            # Fallback: compact stringified version of the last few events
+            try:
+                s = json.dumps(event_trace[-5:], ensure_ascii=False)
+                self._last_event_summary = f"Recent events (raw): {s[:400]}"
+            except Exception:
+                self._last_event_summary = None
+
+
     # ---------- Planner proposals ingestion ----------
     def _on_planner_proposal(self, msg: StringMsg):
         """
         Ingest proposals from the planner/coordination node and immediately
-        convert them into a concrete skill plan if possible.
-
-        Expected payload (flexible):
-          EITHER:
-            {
-              "objective": {...},
-              "proposal": {
-                "summary": str,
-                "steps": [ {...}, ...],
-                ...
-              },
-              "reason": str,
-              "ts": float,
-              ...
-            }
-          OR directly:
-            {
-              "summary": str,
-              "steps": [ {...}, ...],
-              ...
-            }
+        convert them into a concrete skill plan executed via /skills/execute.
         """
         try:
             obj = json.loads(msg.data) if msg.data else {}
@@ -420,14 +462,14 @@ class InteractionLoopNode(Node):
         if not isinstance(obj, dict):
             return
 
-        # Keep a snapshot for context (e.g., for the LLM path if needed)
+        # Keep a snapshot for context
         self._last_planner_proposal = obj
         self._last_planner_proposal_ts = self._now()
         self.get_logger().info(
             "[interaction_loop] updated planner proposal snapshot"
         )
 
-        # Immediately try to turn this planner proposal into a concrete skill plan
+        # Immediately try to turn this planner proposal into a concrete skills list
         skills_inventory = self._build_skills_inventory()
         skills_obj = self._proposal_to_skill_plan(obj, skills_inventory)
 
@@ -444,7 +486,7 @@ class InteractionLoopNode(Node):
             skills_obj=skills_obj,
         )
         self.get_logger().info(
-            "[interaction_loop] executed planner proposal as a skill plan"
+            "[interaction_loop] executed planner proposal as a state_machine via /skills/execute"
         )
 
     # ---------- HDT profiles ingestion ----------
@@ -519,15 +561,35 @@ class InteractionLoopNode(Node):
             entry["zone"] = zone
 
         txt = ""
+        parsed_json = None
+
         if isinstance(data, dict):
+            # --- NEW: try to parse structured json_text from VLM/LLM ---
+            jt = data.get("json_text")
+            if isinstance(jt, str) and jt.strip():
+                try:
+                    parsed_json = json.loads(jt)
+                except Exception:
+                    parsed_json = None
+
+            # keep a short snippet of text for context
             txt = str(
                 data.get("text")
                 or data.get("utterance")
                 or data.get("speech")
                 or ""
             )
+
         if txt:
             entry["text_snippet"] = txt[:80]
+
+        # --- NEW: attach parsed JSON (or a short snippet) if available ---
+        if parsed_json is not None:
+            entry["json"] = parsed_json
+        elif isinstance(data, dict):
+            jt = data.get("json_text")
+            if isinstance(jt, str) and jt.strip():
+                entry["json_text_snippet"] = jt[:160]
 
         self._event_trace.append(entry)
 
@@ -549,6 +611,7 @@ class InteractionLoopNode(Node):
                 payload=data,
             )
 
+
     def _on_comp_event(self, msg: StringMsg):
         try:
             evt = json.loads(msg.data)
@@ -565,6 +628,7 @@ class InteractionLoopNode(Node):
         expr = evt.get("expr") or ""
         ts = float(evt.get("ts") or self._now())
         zone = evt.get("zone")
+        data = evt.get("data") or {}   # NEW: in case we start attaching payloads
 
         entry = {
             "kind": "composite",
@@ -576,6 +640,23 @@ class InteractionLoopNode(Node):
         if expr:
             entry["expr_snippet"] = str(expr)[:120]
 
+        # --- NEW: if composite carries json_text, parse and store it ---
+        parsed_json = None
+        if isinstance(data, dict):
+            jt = data.get("json_text")
+            if isinstance(jt, str) and jt.strip():
+                try:
+                    parsed_json = json.loads(jt)
+                except Exception:
+                    parsed_json = None
+
+        if parsed_json is not None:
+            entry["json"] = parsed_json
+        elif isinstance(data, dict):
+            jt = data.get("json_text")
+            if isinstance(jt, str) and jt.strip():
+                entry["json_text_snippet"] = jt[:160]
+
         self._event_trace.append(entry)
 
         trig_type = self.trigger_map.get(rule)
@@ -586,6 +667,7 @@ class InteractionLoopNode(Node):
             self.get_logger().info(
                 f"[interaction_loop] trigger composite rule={rule}, type={trig_type}"
             )
+            # If you later attach more to evt["data"], you can pass it here instead of just {"expr": expr}
             payload = {"expr": expr}
             self._run_for_trigger(
                 rule=rule,
@@ -596,7 +678,8 @@ class InteractionLoopNode(Node):
                 payload=payload,
             )
 
-    # ---------- Planner proposal → skill plan mapping (NEW) ----------
+
+    # ---------- Planner proposal → skill plan mapping ----------
     def _proposal_to_skill_plan(
         self,
         proposal_root: Dict[str, Any],
@@ -655,7 +738,6 @@ class InteractionLoopNode(Node):
                 zone = step.get("zone")
                 if isinstance(stype, str):
                     if stype == "move" and isinstance(zone, str):
-                        # e.g. goto_zone_A / goto_zone_B
                         cand1 = f"goto_zone_{zone}"
                         cand2 = f"nav.goto_zone_{zone}"
                         if cand1 in all_skill_names:
@@ -737,6 +819,11 @@ class InteractionLoopNode(Node):
             "task_state": self._last_task_state,
         }
 
+        # NEW: attach global event summary from Broker if available
+        if self._last_event_summary:
+            capsule["event_summary"] = self._last_event_summary
+
+
         # Include latest planner proposal (if any) just for context to the LLM
         if self._last_planner_proposal:
             capsule["planner_proposal"] = self._last_planner_proposal
@@ -772,9 +859,8 @@ class InteractionLoopNode(Node):
             )
             return
 
-        # Publish to /skills/execute_plan
+        # Execute via /skills/execute in SAME FORMAT as router
         self._publish_skill_plan(rule, trig_type, skills_obj)
-
 
     # ---------- LLM call ----------
     def _call_skill_selector_llm(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -795,6 +881,7 @@ class InteractionLoopNode(Node):
             client = Groq()
             resp = client.chat.completions.create(
                 model="openai/" + model,
+                reasoning_effort="medium",
                 messages=messages,
                 response_format={"type": "json_object"},
             )
@@ -802,7 +889,6 @@ class InteractionLoopNode(Node):
             client = OpenAI()
             resp = client.chat.completions.create(
                 model=model,
-                reasoning_effort="medium",
                 messages=messages,
                 response_format={"type": "json_object"},
             )
@@ -858,37 +944,191 @@ class InteractionLoopNode(Node):
         # No suitable fallback
         return None
 
-    # ---------- Publishing ----------
+    # ---------- Skills list → state_machine (MATCH router logic) ----------
+    def _skills_list_to_state_machine(
+        self,
+        skills_obj: Dict[str, Any],
+        rule: str,
+        trig_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Turn {"name":?, "skills":[{use,with},...]} into a state_machine skill
+        that skills_node understands, same pattern as router_node._skills_list_to_state_machine.
+        """
+        skills = skills_obj.get("skills") or []
+        if not isinstance(skills, list) or not skills:
+            self.get_logger().warn(
+                "[interaction_loop] skills list is empty; nothing to build"
+            )
+            return None
+
+        base_name = str(skills_obj.get("name") or "").strip()
+        suffix = int(self._now() * 1000)
+
+        if not base_name:
+            base_name = f"{trig_type}.{rule}.{suffix}"
+
+        # We don't enforce a prefix here (router uses router_fast.), but you can if you want.
+        states: List[Dict[str, Any]] = []
+        for idx, step in enumerate(skills):
+            use = str(step.get("use") or "").strip()
+            if not use:
+                continue
+            with_params = step.get("with") or {}
+            state_id = f"s{idx+1}"
+            next_state = f"s{idx+2}" if idx < len(skills) - 1 else None
+            states.append(
+                {
+                    "id": state_id,
+                    "type": "action",
+                    "action": {
+                        "use": use,
+                        "with": with_params,
+                    },
+                    "on_complete": next_state,
+                    "on_failure": None,
+                }
+            )
+
+        if not states:
+            self.get_logger().warn(
+                "[interaction_loop] after filtering, no valid states in skills list"
+            )
+            return None
+
+        sm = {
+            "name": base_name,
+            "kind": "state_machine",
+            "description": (
+                f"interaction_loop auto-generated sequence for {trig_type}/{rule}"
+            ),
+            "params_template": {},
+            "param_keys": [],
+            "when": {},          # arm immediately
+            "until": {},
+            "initial_state": states[0]["id"],
+            "states": states,
+        }
+        return sm
+
+    def _execute_skill(self, entry: Dict[str, Any]):  # ### NEW
+        """
+        Publish a /skills/execute command for a state_machine or composite skill.
+        This matches RouterNode._execute_fast_skill format exactly.
+        """
+        try:
+            skill_name = str(entry.get("skill") or "")
+            if not skill_name:
+                return
+            ctx = entry.get("ctx") or {}
+            payload = {"skill": skill_name, "ctx": ctx}
+            self.skills_execute_pub.publish(
+                StringMsg(data=json.dumps(payload))
+            )
+            self.get_logger().info(
+                f"[interaction_loop] execute: skill='{skill_name}' ctx={ctx}"
+            )
+        except Exception as e:
+            self.get_logger().error(
+                f"[interaction_loop] failed to publish /skills/execute: {e}"
+            )
+
+    def _append_composite_and_reload(  # ### NEW
+        self,
+        composite_skill: Dict[str, Any],
+        to_execute: Dict[str, Any],
+    ):
+        """
+        Append composite_skill to skills_composite.yaml, reload skills,
+        then execute to_execute via /skills/execute.
+
+        Mirrors router_node._append_composite_and_reload, but scoped to this node.
+        """
+        if not self.skills_composite_path:
+            self.get_logger().warn(
+                "[interaction_loop] no skills_composite_path set; cannot persist sequence"
+            )
+            return
+
+        # Read or init doc
+        doc = self._read_yaml_if_exists(self.skills_composite_path) or {
+            "version": 2,
+            "defaults": {"window_ms": 3000},
+            "skills": [],
+        }
+        skills_list = doc.get("skills") or []
+        skills_list.append(composite_skill)
+        doc["skills"] = skills_list
+
+        try:
+            with open(self.skills_composite_path, "w") as f:
+                yaml.safe_dump(doc, f, sort_keys=False)
+            self.get_logger().info(
+                f"[interaction_loop] wrote composite '{composite_skill['name']}' to skills_composite.yaml"
+            )
+        except Exception as e:
+            self.get_logger().error(
+                f"[interaction_loop] failed to write skills_composite.yaml: {e}"
+            )
+            return
+
+        # Reload skills, then execute
+        def _after_reload(_future):
+            try:
+                res = _future.result()
+                if res and res.success:
+                    self.get_logger().info(
+                        f"[interaction_loop] /skills/reload after sequence ok: {res.message}"
+                    )
+                else:
+                    self.get_logger().warn(
+                        "[interaction_loop] /skills/reload after sequence failed or returned None"
+                    )
+            except Exception as e:
+                self.get_logger().warn(
+                    f"[interaction_loop] /skills/reload call error after sequence: {e}"
+                )
+
+            self._execute_skill(to_execute)
+
+        if self.reload_skills_client.wait_for_service(timeout_sec=1.0):
+            req = Trigger.Request()
+            fut = self.reload_skills_client.call_async(req)
+            fut.add_done_callback(_after_reload)
+        else:
+            self.get_logger().warn(
+                "[interaction_loop] /skills/reload not available; executing sequence without reload"
+            )
+            self._execute_skill(to_execute)
+
+    # ---------- Publishing (now via /skills/execute) ----------
     def _publish_skill_plan(
         self,
         rule: str,
         trig_type: str,
         skills_obj: Dict[str, Any],
     ):
-        name = str(skills_obj.get("name") or "").strip()
-        if not name:
-            # Auto-generate a name if missing
-            suffix = int(self._now() * 1000)
-            name = f"reactive.{trig_type}.{rule}.{suffix}"
+        """
+        Take a skills_obj (FAST_SKILLS_LIST_SCHEMA) and:
+          1) Convert it to a state_machine skill.
+          2) Append it to skills_composite.yaml.
+          3) Reload skills.
+          4) Execute via /skills/execute with {"skill":..., "ctx":{}}.
 
-        plan = {
-            "name": name,
-            "skills": skills_obj.get("skills", []),
-        }
-
-        try:
-            s = json.dumps(plan, ensure_ascii=False)
-        except Exception as e:
+        This matches router_node's pattern so the over-the-wire format is identical.
+        """
+        sm = self._skills_list_to_state_machine(skills_obj, rule, trig_type)
+        if not sm:
             self.get_logger().warn(
-                f"[interaction_loop] failed to serialize skill plan {name}: {e}"
+                "[interaction_loop] _publish_skill_plan: could not build state_machine from skills list"
             )
             return
 
-        self.pub_execute_plan.publish(StringMsg(data=s))
-        self.get_logger().info(
-            f"[interaction_loop] published skill plan '{name}' with "
-            f"{len(plan['skills'])} step(s) to /skills/execute_plan"
-        )
+        to_execute = {
+            "skill": sm["name"],
+            "ctx": {},  # you could inject trigger text here if you want
+        }
+        self._append_composite_and_reload(sm, to_execute)
 
 
 def main(args=None):

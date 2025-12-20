@@ -805,7 +805,7 @@ tasks:
     outputs:
       - id: check.json
         ros:
-          topic: "/llm/speech_check"
+          topic: "/llm/speech_check_resp"
           msg: "std_msgs/String"
         schema_hint: >
           {"kind":str,"intent":str,"ok":bool,"confidence":float,
@@ -868,8 +868,8 @@ tasks:
             type: "float"
             default: 0.9
 
-      - id: gpt-5.1-mini
-        version: "gpt-5.1-mini"
+      - id: gpt-5-mini
+        version: "gpt-5-mini"
         description: "Higher-quality LLM for nuanced checks."
         metrics:
           latency_ms: { typical: 150.0 }
