@@ -125,6 +125,12 @@ You receive a single JSON object with:
             ...
           }
         }
+        "control": {
+          "mode": "autonomous" | "follow_human" | "idle_listen",
+          "target": null | "any" | "<human_id>",
+          "reason": str,
+          "ts": float
+        }
       }
 
   - skills_inventory:
@@ -174,6 +180,11 @@ Requirements:
 - Prefer to call higher-level composite/state_machine skills when appropriate
   (e.g., "interact.greet_human" instead of raw primitives), but you may mix them
   with primitives like "tts.say" or "nav.move_relative".
+- If control.mode is "autonomous", the robot is leading and may politely
+  acknowledge humans but generally follow its own plan.
+- If control.mode is "follow_human", the robot should treat humans as leaders.
+  The target may be "any" or a specific human id.
+- If control.mode is "idle_listen", the robot should primarily listen / respond.
 
 You MUST return STRICT JSON ONLY, no explanations, of the form:
 
@@ -268,6 +279,15 @@ class InteractionLoopNode(Node):
         # Latest planner proposal (raw object)
         self._last_planner_proposal: Dict[str, Any] = {}
         self._last_planner_proposal_ts: float = 0.0
+        
+        # NEW: control-mode snapshot from planner
+        # mode ∈ {"autonomous", "follow_human", "idle_listen"}
+        # target ∈ {None, "any", "<human_id>"}
+        self._control_mode: str = "follow_human"
+        self._control_target: Optional[str] = None
+        self._control_reason: str = "initial_default"
+        self._control_ts: float = self._now()
+
 
         # Latest HDT profiles (raw + compact)
         self._profiles_raw: Dict[str, Any] = {}
@@ -308,6 +328,16 @@ class InteractionLoopNode(Node):
             StringMsg, self.planner_proposal_topic, self._on_planner_proposal, 20
         )
 
+
+        # optimizer plan (Gurobi assignments)
+        self.sub_optimizer_plan = self.create_subscription(
+            StringMsg,
+            "/optimizer/plan",
+            self._on_optimizer_plan,
+            10,
+        )
+
+
         # Skills: reload + execute (MATCH router_node)
         self.reload_skills_client = self.create_client(  # ### NEW
             Trigger,
@@ -320,6 +350,176 @@ class InteractionLoopNode(Node):
         )
 
         self.get_logger().info("interaction_loop_node initialized")
+
+
+    def _box_node_id_from_box_id(self, box_id: int) -> str:
+        """
+        Map optimizer box_id -> world node_id used by box.* skills.
+        Assumes naming like 'CNode<box_id>'.
+        """
+        try:
+            return f"CNode{int(box_id)}"
+        except Exception:
+            return ""
+
+    def _on_optimizer_plan(self, msg: StringMsg):
+        """
+        Ingest Gurobi optimizer plan and execute ONLY the first action
+        assigned to the robot, as a short skill sequence.
+
+        Expected payload shape (from Broker):
+
+        {
+          "ts": <float>,
+          "current_time": <float>,
+          "agents": {
+            "robot": [
+              {"box_id": <int>, "property": "X"|"Y", "kind": "sense"|"dispose"},
+              ...
+            ],
+            "human_a": [...],
+            "human_b": [...]
+          },
+          "nodes": {
+            "<node_id>": {
+              "x": <float>,
+              "y": <float>,
+              "yaw": <float optional>
+            },
+            ...
+          }
+        }
+        """
+        try:
+            obj = json.loads(msg.data) if msg.data else {}
+        except Exception:
+            self.get_logger().warn(
+                "[interaction_loop] bad JSON on /optimizer/plan: %r" % msg.data
+            )
+            return
+
+        if not isinstance(obj, dict):
+            return
+
+        agents = obj.get("agents") or {}
+        if not isinstance(agents, dict):
+            return
+
+        robot_actions = agents.get("robot") or []
+        if not isinstance(robot_actions, list) or not robot_actions:
+            self.get_logger().info(
+                "[interaction_loop] optimizer plan has no robot actions; nothing to do"
+            )
+            return
+
+        first = robot_actions[0]
+        if not isinstance(first, dict):
+            return
+
+        box_id = first.get("box_id")
+        prop = str(first.get("property", "X")).upper()
+        kind = str(first.get("kind", "sense")).lower()
+
+        if box_id is None:
+            self.get_logger().warn(
+                "[interaction_loop] optimizer robot action missing box_id; skipping"
+            )
+            return
+
+        if prop not in ("X", "Y"):
+            self.get_logger().warn(
+                f"[interaction_loop] optimizer robot action has invalid property={prop!r}; defaulting to 'X'"
+            )
+            prop = "X"
+
+        node_id = self._box_node_id_from_box_id(box_id)
+        if not node_id:
+            self.get_logger().warn(
+                f"[interaction_loop] could not map box_id={box_id} to node_id; skipping"
+            )
+            return
+
+        # Map kind -> skill
+        if kind == "sense":
+            skill_name = "box.sense_nearby"
+        elif kind == "dispose":
+            skill_name = "box.dispose_nearby"
+        else:
+            self.get_logger().warn(
+                f"[interaction_loop] unknown optimizer action kind={kind!r}; "
+                "defaulting to sense_nearby"
+            )
+            skill_name = "box.sense_nearby"
+
+        # ---------------------------------------
+        # NEW: pull node pose from plan and prepend nav.move_absolute
+        # ---------------------------------------
+        nodes = obj.get("nodes") or {}
+        x = y = yaw = None
+
+        if isinstance(nodes, dict):
+            # we assume optimizer keys by node_id (string), which in your setup
+            # is just the numeric id (e.g., "7")
+            node_entry = nodes.get(str(node_id)) or nodes.get(str(box_id))
+            if isinstance(node_entry, dict):
+                try:
+                    x = float(node_entry.get("x"))
+                    y = float(node_entry.get("y"))
+                    yaw_val = node_entry.get("yaw", 0.0)
+                    yaw = float(yaw_val) if yaw_val is not None else 0.0
+                except (TypeError, ValueError):
+                    x = y = yaw = None
+
+        skills_list: List[Dict[str, Any]] = []
+
+        if x is not None and y is not None:
+            # First: go to the absolute pose
+            skills_list.append(
+                {
+                    "use": "nav.move_absolute",
+                    "with": {
+                        "frame": "map",
+                        "x": x,
+                        "y": y,
+                        "yaw": yaw if yaw is not None else 0.0,
+                    },
+                }
+            )
+        else:
+            self.get_logger().warn(
+                f"[interaction_loop] no pose for node_id={node_id}, "
+                "skipping nav.move_absolute and going straight to nearby-op"
+            )
+
+        # Second: your existing nearby operation
+        skills_list.append(
+            {
+                "use": skill_name,
+                "with": {
+                    "target_node_id": node_id,
+                    "property": prop,
+                },
+            }
+        )
+
+        skills_obj = {
+            "name": f"optimizer.robot.{kind}.{box_id}",
+            "skills": skills_list,
+        }
+
+        self.get_logger().info(
+            f"[interaction_loop] executing optimizer first robot action: "
+            f"kind={kind}, box_id={box_id}, node_id={node_id}, property={prop}, "
+            f"pose=({x},{y},{yaw})"
+        )
+
+        # Reuse the same publishing path as other plans
+        self._publish_skill_plan(
+            rule="optimizer_plan",
+            trig_type="planner",
+            skills_obj=skills_obj,
+        )
+
 
     # ---------- Parameter updates ----------
     def _on_param_change(self, params):
@@ -468,6 +668,35 @@ class InteractionLoopNode(Node):
         self.get_logger().info(
             "[interaction_loop] updated planner proposal snapshot"
         )
+        
+        # NEW: update local control-mode snapshot
+        ctrl = obj.get("control") or {}
+        new_mode = ctrl.get("mode", self._control_mode)
+        new_target = ctrl.get("target", self._control_target)
+        new_reason = ctrl.get("reason", self._control_reason)
+
+        # normalize mode
+        if new_mode not in ("autonomous", "follow_human", "idle_listen"):
+            new_mode = self._control_mode
+            new_target = self._control_target
+            new_reason = f"invalid_mode_from_planner_keep_previous ({ctrl.get('mode')!r})"
+
+        # if not follow_human, target must be None
+        if new_mode != "follow_human":
+            new_target = None
+
+        if new_mode != self._control_mode or new_target != self._control_target:
+            self.get_logger().info(
+                f"[interaction_loop] control_mode update from planner: "
+                f"{self._control_mode}/{self._control_target} → "
+                f"{new_mode}/{new_target} (reason={new_reason})"
+            )
+
+        self._control_mode = new_mode
+        self._control_target = new_target
+        self._control_reason = new_reason
+        self._control_ts = self._now()
+
 
         # Immediately try to turn this planner proposal into a concrete skills list
         skills_inventory = self._build_skills_inventory()
@@ -488,6 +717,89 @@ class InteractionLoopNode(Node):
         self.get_logger().info(
             "[interaction_loop] executed planner proposal as a state_machine via /skills/execute"
         )
+
+    # ---------- Control-mode helpers (gating) ----------
+    def _extract_human_id_from_payload(self, payload: Dict[str, Any]) -> Optional[str]:
+        """
+        Best-effort extraction of a human id from an event payload.
+        We check several common keys; if none present, fall back to HDT active_human.
+        """
+        if not isinstance(payload, dict):
+            return self._active_human
+
+        for key in ("human_id", "speaker_id", "hdt_id", "who", "source_human"):
+            v = payload.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+
+        # Fallback to HDT's active human if defined
+        return self._active_human
+
+    def _should_handle_trigger(
+        self,
+        trig_type: str,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """
+        Decide if this trigger should produce a reactive skill plan, based on
+        the planner's control_mode and target.
+
+        Logic:
+
+        - Non-human triggers (idle, generic, planner, etc.) are ALWAYS handled.
+        - trig_type == "human_command" is gated by control_mode:
+            * autonomous    → ignore human_command (except logging)
+            * idle_listen   → always handle human_command
+            * follow_human:
+                - target is None or "any" → handle from any human
+                - target is "<human_id>" → handle only if event human matches
+                  target or (no event id but active_human == target)
+        """
+        # Only gate human-origin triggers; everything else goes through
+        if trig_type != "human_command":
+            return True
+
+        mode = self._control_mode
+        target = self._control_target
+
+        # 1) Autonomous: robot leads, ignore human_command by default
+        if mode == "autonomous":
+            self.get_logger().info(
+                f"[interaction_loop] ignoring human_command because control_mode=autonomous"
+            )
+            return False
+
+        # 2) Idle-listen: always respond to human_command
+        if mode == "idle_listen":
+            return True
+
+        # 3) follow_human
+        if mode == "follow_human":
+            # No target or "any" → accept from anyone
+            if target is None or target == "any":
+                return True
+
+            # Otherwise, require specific human id
+            event_hid = self._extract_human_id_from_payload(payload)
+            if event_hid == target:
+                return True
+
+            # Fallback: if we don't have an event id but HDT active matches target
+            if event_hid is None and self._active_human == target:
+                return True
+
+            self.get_logger().info(
+                f"[interaction_loop] ignoring human_command from '{event_hid}' "
+                f"because control_mode=follow_human target={target}"
+            )
+            return False
+
+        # Unknown mode (shouldn't happen): be safe and ignore
+        self.get_logger().warn(
+            f"[interaction_loop] unknown control_mode={mode!r}, ignoring human_command"
+        )
+        return False
+
 
     # ---------- HDT profiles ingestion ----------
     def _on_profiles(self, msg: StringMsg):
@@ -794,6 +1106,15 @@ class InteractionLoopNode(Node):
         zone: Any,
         payload: Dict[str, Any],
     ):
+    
+        # 🔹 NEW: gating based on planner control_mode
+        if not self._should_handle_trigger(trig_type, payload):
+            self.get_logger().info(
+                f"[interaction_loop] trigger {rule} (type={trig_type}) ignored due to control_mode="
+                f"{self._control_mode}/{self._control_target}"
+            )
+            return
+    
         # Extract text snippet from payload if any
         text = ""
         if isinstance(payload, dict):
@@ -818,6 +1139,15 @@ class InteractionLoopNode(Node):
             "recent_events": list(self._event_trace),
             "task_state": self._last_task_state,
         }
+
+        # NEW: include control-mode snapshot for the LLM (for context only)
+        capsule["control"] = {
+            "mode": self._control_mode,
+            "target": self._control_target,
+            "reason": self._control_reason,
+            "ts": self._control_ts,
+        }
+
 
         # NEW: attach global event summary from Broker if available
         if self._last_event_summary:

@@ -188,6 +188,9 @@ class HumanDigitalTwinNode(Node):
 
         # NEW: how many events to keep per human for event traces
         self.declare_parameter("event_trace_max_len", 10)
+        self.declare_parameter("use_speaker_id_only", True)
+        
+        self.use_speaker_id_only = bool(self.get_parameter("use_speaker_id_only").value)
 
 
         self.llm_enabled = self.get_parameter("llm_enabled").value
@@ -261,6 +264,10 @@ class HumanDigitalTwinNode(Node):
             elif p.name == "event_trace_max_len" and p.type_ == Parameter.Type.INTEGER:
                 self.event_trace_max_len = int(p.value)
                 self.get_logger().info(f"[hdt] event_trace_max_len -> {self.event_trace_max_len}")
+            elif p.name == "use_speaker_id_only" and p.type_ == Parameter.Type.BOOL:
+                self.use_speaker_id_only = bool(p.value)
+                self.get_logger().info(f"[hdt] use_speaker_id_only -> {self.use_speaker_id_only}")
+
         return SetParametersResult(successful=True, reason="ok")
 
     # ---------- Helpers ----------
@@ -295,11 +302,20 @@ class HumanDigitalTwinNode(Node):
 
     def _guess_human_id_from_event(self, evt: Dict[str, Any]) -> str:
         data = evt.get("data") or {}
-        hid = data.get("human_id") or data.get("speaker_id") or data.get("agent_id")
+
+        # 1st: explicit speaker_id from STT / speech pipeline
+        hid = data.get("speaker_id") or data.get("human_id") or data.get("agent_id")
         if isinstance(hid, str) and hid:
             return hid
+
+        # If configured to use only speaker_id/human_id, do NOT fall back to zone.
+        if getattr(self, "use_speaker_id_only", False):
+            return "human_unknown"
+
+        # Legacy fallback: infer from zone (one human per zone assumption)
         zone = evt.get("zone") or data.get("zone")
         return self._guess_human_id_from_zone(zone)
+
 
     # NEW: record an event into this human's event trace
     def _record_event_for_human(self, human_id: str, evt: Dict[str, Any], src: str):
@@ -453,25 +469,20 @@ class HumanDigitalTwinNode(Node):
             or rule_id in ("speech_final_any", "trigger_speech_final")
         )
 
-        # Link this basic event to a human based on explicit ids or zone
+        # Link this basic event to a human (prefer speaker_id / human_id)
         human_id = self._guess_human_id_from_event(evt)
         if human_id:
-            # ensure we have a feature slot for them
             f = self._ensure_human(human_id)
             f["last_ts"] = ts
-            # record the event in their trace
             self._record_event_for_human(human_id, evt, src="basic")
 
-            # If this is a trigger, force an immediate LLM update for that human
             if is_trigger:
                 self._maybe_update_profile_with_llm(human_id, force=True)
 
-        # Mark "active human" on final speech events that are commands to Bob
+        # Mark active_human only from that same resolved id
         if rule_id in ("speech_final_any", "trigger_speech_final"):
-            if human_id:
-                self._active_human = human_id
-            else:
-                self._active_human = self._guess_human_id_from_event(evt)
+            self._active_human = human_id or "human_unknown"
+
 
         # Meta info from llm_speech_check: interpret style, frustration, etc.
         if "kind" in data and "intent" in data:
@@ -556,9 +567,20 @@ class HumanDigitalTwinNode(Node):
         frustration = data.get("frustration")
         verbosity = data.get("verbosity")
 
-        human_id = data.get("human_id") or data.get("speaker_id")
+        # Prefer explicit STT speaker_id; fall back to human_id/agent_id only if present.
+        human_id = (
+            data.get("speaker_id")
+            or data.get("human_id")
+            or data.get("agent_id")
+        )
+
         if not human_id:
+            if getattr(self, "use_speaker_id_only", False):
+                # No explicit mapping → don't attribute this utterance to anyone.
+                return
+            # Legacy behavior: fall back to zone if allowed
             human_id = self._guess_human_id_from_zone(zone)
+
 
         f = self._ensure_human(human_id)
         f["last_ts"] = ts
@@ -604,6 +626,16 @@ class HumanDigitalTwinNode(Node):
 
         old_profile = self.profiles.get(human_id)
         event_trace = self._get_event_trace(human_id)  # NEW
+        if not event_trace:
+            # You can either skip completely...
+            self.get_logger().info(f"[hdt] skip LLM for {human_id}: empty event_trace")
+            # ...or keep a heuristic profile:
+            old_profile = self.profiles.get(human_id)
+            profile = self._heuristic_profile(human_id, feats, old_profile)
+            self.profiles[human_id] = profile
+            self._last_profile_update_ts[human_id] = now
+            return
+
 
         if not self.llm_enabled:
             profile = self._heuristic_profile(human_id, feats, old_profile)
@@ -753,11 +785,17 @@ class HumanDigitalTwinNode(Node):
 
         # Ensure each known human has some profile
         for human_id, feats in list(self.features.items()):
-            self._maybe_update_profile_with_llm(human_id)
-            if human_id not in self.profiles:
-                self.profiles[human_id] = self._heuristic_profile(
-                    human_id, feats, self.profiles.get(human_id)
-                )
+            # Skip unknown or humans with no trace
+            if human_id == "human_unknown":
+                continue
+            if not self._get_event_trace(human_id):
+                # maybe keep only heuristic profile here
+                if human_id not in self.profiles:
+                    self.profiles[human_id] = self._heuristic_profile(
+                        human_id, feats, self.profiles.get(human_id)
+                    )
+            else:
+                self._maybe_update_profile_with_llm(human_id)
 
         payload = {hid: prof for hid, prof in self.profiles.items()}
 

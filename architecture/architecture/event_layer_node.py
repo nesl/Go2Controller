@@ -1238,13 +1238,34 @@ class EventLayerNode(Node):
     def _cb_text_final(self, msg: StringMsg):
         ts = self._now()
         text = ""
+        speaker_id = None
+        speaker_score = None
+        speaker_match = None
+        speaker_threshold = None
+        speaker_age_ms = None
+        raw_obj = None
+
         try:
-            obj = json.loads(msg.data)
-            text = (obj.get("text") or "").strip()
+            raw_obj = json.loads(msg.data)
+            text = (raw_obj.get("text") or "").strip()
+            speaker_id        = raw_obj.get("speaker_id")
         except Exception:
+            # fallback: plain string
             text = (msg.data or "").strip()
-        ctx = {"text": text, "ts": ts}
+
+        ctx = {
+            "text": text,
+            "ts": ts,
+            # speaker-related (may be None if not present / plain string)
+            "speaker_id": speaker_id,
+        }
+
+        # Optionally keep the full JSON if you ever want it in rules:
+        if isinstance(raw_obj, dict):
+            ctx["raw"] = raw_obj
+
         self._eval_for_rules("audio_asr", "text.final", ctx)
+
 
     def _cb_llm_speech_check(self, msg: StringMsg):
         """

@@ -93,6 +93,9 @@ class CoverageWaitNode(Node):
         self.declare_parameter('dwell_sec', 3.0)
         self.declare_parameter('arrival_radius_m', 0.35)
 
+        # NEW: margin from map borders in meters
+        self.declare_parameter('border_margin_m', 0.5)
+
         self.declare_parameter('occ_free_max', 0)
         self.declare_parameter('occ_occupied_min', 50)
         self.declare_parameter('treat_unknown_as_blocked', True)
@@ -114,6 +117,8 @@ class CoverageWaitNode(Node):
         self.visited_radius_m = float(self.get_parameter('visited_radius_m').value)
         self.dwell_sec = float(self.get_parameter('dwell_sec').value)
         self.arrival_radius_m = float(self.get_parameter('arrival_radius_m').value)
+
+        self.border_margin_m = float(self.get_parameter('border_margin_m').value)
 
         self.occ_free_max = int(self.get_parameter('occ_free_max').value)
         self.occ_occupied_min = int(self.get_parameter('occ_occupied_min').value)
@@ -247,6 +252,9 @@ class CoverageWaitNode(Node):
         if "treat_unknown_as_blocked" in params:
             self.treat_unknown_as_blocked = bool(params["treat_unknown_as_blocked"])
 
+        if "border_margin_m" in params:
+            self.border_margin_m = float(params["border_margin_m"])
+            
         if "persist_path" in params:
             self.persist_path = str(params["persist_path"])
             # allow re-load for same meta if persist file changed
@@ -435,11 +443,27 @@ class CoverageWaitNode(Node):
         cand: List[Tuple[int, int]] = []
         w, h = self.map_meta.width, self.map_meta.height
 
+        margin_cells = 0
+        if self.border_margin_m > 0.0:
+            margin_cells = max(1, int(round(self.border_margin_m / self.map_meta.resolution)))
+
+
         for j in range(0, h, stride):
             row = range(0, w, stride) if (j // stride) % 2 == 0 else range(w - 1 - ((w - 1) % stride), -1, -stride)
             for i in row:
                 if len(cand) >= self.max_candidates:
                     break
+                    
+                # NEW: skip cells too close to borders
+                if margin_cells > 0:
+                    if (
+                        i < margin_cells or
+                        j < margin_cells or
+                        i >= (w - margin_cells) or
+                        j >= (h - margin_cells)
+                    ):
+                        continue
+                    
                 if self._cell_is_free(i, j):
                     cand.append((i, j))
             if len(cand) >= self.max_candidates:

@@ -67,9 +67,9 @@ skills:
       tag: "{{ctx.tag | default:'default_vlm'}}"
       mode: "{{ctx.mode | default:'generic'}}"
 
-  - name: explore.coverage_wait
+  - name: explore.sense
     kind: primitive
-    description: "Visit closest unvisited free-space points and dwell at each; resumes after interruption."
+    description: "Visit closest unvisited free-space points and sense at each."
     action: coverage_wait
     params: {}
 
@@ -279,16 +279,8 @@ skills:
             output_schema: "{{ ctx.output_schema | default:'' }}"
             tag: "{{ ctx.tag | default:'scene_describe' }}"
             mode: "{{ ctx.mode | default:'generic' }}"
-        on_complete: say_scene
-
-      - id: say_scene
-        type: action
-        action:
-          use: tts.say
-          with:
-            text: 
-              "{{ ctx.vlm.raw_text | default:'I could not interpret the scene.' }}"
         on_complete: null
+
 
 
   - name: nav.turn_to_speaker
@@ -305,4 +297,78 @@ skills:
           with: {}
         on_complete: null
 
+
+  - name: box.sense
+    kind: primitive
+    description: "Request a sense operation on a CNode."
+    action: sense_box
+    params:
+      node_id: "{{ctx.node_id | default:ctx.target_node_id | default:rule.bt_rssi_seen.object_id | default:''}}"
+      property: "{{ctx.property | default:'X'}}"
+
+  - name: box.dispose
+    kind: primitive
+    description: "Request a dispose operation on a CNode."
+    action: dispose_box
+    params:
+      node_id: "{{ctx.node_id | default:ctx.target_node_id | default:rule.bt_rssi_seen.object_id | default:''}}"
+      property: "{{ctx.property | default:'X'}}"
+
+      
+  - name: box.wait_target_nearby
+    kind: primitive
+    description: "Wait until the specified CNode is detected nearby via bt_rssi_seen."
+    action: wait_box_nearby
+    params:
+      # e.g. "CNode107"
+      target_node_id: "{{ctx.target_node_id | default:''}}"
+      timeout_s: "{{ctx.timeout_s | default:10}}"
+
+
+
+  - name: box.sense_nearby
+    kind: state_machine
+    description: "Wait for a specific CNode to be nearby, then sense it."
+    initial_state: wait_target
+    states:
+      - id: wait_target
+        type: action
+        action:
+          use: box.wait_target_nearby
+          with:
+            target_node_id: "{{ctx.target_node_id | default:''}}"
+            timeout_s: "{{ctx.timeout_s | default:10}}"
+        on_complete: do_sense
+
+      - id: do_sense
+        type: action
+        action:
+          use: box.sense
+          with:
+            node_id: "{{ctx.target_node_id | default:''}}"
+            property: "{{ctx.property | default:'X'}}"
+        on_complete: null
+
+  - name: box.dispose_nearby
+    kind: state_machine
+    description: "Wait for a specific CNode to be nearby, then dispose it."
+    initial_state: wait_target
+    states:
+      - id: wait_target
+        type: action
+        action:
+          use: box.wait_target_nearby
+          with:
+            target_node_id: "{{ctx.target_node_id | default:''}}"
+            timeout_s: "{{ctx.timeout_s | default:10}}"
+        on_complete: do_dispose
+
+      - id: do_dispose
+        type: action
+        action:
+          use: box.dispose
+          with:
+            node_id: "{{ctx.target_node_id | default:''}}"
+            property: "{{ctx.property | default:'X'}}"
+        on_complete: null
 

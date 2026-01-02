@@ -22,6 +22,8 @@ from rclpy.parameter import Parameter          # NEW
 from rcl_interfaces.msg import SetParametersResult  # NEW
 from groq import Groq
 
+from .optimizer_client import AgentState, BoxInfo, plan_assignments_gurobi
+
 # LLM reply must be STRICT JSON like: {"sql":"SELECT ...", "params": {...}, "purpose":"..."}
 LLM_SQL_SCHEMA = {
     "type": "object",
@@ -92,9 +94,25 @@ class BrokerNode(Node):
 
         # Contamination fetch policy (broker owns it)
         self.declare_parameter('contam_enable_server_calls', True)
-        self.declare_parameter('contam_server_url', 'http://127.0.0.1:8000/check')
+        self.declare_parameter('contam_server_url', 'http://172.17.40.64:8080/check')
         self.declare_parameter('contam_request_timeout_sec', 0.6)
         self.declare_parameter('contam_min_refresh_sec', 120.0)    # throttle per (agent_id,node_id)
+
+        # ---------- Optimizer / planner integration ----------
+        self.declare_parameter("optimizer_enabled", True)
+        self.declare_parameter("optimizer_base_url", "http://172.17.40.64:8080")
+        self.declare_parameter("optimizer_horizon_sec", 60.0)
+
+        # Time budgets per agent for this planning horizon (seconds)
+        self.declare_parameter("optimizer_time_robot", 60.0)
+        self.declare_parameter("optimizer_time_human_a", 60.0)
+        self.declare_parameter("optimizer_time_human_b", 60.0)
+
+        # Nominal walking speeds (m/s) used to turn distances into travel times
+        self.declare_parameter("optimizer_speed_robot_mps", 0.5)
+        self.declare_parameter("optimizer_speed_human_a_mps", 1.0)
+        self.declare_parameter("optimizer_speed_human_b_mps", 1.0)
+
 
         # When to consider a new best/current as “meaningful change” for refresh
         self.declare_parameter('contam_best_delta_db', 5)          # recheck if best improved by ≥5 dB
@@ -112,7 +130,7 @@ class BrokerNode(Node):
             "bt_nodes","nodes_state","bt_measurements",
             "agent_node_labels",
             "vw_bt_nodes_summary","vw_agent_node_labels",
-            "vw_backlog_counts","vw_object_sheet"
+            "vw_backlog_counts","vw_object_sheet", "box_env_state","vw_box_env"
         ]))
 
         # Optional: mock LLM for offline dev (pass JSON {"sql": "...", "params": {...}, "purpose": "..."} in param)
@@ -128,6 +146,47 @@ class BrokerNode(Node):
             .get_parameter_value()
             .string_value
         )
+        
+        self.optimizer_enabled = bool(self.get_parameter("optimizer_enabled").value)
+        self.optimizer_base_url = (
+            self.get_parameter("optimizer_base_url").get_parameter_value().string_value
+        )
+        self.optimizer_horizon_sec = float(
+            self.get_parameter("optimizer_horizon_sec").value
+        )
+
+        self.optimizer_time_robot = float(
+            self.get_parameter("optimizer_time_robot").value
+        )
+        self.optimizer_time_human_a = float(
+            self.get_parameter("optimizer_time_human_a").value
+        )
+        self.optimizer_time_human_b = float(
+            self.get_parameter("optimizer_time_human_b").value
+        )
+
+        self.optimizer_speed_robot = float(
+            self.get_parameter("optimizer_speed_robot_mps").value
+        )
+        self.optimizer_speed_human_a = float(
+            self.get_parameter("optimizer_speed_human_a_mps").value
+        )
+        self.optimizer_speed_human_b = float(
+            self.get_parameter("optimizer_speed_human_b_mps").value
+        )
+
+        self._agent_det_agents, self._agent_det_default = self._load_agent_detection_params()
+
+        # Last plan and “fingerprint” of box server state
+        self._last_plan = None
+        self._last_boxes_fp = None
+        self._optimizer_running = False
+
+        # Publish plan as JSON so planner / reactive node can consume it
+        self.pub_opt_plan = self.create_publisher(
+            StringMsg, "/optimizer/plan", 10
+        )
+
         
         # NEW: enable/disable use of LLM (everything else still works)
         self.declare_parameter("llm_enabled", False)
@@ -320,11 +379,70 @@ class BrokerNode(Node):
             self._on_save_registry_with_perf,
         )
 
+        if self.optimizer_enabled:
+            # Small polling period; can tune (e.g. 0.5–2.0 s)
+            self.create_timer(1.0, self._optimizer_tick)
+
+
         self.get_logger().info(
             f"broker_node up | db={self.db_path} bus={self.bus_topic} rule={self.bt_rule_id} "
             f"target_frame={self.target_frame} zone_split_x={self.zone_split_x} server={self.server_url} "
             f"enable_server={self.enable_server}"
         )
+
+
+    def _load_agent_detection_params(self):
+        """
+        Call the box server /agents/params endpoint once at startup
+        to get per-agent detection probabilities.
+
+        Returns:
+            (agents_cfg, default_cfg) where:
+              agents_cfg: dict[agent_id] -> {"X": {"present", "absent"}, "Y": {...}}
+              default_cfg: same shape, used as fallback.
+        """
+        base = self.optimizer_base_url.rstrip("/")
+        url = base + "/agents/params"
+
+        # Reasonable default if server is down or older version without this route
+        default_cfg = {
+            "X": {"present": 0.8, "absent": 0.2},
+            "Y": {"present": 0.8, "absent": 0.2},
+        }
+
+        try:
+            r = requests.get(url, timeout=self.req_timeout)
+            if r.status_code != 200:
+                self.get_logger().warn(
+                    f"[optimizer] /agents/params returned {r.status_code}; "
+                    f"using default detection params"
+                )
+                return {}, default_cfg
+
+            data = r.json()
+            agents_cfg = data.get("agents", {})
+            default_raw = data.get("default") or default_cfg
+
+            # Minimal sanity check
+            if "X" not in default_raw or "Y" not in default_raw:
+                self.get_logger().warn(
+                    "[optimizer] /agents/params default missing X/Y; "
+                    "falling back to hardcoded defaults"
+                )
+                default_raw = default_cfg
+
+            self.get_logger().info(
+                f"[optimizer] loaded agent detection params for agents={list(agents_cfg.keys())}"
+            )
+            return agents_cfg, default_raw
+
+        except Exception as e:
+            self.get_logger().warn(
+                f"[optimizer] failed to load /agents/params: {e}; "
+                f"using default detection params"
+            )
+            return {}, default_cfg
+
 
     # ------------------------------ Perf topic discovery ------------------------------
     
@@ -764,6 +882,25 @@ class BrokerNode(Node):
                 ts       REAL NOT NULL
             );
         """)
+        
+        # Box world state (mirrors info learned from the box server)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS box_env_state (
+                node_id                TEXT PRIMARY KEY
+                                        REFERENCES bt_nodes(node_id) ON DELETE CASCADE,
+                box_id                 INTEGER NOT NULL,
+                deadline               REAL,      -- sim-time seconds from box server
+                x                      REAL,      -- box position from server
+                y                      REAL,
+                last_sense_status      TEXT,      -- completed / cached / cancelled
+                last_sense_detected    INTEGER,   -- 0/1 or NULL
+                last_sense_probability REAL,      -- sensor probability used
+                last_sense_agent       TEXT,      -- 'robot','human_a','human_b',...
+                last_sense_completed_at REAL      -- sim-time from server
+            );
+        """)
+
+        
         cur.execute("CREATE INDEX idx_agent_loc_agent_ts ON agent_locations(agent_id, ts);")
 
         # Views
@@ -836,6 +973,28 @@ class BrokerNode(Node):
             LEFT JOIN agent_node_labels ala ON ala.node_id=s.node_id AND ala.agent_id='human_a'
             LEFT JOIN agent_node_labels alb ON alb.node_id=s.node_id AND alb.agent_id='human_b';
         """)
+        
+        cur.execute("""
+            CREATE VIEW IF NOT EXISTS vw_box_env AS
+            SELECT
+              b.node_id,
+              s.box_id,
+              s.deadline,
+              s.x,
+              s.y,
+              s.last_sense_status,
+              s.last_sense_detected,
+              s.last_sense_probability,
+              s.last_sense_agent,
+              s.last_sense_completed_at,
+              os.in_basket,
+              os.disposed_to,
+              os.disposed_to <> 'none' AS is_delivered
+            FROM bt_nodes b
+            LEFT JOIN box_env_state s ON s.node_id = b.node_id
+            LEFT JOIN nodes_state os ON os.node_id = b.node_id;
+        """)
+
         
         # ----- "best" maintenance via triggers -----
         # 1) Initialize best from first current
@@ -1145,7 +1304,7 @@ class BrokerNode(Node):
         self._upsert_current(node_id, rssi, ts_epoch, x, y, zone, agent_id)
 
         # Only fetch contamination if (agent,node) new
-        self._maybe_queue_contamination_refresh(agent_id, node_id, rssi, ts_epoch)
+        #self._maybe_queue_contamination_refresh(agent_id, node_id, rssi, ts_epoch)
 
     # ------------------------------ DB helpers ------------------------------
     def _ensure_node(self, node_id: str):
@@ -1208,42 +1367,312 @@ class BrokerNode(Node):
         for agent_id, node_id in batch:
             self._refresh_one_label(agent_id, node_id)
 
+    def _box_id_from_node(self, node_id: str) -> Optional[int]:
+        """
+        Map a bt node_id like 'CNode12' or 'Box_7' to an integer box_id
+        used by the FastAPI box server.
+
+        Returns None if we can't parse a positive integer.
+        """
+        m = re.search(r'(\d+)', node_id)
+        if not m:
+            self.get_logger().warn(f"[broker] cannot map node_id='{node_id}' to box_id")
+            return None
+        try:
+            val = int(m.group(1))
+            return val if val > 0 else None
+        except ValueError:
+            self.get_logger().warn(f"[broker] invalid numeric portion in node_id='{node_id}'")
+            return None
+
+    def _node_id_from_box(self, box_id: int) -> str:
+        """
+        Map an integer box_id (from the FastAPI box server) to a canonical node_id
+        in the broker DB. Adjust the format if you use a different naming scheme.
+        """
+        return f"CNode{box_id}"
+
+
     def _refresh_one_label(self, agent_id: str, node_id: str):
+        """
+        NEW VERSION:
+
+        Instead of calling the old contamination '/check' endpoint, we call the
+        FastAPI box server's /sense endpoint for PROPERTY X and interpret its
+        detection outcome as this agent's label for the node.
+
+        - node_id is mapped to an integer box_id via _box_id_from_node().
+        - We do a blocking POST /sense (the box server simulates sensing time).
+        - We write the result into:
+            * agent_node_labels   (contaminated + probability)
+            * box_env_state       (deadline, x,y, and last sense info)
+        """
         now = time.time()
         key = (agent_id, node_id)
         with self._lock:
             ent = self._contam_cache.get(key)
             if ent and (now - ent["ts"] < self.min_refresh):
                 return
+
         if not self.enable_server or not self.server_url:
             return
-        try:
-            resp = requests.post(
-                self.server_url,
-                json={"object_id": node_id, "phone_id": agent_id},
-                timeout=self.req_timeout
-            )
-            if resp.status_code != 200:
-                self.get_logger().warn(f"contam server non-200 for {(agent_id,node_id)}: {resp.status_code}")
-                return
-            data = resp.json()
-            contaminated = bool(data.get("contaminated"))
-            probability  = float(data.get("probability"))
-        except Exception as e:
-            self.get_logger().warn(f"contam server failed for {(agent_id,node_id)}: {e}")
+
+        box_id = self._box_id_from_node(node_id)
+        if box_id is None:
             return
 
-        self.conn.execute("""
+        url = self.server_url.rstrip("/") + "/sense"
+        payload = {
+            "agent_id": agent_id,
+            "box_id": box_id,
+            "property": "X",  # we treat X as the contamination-like property
+        }
+
+        try:
+            resp = requests.post(url, json=payload, timeout=self.req_timeout)
+            if resp.status_code != 200:
+                self.get_logger().warn(
+                    f"[broker] box server /sense non-200 for {(agent_id,node_id)}: {resp.status_code}"
+                )
+                return
+
+            data = resp.json()
+        except Exception as e:
+            self.get_logger().warn(f"[broker] box server /sense failed for {(agent_id,node_id)}: {e}")
+            return
+
+        # SenseResponse fields from the new server:
+        # {
+        #   "agent_id": str,
+        #   "box_id": int,
+        #   "property": "X"|"Y",
+        #   "status": "completed"|"cached"|"cancelled",
+        #   "detected": bool | null,
+        #   "probability": float | null,
+        #   "deadline": float,
+        #   "x": float,
+        #   "y": float,
+        #   "requested_at": float,
+        #   "completed_at": float | null
+        # }
+        status = data.get("status")
+        detected = data.get("detected")
+        probability = data.get("probability")
+        deadline = data.get("deadline")
+        bx = data.get("x")
+        by = data.get("y")
+        completed_at = data.get("completed_at")
+
+        # We only treat 'completed' or 'cached' with a boolean detected value as a usable label
+        if status not in ("completed", "cached") or detected is None or probability is None:
+            self.get_logger().info(
+                f"[broker] box /sense returned unusable status='{status}' for {(agent_id,node_id)}"
+            )
+            return
+
+        contaminated = bool(detected)  # our label semantics: detected X == contaminated
+
+        # --- Update agent_node_labels (same schema as before) ---
+        self.conn.execute(
+            """
             INSERT INTO agent_node_labels(agent_id, node_id, contaminated, probability, updated_ts)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(agent_id, node_id) DO UPDATE SET
-                contaminated=excluded.contaminated,
-                probability=excluded.probability,
-                updated_ts=excluded.updated_ts
-        """, (agent_id, node_id, int(1 if contaminated else 0), probability, now))
+                contaminated = excluded.contaminated,
+                probability  = excluded.probability,
+                updated_ts   = excluded.updated_ts
+            """,
+            (agent_id, node_id, int(1 if contaminated else 0), float(probability), now),
+        )
+
+        # --- Update box_env_state with richer info from the server ---
+        self.conn.execute(
+            """
+            INSERT INTO box_env_state(
+                node_id, box_id, deadline, x, y,
+                last_sense_status, last_sense_detected,
+                last_sense_probability, last_sense_agent,
+                last_sense_completed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                box_id                 = excluded.box_id,
+                deadline               = excluded.deadline,
+                x                      = excluded.x,
+                y                      = excluded.y,
+                last_sense_status      = excluded.last_sense_status,
+                last_sense_detected    = excluded.last_sense_detected,
+                last_sense_probability = excluded.last_sense_probability,
+                last_sense_agent       = excluded.last_sense_agent,
+                last_sense_completed_at= excluded.last_sense_completed_at
+            """,
+            (
+                node_id,
+                int(box_id),
+                float(deadline) if deadline is not None else None,
+                float(bx) if bx is not None else None,
+                float(by) if by is not None else None,
+                status,
+                int(1 if contaminated else 0),
+                float(probability),
+                agent_id,
+                float(completed_at) if completed_at is not None else None,
+            ),
+        )
 
         with self._lock:
-            self._contam_cache[key] = {"ts": now, "contaminated": contaminated, "probability": probability}
+            self._contam_cache[key] = {
+                "ts": now,
+                "contaminated": contaminated,
+                "probability": probability,
+            }
+
+
+    def _sync_box_state_from_server(self, boxes_state: list):
+        """
+        Mirror the FastAPI box server state into the broker DB.
+
+        For each box:
+          - ensure bt_nodes/nodes_state rows exist
+          - update box_env_state (deadline, x, y, last sense info for X)
+          - update nodes_state.disposed_to based on disposed_X / disposed_Y
+          - update agent_node_labels for property X from the latest completed
+            sense result (we interpret X as the 'contamination-like' property).
+        """
+        now = time.time()
+        cur = self.conn.cursor()
+        try:
+            for b in boxes_state:
+                try:
+                    box_id = int(b["box_id"])
+                except Exception:
+                    continue
+
+                node_id = self._node_id_from_box(box_id)
+                self._ensure_node(node_id)
+                self._ensure_node_state(node_id)
+
+                deadline = float(b.get("deadline", 1e9))
+                x = float(b.get("x", 0.0))
+                y = float(b.get("y", 0.0))
+
+                # --- pick latest completed sense result for property X ---
+                sense_results = b.get("sense_results") or []
+                last_x = None
+                for sr in sense_results:
+                    if sr.get("property") != "X":
+                        continue
+                    if sr.get("status") != "completed":
+                        continue
+                    # assuming /boxes/state gives sense_results in chronological order,
+                    # this leaves us with the latest completed X result
+                    last_x = sr
+
+                if last_x:
+                    status_x = last_x.get("status")
+                    detected_x = last_x.get("detected")
+                    prob_x = last_x.get("probability")
+                    agent_x = str(last_x.get("agent_id") or "")
+                    completed_at_x = last_x.get("completed_at")
+                else:
+                    status_x = None
+                    detected_x = None
+                    prob_x = None
+                    agent_x = None
+                    completed_at_x = None
+
+                # --- Update box_env_state (we treat last_sense_* as property X) ---
+                cur.execute(
+                    """
+                    INSERT INTO box_env_state(
+                        node_id, box_id, deadline, x, y,
+                        last_sense_status, last_sense_detected,
+                        last_sense_probability, last_sense_agent,
+                        last_sense_completed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        box_id                 = excluded.box_id,
+                        deadline               = excluded.deadline,
+                        x                      = excluded.x,
+                        y                      = excluded.y,
+                        last_sense_status      = excluded.last_sense_status,
+                        last_sense_detected    = excluded.last_sense_detected,
+                        last_sense_probability = excluded.last_sense_probability,
+                        last_sense_agent       = excluded.last_sense_agent,
+                        last_sense_completed_at= excluded.last_sense_completed_at
+                    """,
+                    (
+                        node_id,
+                        box_id,
+                        deadline,
+                        x,
+                        y,
+                        status_x,
+                        int(1 if detected_x else 0) if detected_x is not None else None,
+                        float(prob_x) if prob_x is not None else None,
+                        agent_x,
+                        float(completed_at_x) if completed_at_x is not None else None,
+                    ),
+                )
+
+                # --- Map dispose flags into nodes_state.disposed_to ---
+                # Assumption (edit if your semantics differ):
+                #   disposed_X  -> contaminated_bin
+                #   disposed_Y  -> clean_bin (if X not already disposed)
+                disposed_X = bool(b.get("disposed_X", False))
+                disposed_Y = bool(b.get("disposed_Y", False))
+
+                if disposed_X:
+                    disposed_to = "contaminated_bin"
+                elif disposed_Y:
+                    disposed_to = "clean_bin"
+                else:
+                    disposed_to = "none"
+
+                cur.execute(
+                    """
+                    UPDATE nodes_state
+                    SET disposed_to = ?
+                    WHERE node_id = ?
+                    """,
+                    (disposed_to, node_id),
+                )
+
+                # --- agent_node_labels: property X → contaminated label ---
+                if (
+                    agent_x
+                    and status_x == "completed"
+                    and detected_x is not None
+                    and prob_x is not None
+                ):
+                    cur.execute(
+                        """
+                        INSERT INTO agent_node_labels(
+                            agent_id, node_id, contaminated, probability, updated_ts
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(agent_id, node_id) DO UPDATE SET
+                            contaminated = excluded.contaminated,
+                            probability  = excluded.probability,
+                            updated_ts   = excluded.updated_ts
+                        """,
+                        (
+                            agent_x,
+                            node_id,
+                            int(1 if detected_x else 0),
+                            float(prob_x),
+                            now,
+                        ),
+                    )
+
+            self.conn.commit()
+        except Exception as e:
+            self.get_logger().warn(f"[optimizer] sync box state to DB failed: {e}")
+            self.conn.rollback()
+        finally:
+            cur.close()
+
 
     # ---------- Async running event summary ----------
 
@@ -2208,6 +2637,412 @@ class BrokerNode(Node):
             self.pub_task_state.publish(StringMsg(data=json.dumps(state)))
         except Exception as e:
             self.get_logger().warn(f"[task_state] tick failed: {e}")
+
+
+    def _optimizer_tick(self):
+        """
+        Periodic tick: pull /boxes/state and /time from the box server.
+
+        If the world state fingerprint changed since last tick, recompute plan.
+        """
+        if self._optimizer_running or not self.optimizer_enabled:
+            return
+
+        try:
+            base = self.optimizer_base_url.rstrip("/")
+            url_state = base + "/boxes/state"
+            url_time  = base + "/time"
+
+            r_state = requests.get(url_state, timeout=self.req_timeout)
+            r_time  = requests.get(url_time, timeout=self.req_timeout)
+
+            if r_state.status_code != 200 or r_time.status_code != 200:
+                self.get_logger().warn(
+                    f"[optimizer] box server unavailable: "
+                    f"state={r_state.status_code}, time={r_time.status_code}"
+                )
+                return
+
+            boxes_state = r_state.json()   # list[BoxState-like dicts]
+            time_resp   = r_time.json()    # {"server_time": float}
+            current_time = float(time_resp.get("server_time", 0.0))
+
+        except Exception as e:
+            self.get_logger().warn(f"[optimizer] failed to contact box server: {e}")
+            return
+
+        # Compute a cheap fingerprint of the *world state* that is
+        # insensitive to time (server_time, deadlines).
+        try:
+            canonical_boxes = []
+            for b in boxes_state:
+                canonical_boxes.append(
+                    {
+                        # identity / geometry
+                        "box_id": b.get("box_id"),
+                        "x": b.get("x"),
+                        "y": b.get("y"),
+
+                        # sensing + disposal state
+                        # (we keep sense_results as-is so new completed senses
+                        #  or detections will trigger a replan)
+                        "sense_results": b.get("sense_results") or [],
+                        "disposed_X": bool(b.get("disposed_X", False)),
+                        "disposed_Y": bool(b.get("disposed_Y", False)),
+                    }
+                )
+
+            # Sort to make hashing order-independent
+            canonical_boxes.sort(key=lambda bb: bb["box_id"])
+
+            fp_str = json.dumps(canonical_boxes, sort_keys=True)
+            fp = hashlib.sha256(fp_str.encode("utf-8")).hexdigest()
+        except Exception as e:
+            self.get_logger().warn(f"[optimizer] fingerprint failed: {e}")
+            return
+
+
+
+        if fp == self._last_boxes_fp:
+            # No relevant change in box world since last plan
+            return
+            
+        # Optional: much smaller log
+        self.get_logger().info(f"[optimizer] Plan fingerprint={fp}")
+
+        self.get_logger().info(f"[optimizer] Running optimizer")
+        # Mark and run optimizer in background to avoid blocking callbacks
+        self._last_boxes_fp = fp
+        self._optimizer_running = True
+
+        threading.Thread(
+            target=self._run_optimizer_thread,
+            args=(boxes_state, current_time),
+            daemon=True,
+        ).start()
+
+    def _run_optimizer_thread(self, boxes_state: list, current_time: float):
+        """
+        Background worker that:
+          1) syncs box-server world into broker DB
+          2) builds optimizer inputs
+          3) runs Gurobi and publishes a plan
+        """
+        try:
+            # 1) sync DB with latest box server state
+            self._sync_box_state_from_server(boxes_state)
+
+            # 2) build optimizer inputs
+            agents = self._build_agents_for_optimizer()
+            boxes, box_positions = self._build_boxes_for_optimizer(boxes_state)
+            if not agents or not boxes:
+                self.get_logger().info(
+                    "[optimizer] no agents or boxes available; skipping"
+                )
+                return
+
+            horizon = self.optimizer_horizon_sec
+            agent_positions = self._snapshot_agent_positions()
+
+            def travel_time_fn(agent_id: str, box_id: int) -> float:
+                ax, ay = agent_positions.get(agent_id, (None, None))
+                bx, by = box_positions.get(box_id, (None, None))
+                if ax is None or ay is None or bx is None or by is None:
+                    return 0.0
+
+                dx = ax - bx
+                dy = ay - by
+                dist = (dx * dx + dy * dy) ** 0.5
+
+                if agent_id == "robot":
+                    speed = self.optimizer_speed_robot
+                elif agent_id == "human_a":
+                    speed = self.optimizer_speed_human_a
+                elif agent_id == "human_b":
+                    speed = self.optimizer_speed_human_b
+                else:
+                    speed = 1.0
+
+                if speed <= 0.0:
+                    return 0.0
+                return dist / speed
+
+            # 3) run Gurobi
+            plan = plan_assignments_gurobi(
+                agents=agents,
+                boxes=boxes,
+                current_time=current_time,
+                horizon=horizon,
+                travel_time_fn=travel_time_fn,
+            )
+
+            self._last_plan = plan
+            self._publish_optimizer_plan(plan, current_time, box_positions)
+
+        except Exception as e:
+            self.get_logger().warn(f"[optimizer] optimization failed: {e}")
+        finally:
+            self._optimizer_running = False
+
+
+    def _build_agents_for_optimizer(self) -> List[AgentState]:
+        """
+        Build AgentState list for Gurobi.
+        - human_a can only sense X
+        - human_b can only sense Y
+        - robot can sense both
+        Detection quality (present/absent) is pulled from box server /agents/params.
+        """
+        agents_cfg = self._agent_det_agents or {}
+        default_cfg = self._agent_det_default or {
+            "X": {"present": 0.8, "absent": 0.2},
+            "Y": {"present": 0.8, "absent": 0.2},
+        }
+
+        def get_det(agent_id: str):
+            cfg = agents_cfg.get(agent_id, default_cfg)
+            x_cfg = cfg["X"]
+            y_cfg = cfg["Y"]
+            return (
+                float(x_cfg["present"]),
+                float(x_cfg["absent"]),
+                float(y_cfg["present"]),
+                float(y_cfg["absent"]),
+            )
+
+        # human_a
+        hA_pX, hA_aX, hA_pY, hA_aY = get_det("human_a")
+        # human_b
+        hB_pX, hB_aX, hB_pY, hB_aY = get_det("human_b")
+        # robot
+        r_pX, r_aX, r_pY, r_aY = get_det("robot")
+
+        agents = [
+            AgentState(
+                agent_id="human_a",
+                max_time=self.optimizer_time_human_a,
+                can_sense_X=True,
+                can_sense_Y=False,
+                detect_present_X=hA_pX,
+                detect_absent_X=hA_aX,
+                detect_present_Y=hA_pY,
+                detect_absent_Y=hA_aY,
+            ),
+            AgentState(
+                agent_id="human_b",
+                max_time=self.optimizer_time_human_b,
+                can_sense_X=False,
+                can_sense_Y=True,
+                detect_present_X=hB_pX,
+                detect_absent_X=hB_aX,
+                detect_present_Y=hB_pY,
+                detect_absent_Y=hB_aY,
+            ),
+            AgentState(
+                agent_id="robot",
+                max_time=self.optimizer_time_robot,
+                can_sense_X=True,
+                can_sense_Y=True,
+                detect_present_X=r_pX,
+                detect_absent_X=r_aX,
+                detect_present_Y=r_pY,
+                detect_absent_Y=r_aY,
+            ),
+        ]
+        return agents
+
+
+    def _snapshot_agent_positions(self) -> Dict[str, Tuple[float, float]]:
+        """
+        Read agent_status and return {agent_id: (x,y)} for travel_time_fn.
+        """
+        positions: Dict[str, Tuple[float, float]] = {}
+        try:
+            rows = self.conn.execute(
+                "SELECT agent_id, x, y FROM agent_status"
+            ).fetchall()
+            for agent_id, x, y in rows:
+                if x is None or y is None:
+                    continue
+                positions[str(agent_id)] = (float(x), float(y))
+        except Exception as e:
+            self.get_logger().warn(f"[optimizer] failed to read agent_status: {e}")
+        return positions
+
+    def _build_boxes_for_optimizer(
+        self,
+        boxes_state: list,
+    ) -> Tuple[List[BoxInfo], Dict[int, Tuple[float, float]]]:
+        """
+        Convert /boxes/state payload into List[BoxInfo] + box positions.
+
+        Heuristics:
+        - p_true_X/Y: based on last detection(s) per property (very simple).
+        - info_X/Y: grows with #completed senses for that property (0..1).
+        - already_sensed: True if an agent has a completed sense for (box, prop).
+        """
+        boxes: List[BoxInfo] = []
+        positions: Dict[int, Tuple[float, float]] = {}
+
+        for b in boxes_state:
+            try:
+                box_id = int(b["box_id"])
+            except Exception:
+                continue
+
+            deadline = float(b.get("deadline", 1e9))
+            x = float(b.get("x", 0.0))
+            y = float(b.get("y", 0.0))
+            positions[box_id] = (x, y)
+
+            # If your /boxes/state does NOT yet include these,
+            # you can fall back to constants or broker params.
+            sense_time_X = float(b.get("sense_time_X", 3.0))
+            sense_time_Y = float(b.get("sense_time_Y", 3.0))
+            dispose_time_X = float(b.get("dispose_time_X", 4.0))
+            dispose_time_Y = float(b.get("dispose_time_Y", 4.0))
+
+            disposed_X = bool(b.get("disposed_X", False))
+            disposed_Y = bool(b.get("disposed_Y", False))
+
+            # --- Build already_sensed + crude beliefs from sense_results ---
+            already_sensed: Dict[str, Dict[str, bool]] = {}
+            sense_results = b.get("sense_results") or []
+
+            # Track last detection for each (prop)
+            last_det_X = None
+            last_det_Y = None
+            count_X = 0
+            count_Y = 0
+
+            for sr in sense_results:
+                agent_id = str(sr.get("agent_id") or "")
+                prop = sr.get("property")
+                status = sr.get("status")
+                detected = sr.get("detected")
+
+                if prop not in ("X", "Y") or not agent_id:
+                    continue
+
+                if status == "completed":
+                    # mark already_sensed[agent_id][prop] = True
+                    amap = already_sensed.setdefault(agent_id, {})
+                    amap[prop] = True
+
+                    if prop == "X":
+                        count_X += 1
+                        last_det_X = detected
+                    else:
+                        count_Y += 1
+                        last_det_Y = detected
+
+            # Very crude belief heuristics:
+            #   - prior 0.5
+            #   - if we've seen a completed detection True, bump to 0.8
+            #   - if only detections False, drop to 0.2
+            def belief_from_counts(last_det, count):
+                if count == 0:
+                    return 0.5
+                if last_det is True:
+                    return 0.8
+                if last_det is False:
+                    return 0.2
+                return 0.5
+
+            p_true_X = belief_from_counts(last_det_X, count_X)
+            p_true_Y = belief_from_counts(last_det_Y, count_Y)
+
+            # info_X/Y: just saturating with #completed senses
+            info_X = min(1.0, 0.3 * count_X)
+            info_Y = min(1.0, 0.3 * count_Y)
+
+            box_info = BoxInfo(
+                box_id=box_id,
+                deadline=deadline,
+                sense_time_X=sense_time_X,
+                sense_time_Y=sense_time_Y,
+                dispose_time_X=dispose_time_X,
+                dispose_time_Y=dispose_time_Y,
+                p_true_X=p_true_X,
+                p_true_Y=p_true_Y,
+                disposed_X=disposed_X,
+                disposed_Y=disposed_Y,
+                info_X=info_X,
+                info_Y=info_Y,
+                already_sensed=already_sensed,
+            )
+            boxes.append(box_info)
+
+        return boxes, positions
+
+    def _publish_optimizer_plan(
+        self,
+        plan: dict,
+        current_time: float,
+        box_positions: Dict[int, Tuple[float, float]],
+    ):
+        """
+        Publish the latest plan to /optimizer/plan as JSON.
+
+        Shape:
+          {
+            "ts": ...,
+            "current_time": ...,
+            "agents": {
+              "<agent_id>": [
+                {"box_id": int, "property": "X"|"Y", "kind": "sense"|"dispose"},
+                ...
+              ],
+              ...
+            },
+            "nodes": {
+              "<node_id>": {"box_id": int, "x": float, "y": float},
+              ...
+            },
+            "agent_positions": {
+              "<agent_id>": {"x": float, "y": float},
+              ...
+            }
+          }
+        """
+        try:
+            # Per-agent action lists (already built by plan_assignments_gurobi wrapper)
+            agents_block = {
+                aid: [
+                    {"box_id": box_id, "property": prop, "kind": kind}
+                    for (box_id, prop, kind) in actions
+                ]
+                for aid, actions in plan.items()
+            }
+
+            # Map box_id -> node_id + location
+            nodes_block = {
+                f"CNode{int(box_id)}": {
+                    "box_id": int(box_id),
+                    "x": float(pos[0]),
+                    "y": float(pos[1]),
+                }
+                for box_id, pos in box_positions.items()
+            }
+
+
+            payload = {
+                "ts": time.time(),
+                "current_time": current_time,
+                "agents": agents_block,
+                "nodes": nodes_block,
+            }
+
+            msg = StringMsg(data=json.dumps(payload))
+            self.pub_opt_plan.publish(msg)
+            self.get_logger().info(
+                f"[optimizer] published plan with "
+                f"{sum(len(v) for v in agents_block.values())} actions across "
+                f"{len(agents_block)} agents."
+            )
+        except Exception as e:
+            self.get_logger().warn(f"[optimizer] failed to publish plan: {e}")
+
 
 
     # ------------------------------ Shutdown ------------------------------

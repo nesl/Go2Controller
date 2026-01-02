@@ -25,10 +25,13 @@ from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
 from tf2_ros import Buffer, TransformListener
 from go2_interfaces.msg import WebRtcReq
+import requests
 
 
 from dataclasses import dataclass, field
 import time
+
+from typing import Tuple
 
 @dataclass
 class SkillInstance:
@@ -189,6 +192,30 @@ def _normalize_tts_text(text: str) -> str:
 
     return out
 
+
+
+def _box_id_from_node_id(node_id: str) -> Optional[int]:
+    """
+    Map a node name like 'CNode1##' (e.g., 'CNode107') or a bare numeric
+    string to an integer box_id.
+
+    We just extract the digits from 'CNode###' and interpret as the box_id.
+    """
+    s = str(node_id or "").strip()
+    if not s:
+        return None
+
+    m = _CNODE_RE.search(s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    try:
+        return int(s)
+    except Exception:
+        return None
 
 # ───────────────────────────────────────────────────────────────────────────────
 #                               Skills YAML (inline fallback)
@@ -1224,6 +1251,18 @@ class SkillsAgent(Node):
 
         self.declare_parameter("turn_speed_rad_s", 0.6)  # was 0.25
         self.declare_parameter("fwd_speed_m_s", 0.25)
+        
+        
+        # Box server (for calling /sense directly from skills)
+        self.declare_parameter("box_server_url", "http://172.17.40.64:8080")
+        self.declare_parameter("box_req_timeout", 5.0)
+        self.declare_parameter("agent_id", "robot")  # logical agent id for /sense
+
+        self.box_server_url = self.get_parameter("box_server_url").get_parameter_value().string_value
+        self.box_req_timeout = float(self.get_parameter("box_req_timeout").value)
+        self.agent_id = self.get_parameter("agent_id").get_parameter_value().string_value or "robot"
+
+        
         self.turn_speed = float(self.get_parameter("turn_speed_rad_s").value)
         self.fwd_speed  = float(self.get_parameter("fwd_speed_m_s").value)
 
@@ -2100,6 +2139,386 @@ class SkillsAgent(Node):
     # Bindings factory (so actions call our methods)
     def _make_bindings_for_self(self):
     
+        def sense_box(node_id: str, property: str = "X", ctx: dict = None):
+            """
+            Sensing primitive.
+
+            Synchronously calls the FastAPI /sense endpoint:
+
+              POST /sense
+              {
+                "agent_id": <self.agent_id>,
+                "box_id":   <int>,
+                "property": "X" | "Y"
+              }
+
+            and records the result into ctx["box"]["sense_result"].
+
+            On cancel(), we best-effort call /sense/cancel for the same
+            (agent_id, box_id, property).
+            """
+            h = StepHandle()
+            if ctx is None:
+                ctx = {}
+
+            node_id = str(node_id or "").strip()
+            if not node_id:
+                self.get_logger().warn("[box.sense] empty node_id; skipping.")
+                h.mark_done()
+                return h
+
+            if not self.box_server_url:
+                self.get_logger().warn("[box.sense] box_server_url is empty; skipping /sense call.")
+                h.mark_done()
+                return h
+
+            # Map CNode1## → int box_id
+            def _box_id_from_node_id(nid: str) -> int | None:
+                s = str(nid).strip()
+                if s.lower().startswith("cnode"):
+                    s = s[5:]
+                try:
+                    return int(s)
+                except Exception:
+                    return None
+
+            box_id = _box_id_from_node_id(node_id)
+            if box_id is None:
+                self.get_logger().warn(f"[box.sense] could not map node_id={node_id!r} to box_id; skipping.")
+                h.mark_done()
+                return h
+
+            prop = str(property or "X").upper()
+            if prop not in ("X", "Y"):
+                self.get_logger().warn(f"[box.sense] invalid property={property!r}; forcing 'X'.")
+                prop = "X"
+
+            base_url   = self.box_server_url.rstrip("/")
+            url        = base_url + "/sense"
+            cancel_url = base_url + "/sense/cancel"
+
+            payload = {
+                "agent_id": self.agent_id,
+                "box_id":   box_id,
+                "property": prop,
+            }
+
+            self.get_logger().info(f"[box.sense] POST {url} {payload}")
+
+            result = {
+                "status": None,          # "completed" | "cached" | "cancelled"
+                "detected": None,        # bool | None
+                "probability": None,     # float | None
+                "deadline": None,
+                "x": None,
+                "y": None,
+                "requested_at": None,
+                "completed_at": None,
+                "error": None,
+            }
+
+            # --- define cancel hook before the blocking call ---
+            def _cancel():
+                """
+                Best-effort cancellation via /sense/cancel.
+
+                If the server still has a running sense op for this triple,
+                it will mark it cancelled and wake up the sleep.
+                """
+                try:
+                    cancel_payload = dict(payload)  # same keys
+                    self.get_logger().info(f"[box.sense] POST {cancel_url} {cancel_payload} (cancel)")
+                    resp_c = requests.post(cancel_url, json=cancel_payload, timeout=self.box_req_timeout)
+                    self.get_logger().info(
+                        f"[box.sense] cancel response code={resp_c.status_code} "
+                        f"body={resp_c.text[:160]!r}"
+                    )
+                except Exception as e:
+                    self.get_logger().warn(f"[box.sense] /sense/cancel failed: {e}")
+                finally:
+                    h.mark_done()
+
+            h._cancel = _cancel
+
+            # --- blocking call to /sense ---
+            try:
+                resp = requests.post(url, json=payload, timeout=self.box_req_timeout)
+                if resp.status_code != 200:
+                    msg = f"non-200 status {resp.status_code}"
+                    self.get_logger().warn(f"[box.sense] /sense {payload} -> {msg}")
+                    result["error"] = msg
+                else:
+                    data = resp.json()
+                    # Expected fields from SenseResponse:
+                    #   agent_id, box_id, property, status,
+                    #   detected, probability, deadline, x, y,
+                    #   requested_at, completed_at
+                    result.update(
+                        status=data.get("status"),
+                        detected=data.get("detected"),
+                        probability=data.get("probability"),
+                        deadline=data.get("deadline"),
+                        x=data.get("x"),
+                        y=data.get("y"),
+                        requested_at=data.get("requested_at"),
+                        completed_at=data.get("completed_at"),
+                    )
+            except Exception as e:
+                msg = f"/sense failed: {e}"
+                self.get_logger().warn(f"[box.sense] {msg}")
+                result["error"] = msg
+
+            # Expose result via ctx
+            ctx.setdefault("box", {})
+            ctx["box"].update({
+                "node_id": node_id,
+                "box_id": box_id,
+                "property": prop,
+                "sense_result": result,
+            })
+
+            self.get_logger().info(
+                f"[box.sense] box_id={box_id}, prop={prop}, "
+                f"status={result['status']}, detected={result['detected']}, "
+                f"prob={result['probability']}"
+            )
+
+            h.mark_done()
+            return h
+
+
+        def dispose_box(node_id: str, property: str = "X", ctx: dict = None):
+            """
+            Disposal primitive.
+
+            Synchronously calls the FastAPI /dispose endpoint:
+
+              POST /dispose
+              {
+                "agent_id": <self.agent_id>,
+                "box_id":   <int>,
+                "property": "X" | "Y"
+              }
+
+            and records the result into ctx["box"]["dispose_result"].
+
+            On cancel(), we best-effort call /dispose/cancel for the same
+            (agent_id, box_id, property).
+            """
+            h = StepHandle()
+            if ctx is None:
+                ctx = {}
+
+            node_id = str(node_id or "").strip()
+            if not node_id:
+                self.get_logger().warn("[box.dispose] empty node_id; skipping.")
+                h.mark_done()
+                return h
+
+            if not self.box_server_url:
+                self.get_logger().warn("[box.dispose] box_server_url is empty; skipping /dispose call.")
+                h.mark_done()
+                return h
+
+            box_id = _box_id_from_node_id(node_id)
+            if box_id is None:
+                self.get_logger().warn(f"[box.dispose] could not map node_id={node_id!r} to box_id; skipping.")
+                h.mark_done()
+                return h
+
+            prop = str(property or "X").upper()
+            if prop not in ("X", "Y"):
+                self.get_logger().warn(f"[box.dispose] invalid property={property!r}; forcing 'X'.")
+                prop = "X"
+
+            base_url   = self.box_server_url.rstrip("/")
+            url        = base_url + "/dispose"
+            cancel_url = base_url + "/dispose/cancel"
+
+            payload = {
+                "agent_id": self.agent_id,
+                "box_id":   box_id,
+                "property": prop,
+            }
+
+            self.get_logger().info(f"[box.dispose] POST {url} {payload}")
+
+            result = {
+                "status": None,          # "completed" | "cancelled"
+                "success": None,         # bool | None
+                "deadline": None,
+                "x": None,
+                "y": None,
+                "requested_at": None,
+                "completed_at": None,
+                "error": None,
+            }
+
+            # --- define cancel hook *before* the blocking request ---
+            def _cancel():
+                """
+                Best-effort cancellation via /dispose/cancel.
+
+                If the server still has a running disposal for this triple,
+                it will mark it cancelled and wake up the sleep.
+                """
+                try:
+                    cancel_payload = dict(payload)  # same keys: agent_id, box_id, property
+                    self.get_logger().info(f"[box.dispose] POST {cancel_url} {cancel_payload} (cancel)")
+                    resp_c = requests.post(cancel_url, json=cancel_payload, timeout=self.box_req_timeout)
+                    # We don't strictly care about the status here; this is best-effort.
+                    self.get_logger().info(
+                        f"[box.dispose] cancel response code={resp_c.status_code} body={resp_c.text[:160]!r}"
+                    )
+                except Exception as e:
+                    self.get_logger().warn(f"[box.dispose] /dispose/cancel failed: {e}")
+                finally:
+                    h.mark_done()
+
+            h._cancel = _cancel
+
+            # --- blocking call to /dispose ---
+            try:
+                resp = requests.post(url, json=payload, timeout=self.box_req_timeout)
+                if resp.status_code != 200:
+                    msg = f"non-200 status {resp.status_code}"
+                    self.get_logger().warn(f"[box.dispose] /dispose {payload} -> {msg}")
+                    result["error"] = msg
+                else:
+                    data = resp.json()
+                    # Expected fields from DisposeResponse:
+                    #   agent_id, box_id, property, status,
+                    #   success, deadline, x, y, requested_at, completed_at
+                    result.update(
+                        status=data.get("status"),
+                        success=data.get("success"),
+                        deadline=data.get("deadline"),
+                        x=data.get("x"),
+                        y=data.get("y"),
+                        requested_at=data.get("requested_at"),
+                        completed_at=data.get("completed_at"),
+                    )
+            except Exception as e:
+                msg = f"/dispose failed: {e}"
+                self.get_logger().warn(f"[box.dispose] {msg}")
+                result["error"] = msg
+
+            # Make result visible via ctx
+            ctx.setdefault("box", {})
+            ctx["box"].update({
+                "node_id": node_id,
+                "box_id": box_id,
+                "property": prop,
+                "dispose_result": result,
+            })
+
+            self.get_logger().info(
+                f"[box.dispose] box_id={box_id}, prop={prop}, "
+                f"status={result['status']}, success={result['success']}"
+            )
+
+            h.mark_done()
+            return h
+
+
+    
+        def wait_box_nearby(target_node_id: str, timeout_s: float = 10.0, ctx: dict = None):
+            """
+            Wait until bt_rssi_seen fires for the specified node.
+
+            We compare the normalized node name (CNode###) from the rule payload
+            with the given target_node_id.
+            """
+            h = StepHandle()
+            if ctx is None:
+                ctx = {}
+
+            target_node_id = str(target_node_id or "").strip()
+            if not target_node_id:
+                self.get_logger().warn("[wait_box_nearby] empty target_node_id; finishing immediately.")
+                h.mark_done()
+                return h
+
+            start_ms = int(self.get_clock().now().nanoseconds * 1e-6)
+            timeout_ms = max(0.5, float(timeout_s)) * 1000.0
+            period = 0.1  # 10 Hz
+            canceled = {"v": False}
+            timers = {"t": None}
+
+            def _cancel():
+                canceled["v"] = True
+                t = timers["t"]
+                if t:
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+                    self._live_timers.discard(t)
+                h.mark_done()
+
+            h._cancel = _cancel
+
+            def _tick():
+                if canceled["v"]:
+                    return
+
+                now_ms = int(self.get_clock().now().nanoseconds * 1e-6)
+                elapsed = now_ms - start_ms
+
+                # Look at latest bt_rssi_seen payload in recent window
+                payload = self.rules_view.latest_payload("bt_rssi_seen", within_ms=3000)
+                if payload is not None:
+                    obj_id_raw = str(payload.get("object_id", "")).strip()
+
+                    # Normalize both to a canonical "CNode###" form for comparison
+                    norm_seen = obj_id_raw
+                    if not norm_seen.lower().startswith("cnode"):
+                        norm_seen = f"CNode{norm_seen}"
+
+                    norm_target = target_node_id
+                    if not norm_target.lower().startswith("cnode"):
+                        norm_target = f"CNode{norm_target}"
+
+                    if norm_seen == norm_target:
+                        self.get_logger().info(
+                            f"[wait_box_nearby] target {norm_target} is nearby (bt_rssi_seen.object_id={obj_id_raw!r})"
+                        )
+                        try:
+                            timers["t"].cancel()
+                        except Exception:
+                            pass
+                        self._live_timers.discard(timers["t"])
+
+                        # Record in ctx for downstream states
+                        ctx.setdefault("box", {})
+                        ctx["box"].update({
+                            "node_id": norm_target,
+                            "box_id": _box_id_from_node_id(norm_target),
+                            "seen_nearby_ms": now_ms,
+                            "last_bt_payload": payload,
+                        })
+
+                        h.mark_done()
+                        return
+
+                if elapsed >= timeout_ms:
+                    self.get_logger().warn(
+                        f"[wait_box_nearby] timeout waiting for {target_node_id} (~{timeout_s:.1f}s)."
+                    )
+                    try:
+                        timers["t"].cancel()
+                    except Exception:
+                        pass
+                    self._live_timers.discard(timers["t"])
+                    h.mark_done()
+                    return
+
+            timers["t"] = self.create_timer(period, _tick)
+            self._live_timers.add(timers["t"])
+            return h
+
+
+    
         def tts(text: str, ctx: dict = None):
             """
             TTS primitive that waits for speech playback to finish.
@@ -2368,6 +2787,9 @@ class SkillsAgent(Node):
             'llm_speech_check': llm_speech_check,
             'vlm_inference': vlm_inference,
             'coverage_wait': coverage_wait,
+            'wait_box_nearby': wait_box_nearby,
+            'sense_box': sense_box,
+            'dispose_box': dispose_box,
         }
 
     def _move_relative_handle(self, az_deg: float, dist_m: float) -> StepHandle:

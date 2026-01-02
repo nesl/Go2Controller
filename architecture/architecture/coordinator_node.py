@@ -111,6 +111,17 @@ PLANNER_PROPOSAL_SCHEMA: Dict[str, Any] = {
         },
         "reason": {"type": ["string", "null"]},
         "ts": {"type": ["number", "null"]},
+        
+        "control": {
+            "type": "object",
+            "properties": {
+                "mode":   {"type": "string"},
+                "target": {"type": ["string", "null"]},
+                "reason": {"type": ["string", "null"]},
+                "ts":     {"type": ["number", "null"]},
+            },
+            "additionalProperties": True,
+        },
     },
     "additionalProperties": True,
 }
@@ -175,8 +186,23 @@ You receive a single JSON object with:
             "param_keys": [str, ...]
           }, ...
         ]
+      },
+      "control_hint": {
+        "last_mode": "autonomous" | "follow_human" | "idle_listen",
+        "last_target": null | "any" | "<human_id>",
+        "last_reason": str|null,
+        "last_ts": float,
+        "allowed_modes": ["autonomous","follow_human","idle_listen"],
+        "note": str
       }
     }
+
+The robot operates in one of these CONTROL MODES:
+  - "autonomous": robot leads and acts proactively.
+  - "follow_human": robot treats a human as leader. The "target" must be:
+        * a concrete human id from humans.humans (e.g. "human_A"), OR
+        * the string "any" to mean “follow whichever human is currently leading”.
+  - "idle_listen": robot does not plan new actions; it mainly listens / waits.
 
 Your job:
 
@@ -190,7 +216,17 @@ Your job:
 3. PRODUCE a SHORT PROPOSAL of concrete next steps for the robot to take.
    These steps will be handed to another module that maps them to executable skills.
 
-Each step should:
+4. DECIDE THE CONTROL MODE for the next interval:
+   - Prefer to keep the previous mode from control_hint.last_mode unless there is
+     a clear reason to change.
+   - Avoid oscillating back and forth frequently.
+   - If following humans, choose either:
+       * a specific human id ("human_A", "human_B", etc.), OR
+       * "any" when you want to follow whichever human is actively interacting.
+   - If there is nothing useful to do or leadership is unclear, "idle_listen" is acceptable.
+   - Explain briefly WHY you chose the mode in a short "reason" string.
+
+Each step in the proposal should:
   - Describe what to do in 1–2 sentences ("description").
   - Optionally specify:
       * "type":   a coarse action type (e.g., "move", "survey", "summarize",
@@ -203,11 +239,11 @@ Each step should:
 Guidelines:
 - Keep the number of steps small (1–4).
 - Be honest and critical: if the robot is wasting time, say so in the "reason".
-- When choosing "skill_hint", use only names that appear in skills_inventory.
-  If no appropriate skill exists, leave "skill_hint" as null.
-- Prefer to reference composite/state_machine skills where appropriate
-  (for example, "interact.greet_human" or "survey_scene_or_patrol"),
-  but ONLY if they exist in skills_inventory.
+- When choosing "skill_hint", use only names that appear in skills_inventory. If no appropriate skill exists, leave "skill_hint" as null.
+- Prefer to reference composite/state_machine skills where appropriate, but ONLY if they exist in skills_inventory.
+- You SHOULD update the "control" block on each call, even if you decide to keep the same mode and target as in control_hint.
+- When there is no urgent human request, you should usually propose sensing / coverage actions first, such as moving through the environment to sense most of the area.
+
 
 You MUST respond with STRICT JSON only, of the form:
 
@@ -232,6 +268,12 @@ You MUST respond with STRICT JSON only, of the form:
     ]
   },
   "reason": str,                  // short critique and justification of the proposal
+  "control": {
+    "mode": "autonomous" | "follow_human" | "idle_listen",
+    "target": null | "any" | "<human_id>",
+    "reason": str,                // why this mode was chosen vs the previous one
+    "ts": float                   // planning timestamp or control decision timestamp
+  },
   "ts": float                     // planning timestamp
 }
 """.strip()
@@ -306,6 +348,10 @@ class PlannerNode(Node):
         # ----- Internal state -----
         self._event_trace = deque(maxlen=self.event_trace_len)
 
+        self._control_mode: str = "follow_human"
+        self._control_target: Optional[str] = None    # None | "any" | "<human_id>"
+        self._control_last_reason: str = "initial_default"
+        self._control_last_update_ts: float = self._now()
 
         # NEW: latest global event summary from Broker
         self._last_event_summary: Optional[str] = None
@@ -704,6 +750,9 @@ class PlannerNode(Node):
 
     # ---------- Planner core ----------
     def _run_planner(self, trigger_ctx: Optional[Dict[str, Any]], idle_invocation: bool = False):
+    
+        now = self._now()
+        
         # Build capsule
         capsule: Dict[str, Any] = {
             "task_state": self._last_task_state,
@@ -714,6 +763,21 @@ class PlannerNode(Node):
         if self._profiles_compact:
             capsule["humans"] = self._profiles_compact
             
+        # 🔹 NEW: attach last control decision as a hint
+        capsule["control_hint"] = {
+            "last_mode": self._control_mode,
+            "last_target": self._control_target,
+            "last_reason": self._control_last_reason,
+            "last_ts": self._control_last_update_ts,
+            "allowed_modes": ["autonomous", "follow_human", "idle_listen"],
+            "note": "Prefer last_mode unless you have a clear reason to switch; avoid oscillations.",
+        }
+
+        # NEW: attach global event summary from Broker if available
+        if self._last_event_summary:
+            capsule["event_summary"] = self._last_event_summary
+
+        payload_for_llm = {"planner_capsule": capsule}
 
         # NEW: attach global event summary from Broker if available
         if self._last_event_summary:
@@ -749,11 +813,53 @@ class PlannerNode(Node):
         proposal_obj["idle_trigger"] = bool(idle_invocation)
         proposal_obj["trigger_type"] = trigger_type
 
-        # Fill ts if missing
+        # Fill ts if missing (planning timestamp)
         if proposal_obj.get("ts") is None:
-            proposal_obj["ts"] = self._now()
+            proposal_obj["ts"] = now
 
-        # Publish
+        # 🔹 NEW: integrate LLM-decided control mode
+        ctrl_from_llm = proposal_obj.get("control") or {}
+        new_mode = ctrl_from_llm.get("mode") or self._control_mode
+        # If "target" not present at all, keep previous; if it's present but null, accept null
+        if "target" in ctrl_from_llm:
+            new_target = ctrl_from_llm.get("target")
+        else:
+            new_target = self._control_target
+        new_reason = ctrl_from_llm.get("reason") or "keep_previous_mode"
+
+        # Normalize and guardrail:
+        if new_mode not in ("autonomous", "follow_human", "idle_listen"):
+            new_mode = self._control_mode
+            new_target = self._control_target
+            new_reason = "invalid_mode_fallback_keep_previous"
+
+        # If not following, ignore target
+        if new_mode != "follow_human":
+            new_target = None
+
+        # Optional logging of control switches
+        if new_mode != self._control_mode or new_target != self._control_target:
+            self.get_logger().info(
+                f"[planner] control_mode (LLM) switch: "
+                f"{self._control_mode}/{self._control_target} → {new_mode}/{new_target} "
+                f"(reason={new_reason})"
+            )
+
+        # Update internal state
+        self._control_mode = new_mode
+        self._control_target = new_target
+        self._control_last_reason = new_reason
+        self._control_last_update_ts = now
+
+        # Ensure 'control' is always present in the outgoing object
+        proposal_obj["control"] = {
+            "mode": self._control_mode,
+            "target": self._control_target,   # None | "any" | "<human_id>"
+            "reason": self._control_last_reason,
+            "ts": self._control_last_update_ts,
+        }
+
+        # Serialize & publish
         try:
             s = json.dumps(proposal_obj, ensure_ascii=False)
         except Exception as e:
@@ -766,6 +872,7 @@ class PlannerNode(Node):
         self.get_logger().info(
             "[planner] published proposal to /planner/proposal"
         )
+
 
 
     # ---------- LLM call ----------

@@ -258,8 +258,8 @@ tasks:
         schema_hint: '{"text": str}'
         context:
           fields:
-            - { name: text, type: "string", desc: "final ASR text" }
-
+            - { name: text,              type: "string", desc: "final ASR text" }
+            - { name: speaker_id,        type: "string?", desc: "enrolled speaker id (e.g., 'human_a'), or null/absent if no verification" }
       - id: json.final
         ros: { msg: std_msgs/String, topic: "/audio/stt_doa_json" }
         schema_hint: >

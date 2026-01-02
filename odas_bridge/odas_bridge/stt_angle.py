@@ -469,7 +469,7 @@ class STTFasterWhisperNode(Node):
         # --- Speaker ID / enrollment ---
         self.declare_parameter("spk_profiles_dir", "/tmp/spk_profiles")
         self.declare_parameter("spk_threshold", 0.85)   # tune later
-        self.declare_parameter("spk_save_wav", True)
+        self.declare_parameter("spk_save_wav", False)
 
         self.profiles_dir = str(self.get_parameter("spk_profiles_dir").value)
         os.makedirs(self.profiles_dir, exist_ok=True)
@@ -494,7 +494,7 @@ class STTFasterWhisperNode(Node):
         # ---- Annotate STT output with speaker verification ----
         self.declare_parameter("stt_text_annotate_verify", True)
         self.declare_parameter("stt_text_verify_format", "[spk:{id} score={score:.2f} {'OK' if match else 'NO'}] ")
-        self.declare_parameter("stt_text_verify_ttl_ms", 2500)
+        self.declare_parameter("stt_text_verify_ttl_ms", 10000)
 
         self.stt_text_annotate_verify = bool(self.get_parameter("stt_text_annotate_verify").value)
         self.stt_text_verify_format = str(self.get_parameter("stt_text_verify_format").value)
@@ -690,13 +690,14 @@ class STTFasterWhisperNode(Node):
         return resp
 
     def _srv_verify(self, req, resp):
-        pid = str(self.get_parameter("speaker_id").value) if self.has_parameter("speaker_id") else "person"
+        # In the new behavior, "verify" = "identify among all enrolled speakers".
         self._spk_mode = "verify"
-        self._spk_target = pid
+        # _spk_target is no longer used for verify; keep it only for enroll naming.
         resp.success = True
-        resp.message = f"Verification armed for '{pid}'. Speak now."
+        resp.message = "Verification armed: will identify the most similar enrolled speaker."
         self.get_logger().info(resp.message)
         return resp
+
 
     def _srv_cancel(self, req, resp):
         self._spk_mode = "idle"
@@ -1097,8 +1098,33 @@ class STTFasterWhisperNode(Node):
         self._maybe_publish_perf()
 
 
+    def _load_all_profiles(self):
+        """
+        Load all .npz profiles from self.profiles_dir.
+
+        Returns:
+            dict[speaker_id -> np.ndarray embedding]
+        """
+        profiles = {}
+        try:
+            for fname in os.listdir(self.profiles_dir):
+                if not fname.endswith(".npz"):
+                    continue
+                sid = os.path.splitext(fname)[0]
+                path = os.path.join(self.profiles_dir, fname)
+                try:
+                    data = np.load(path)
+                    emb = data["emb"].astype(np.float32)
+                    profiles[sid] = emb
+                except Exception as e:
+                    self.get_logger().warn(f"[spk] Failed to load profile {path}: {e}")
+        except Exception as e:
+            self.get_logger().warn(f"[spk] Error listing profiles in {self.profiles_dir}: {e}")
+        return profiles
+
+
     def _speaker_process_final(self, audio_i16: np.ndarray, stamp_msg: TimeMsg):
-        if self._spk_mode == "idle" or not self._spk_target:
+        if self._spk_mode == "idle":
             return
 
         pid = self._spk_target
@@ -1143,43 +1169,60 @@ class STTFasterWhisperNode(Node):
             self.get_logger().info(f"[spk] Enrolled '{pid}' -> {prof_path}")
 
         elif self._spk_mode == "verify":
-            if not os.path.exists(prof_path):
+            # New behavior: identify among ALL enrolled profiles in profiles_dir.
+            profiles = self._load_all_profiles()
+            if not profiles:
                 payload = {
                     "kind": "verify_error",
-                    "speaker_id": pid,
-                    "error": "profile_not_found",
-                    "profile_path": prof_path,
+                    "error": "no_profiles",
+                    "speaker_id": None,
+                    "profile_dir": self.profiles_dir,
                 }
                 self.pub_spk.publish(String(data=json.dumps(payload)))
-                self.get_logger().warn(f"[spk] Profile not found: {prof_path}")
+                self.get_logger().warn(f"[spk] No profiles found in {self.profiles_dir}")
             else:
-                ref = np.load(prof_path)["emb"].astype(np.float32)
-                score = _cosine(emb, ref)
-                is_match = bool(score >= self.spk_threshold)
+                best_id = None
+                best_score = -1.0
+                all_scores = []
 
-                # cache latest verification result (for annotating text)
+                for sid, ref in profiles.items():
+                    s = _cosine(emb, ref)
+                    s_f = float(s)
+                    all_scores.append((sid, s_f))
+                    if s_f > best_score:
+                        best_score = s_f
+                        best_id = sid
+
+                is_match = bool(best_score >= self.spk_threshold)
+
+                # Cache latest result for /audio/stt_text annotation
                 self._last_spk = {
-                    "id": pid,
-                    "score": float(score),
-                    "match": bool(is_match),
+                    "id": best_id,
+                    "score": float(best_score),
+                    "match": is_match,
                     "threshold": float(self.spk_threshold),
                     "ts_ns": ts_ns,
                     "kind": "verify_done",
+                    # optional: scores per speaker if you want to debug
+                    "scores": {sid: float(s) for sid, s in all_scores},
                 }
-
-
 
                 payload = {
                     "kind": "verify_done",
-                    "speaker_id": pid,
-                    "score": float(score),
+                    "speaker_id": best_id,
+                    "score": float(best_score),
                     "threshold": float(self.spk_threshold),
                     "match": is_match,
+                    "scores": all_scores,  # list of [speaker_id, score]
                     "wav_path": wav_path if self.spk_save_wav else None,
                     "stamp": {"sec": stamp_msg.sec, "nanosec": stamp_msg.nanosec},
                 }
                 self.pub_spk.publish(String(data=json.dumps(payload)))
-                self.get_logger().info(f"[spk] Verify '{pid}' score={score:.3f} match={is_match}")
+                self.get_logger().info(
+                    f"[spk] Identify -> {best_id} score={best_score:.3f} "
+                    f"(profiles={len(profiles)}) match={is_match}"
+                )
+
 
         # Disarm after one utterance
         if self._spk_mode == "enroll":
@@ -1527,27 +1570,33 @@ class STTFasterWhisperNode(Node):
             lang = item.get("language")
             duration = item.get("duration")
 
-            # Publish plain text
-            out_text = text
+            # -------- /audio/stt_text as JSON --------
+            if text:
+                payload_text = {
+                    "text": text,
+                }
 
-            if self.stt_text_annotate_verify and text:
-                spk = self._last_spk
+                # Attach speaker verification info if recent enough
+                spk = getattr(self, "_last_spk", None)
                 if spk is not None:
+                    self.get_logger().info(
+                        f"Hello"
+                    )
                     now_ns = self.get_clock().now().nanoseconds
                     age_ms = (now_ns - int(spk.get("ts_ns", 0))) / 1e6
-                    if age_ms <= self.stt_text_verify_ttl_ms:
-                        try:
-                            prefix = self.stt_text_verify_format.format(
-                                id=spk.get("id", "unknown"),
-                                score=float(spk.get("score", 0.0)),
-                                match=bool(spk.get("match", False)),
-                            )
-                        except Exception:
-                            prefix = f"[spk:{spk.get('id','unknown')} score={float(spk.get('score',0.0)):.2f} {'OK' if spk.get('match') else 'NO'}] "
-                        out_text = prefix + text
+                    if age_ms <= getattr(self, "stt_text_verify_ttl_ms", 100000):
+                        payload_text.update({
+                            "speaker_id":      spk.get("id", "unknown"),
+                            "speaker_score":   float(spk.get("score", 0.0)),
+                            "speaker_match":   bool(spk.get("match", False)),
+                            "speaker_threshold": float(spk.get("threshold", self.spk_threshold)),
+                            "speaker_age_ms":  age_ms,
+                        })
 
-            if out_text:
-                self.pub_text.publish(String(data=out_text))
+                # Publish JSON instead of raw text
+                self.pub_text.publish(
+                    String(data=json.dumps(payload_text, ensure_ascii=False))
+                )
 
 
             
