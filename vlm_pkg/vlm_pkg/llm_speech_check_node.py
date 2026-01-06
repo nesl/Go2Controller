@@ -95,7 +95,15 @@ class LlmSpeechCheckNode(Node):
 
     # ────────────────────────── Helpers ───────────────────────────
 
-    def _build_prompt(self, prompt: str, output_schema: str, text: str, tag: str = "") -> str:
+    def _build_prompt(
+        self,
+        prompt: str,
+        output_schema: str,
+        text: str,
+        tag: str = "",
+        history: list[Dict[str, Any]] | None = None,
+    ) -> str:
+
         """
         Generic wrapper:
           - caller provides prompt + (optional) JSON schema
@@ -108,6 +116,17 @@ class LlmSpeechCheckNode(Node):
 
         if tag:
             header += f"Task tag: {tag}\n"
+
+        # Add recent conversation history if provided
+        history = history or []
+        if history:
+            header += "Recent dialogue (oldest first):\n"
+            for h in history:
+                spk = h.get("speaker_id") or "unknown"
+                txt = (h.get("text") or "").strip()
+                header += f"- [{spk}] {txt}\n"
+            header += "\n"
+
 
         # If caller gave no prompt, provide a very generic one
         if not user_prompt:
@@ -134,7 +153,7 @@ class LlmSpeechCheckNode(Node):
 
         return (
             f"{header}\n"
-            f"User utterance:\n{text}\n\n"
+            f"Current user utterance:\n{text}\n\n"
             f"Instructions:\n{user_prompt}\n\n"
             f"{schema_block}"
         )
@@ -186,15 +205,24 @@ class LlmSpeechCheckNode(Node):
 
         text = (obj.get("text") or "").strip()
         if not text:
-            self._publish_resp(req_id, success=False, raw="empty text", json_text="", lat_ms=0.0, tag=obj.get("tag", ""))
+            self._publish_resp(
+                req_id,
+                success=False,
+                raw="empty text",
+                json_text="",
+                lat_ms=0.0,
+                tag=obj.get("tag", ""),
+                original_req=obj,              # ← pass it through
+            )
             return
 
         prompt = obj.get("prompt", "")
         output_schema = obj.get("output_schema", "")
         tag = obj.get("tag", "")  # just for logging/echo
+        history = obj.get("history") or []
 
         try:
-            p = self._build_prompt(prompt, output_schema, text, tag)
+            p = self._build_prompt(prompt, output_schema, text, tag, history=history)
             raw, lat_ms = self._call_llm(p)
 
             json_text = ""
@@ -212,7 +240,20 @@ class LlmSpeechCheckNode(Node):
                 except Exception:
                     json_text = ""
 
-            self._publish_resp(req_id, True, raw, json_text, lat_ms, tag)
+            sanitized_req = dict(obj)
+            sanitized_req.pop("prompt", None)
+            sanitized_req.pop("output_schema", None)
+            sanitized_req.pop("history", None)
+
+            self._publish_resp(
+                req_id,
+                True,
+                raw,
+                json_text,
+                lat_ms,
+                tag,
+                original_req=sanitized_req,              # ← HERE
+            )
 
             perf_obj = {
                 "model": self.model_id,
@@ -225,9 +266,17 @@ class LlmSpeechCheckNode(Node):
 
         except Exception as e:
             self.get_logger().error(f"llm_speech_check error: {e}")
-            self._publish_resp(req_id, False, str(e), "", 0.0, tag)
+            self._publish_resp(
+                req_id,
+                False,
+                str(e),
+                "",
+                0.0,
+                tag,
+                original_req=obj,              # optional but consistent
+            )
 
-    def _publish_resp(self, req_id, success, raw, json_text, lat_ms, tag=""):
+    def _publish_resp(self, req_id, success, raw, json_text, lat_ms, tag="", original_req: dict | None = None):
         out = {
             "id": req_id,
             "success": bool(success),
@@ -237,7 +286,13 @@ class LlmSpeechCheckNode(Node):
             "lat_ms": float(lat_ms),
             "tag": tag,
         }
+        # include a reference to the triggering message
+        if original_req is not None:
+            out["request"] = original_req
+
         self.resp_pub.publish(StringMsg(data=json.dumps(out, ensure_ascii=False)))
+
+
 
 
 

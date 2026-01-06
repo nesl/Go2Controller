@@ -333,6 +333,7 @@ class StepHandle:
     def __init__(self, cancel_fn=None):
         self._done = False
         self._cancel = cancel_fn or (lambda: None)
+        self.outcome = "ok"   # "ok" | "timeout" | "error" | whatever you need
 
     def mark_done(self):
         self._done = True
@@ -1065,16 +1066,28 @@ class SkillEngineV2:
                         continue
 
                     if not inst.handle.done():
-                        # Still in progress
                         continue
 
                     if self.logger:
                         self.logger.info(
                             f"[SkillEngine] Skill '{inst.name}' action state '{inst.state_id}' "
-                            "completed; selecting on_complete transition."
+                            "completed; selecting transition based on outcome."
                         )
 
-                    next_id = st.get("on_complete")
+                    # NEW: choose next state based on handle.outcome
+                    outcome = getattr(inst.handle, "outcome", "ok")
+
+                    if outcome == "timeout":
+                        if "on_timeout" in st:
+                            next_id = st.get("on_timeout")
+                        else:
+                            next_id = None
+                    elif outcome == "error":
+                        next_id = st.get("on_failure") or st.get("on_complete")
+                    else:
+                        # default success
+                        next_id = st.get("on_complete")
+
                     self._transition_to(inst, skill, next_id)
                     continue
 
@@ -2172,15 +2185,21 @@ class SkillsAgent(Node):
                 h.mark_done()
                 return h
 
-            # Map CNode1## → int box_id
+            # CNode1## → int box_id
             def _box_id_from_node_id(nid: str) -> int | None:
                 s = str(nid).strip()
                 if s.lower().startswith("cnode"):
-                    s = s[5:]
+                    s = s[5:]  # remove 'CNode'
+
+                # expect format: '1##'
+                if len(s) >= 3 and s[0] == "1":
+                    s = s[1:]  # drop the fixed '1' prefix
+
                 try:
                     return int(s)
                 except Exception:
                     return None
+
 
             box_id = _box_id_from_node_id(node_id)
             if box_id is None:
@@ -2510,6 +2529,8 @@ class SkillsAgent(Node):
                     except Exception:
                         pass
                     self._live_timers.discard(timers["t"])
+                    
+                    h.outcome = "timeout"
                     h.mark_done()
                     return
 

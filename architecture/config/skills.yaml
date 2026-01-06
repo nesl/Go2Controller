@@ -337,8 +337,9 @@ skills:
           use: box.wait_target_nearby
           with:
             target_node_id: "{{ctx.target_node_id | default:''}}"
-            timeout_s: "{{ctx.timeout_s | default:10}}"
+            timeout_s: "{{ctx.timeout_s | default:20}}"
         on_complete: do_sense
+        on_timeout: null
 
       - id: do_sense
         type: action
@@ -360,8 +361,9 @@ skills:
           use: box.wait_target_nearby
           with:
             target_node_id: "{{ctx.target_node_id | default:''}}"
-            timeout_s: "{{ctx.timeout_s | default:10}}"
+            timeout_s: "{{ctx.timeout_s | default:20}}"
         on_complete: do_dispose
+        on_timeout: null
 
       - id: do_dispose
         type: action

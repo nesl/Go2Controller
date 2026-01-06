@@ -228,7 +228,18 @@ class EventLayerNode(Node):
         )
 
         self.get_logger().info("event_layer_node (expr) up")
+        
+        # --- NEW: mediation gating for llm_speech_plan ---
+        # When True → do NOT fire the llm_speech_plan llm_call rule
+        self._mediation_block_llm_speech_plan = False
 
+        # Control comes from Broker/PlanMediator on this topic
+        self.sub_mediation_ctrl = self.create_subscription(
+            StringMsg,
+            "/mediation/control",
+            self._cb_mediation_control,
+            10,
+        )
     def _publish_llm_request(self, llm_cfg: dict, envelope: dict):
         """
         Publish the envelope as JSON to the appropriate request topic.
@@ -301,23 +312,52 @@ class EventLayerNode(Node):
 
         task = llm_cfg.get("task", "")
 
-        # For llm_speech_check, we MUST provide 'text'
+        # For llm_speech_check, we MUST provide 'text' and we OPTIONALLY add history
         if task == "llm_speech_check":
-            # Allow override; default to 'speech_final_any'
             src_rule = llm_cfg.get("text_from_rule_id", "speech_final_any")
             last_evt = self._latest_payload_for_rule(src_rule)
+
             text = ""
+            speaker_id = None
             if last_evt and isinstance(last_evt, dict):
-                # last_evt is the payload we gave to _publish_basic
                 data = last_evt.get("data") or last_evt
                 text = (data.get("text") or "").strip()
+                speaker_id = data.get("speaker_id")
+
             if not text:
-                # nothing to check, skip this call
                 self.get_logger().info(
                     f"LLM call for rule '{rid}' skipped: no text from '{src_rule}'."
                 )
                 return None
+
             env["text"] = text
+            if speaker_id is not None:
+                env["speaker_id"] = speaker_id
+
+            # History sources: typically both human and robot
+            try:
+                hist_sources_raw = llm_cfg.get(
+                    "history_source_rules_json",
+                    '["speech_final_any"]'
+                )
+                hist_source_ids = json.loads(hist_sources_raw)
+                if not isinstance(hist_source_ids, list):
+                    hist_source_ids = ["speech_final_any"]
+            except Exception:
+                hist_source_ids = ["speech_final_any"]
+
+            hist_window_ms = int(llm_cfg.get("history_window_ms", 60000))
+            hist_max_items = int(llm_cfg.get("history_max_items", 10))
+
+            history = self._recent_text_history_multi(
+                hist_source_ids,
+                window_ms=hist_window_ms,
+                max_items=hist_max_items,
+            )
+            if history:
+                env["history"] = history
+
+
 
         # For VLM, just use prompt/metadata; no extra fields required by the server
         return env
@@ -332,6 +372,56 @@ class EventLayerNode(Node):
         if not dq:
             return None
         return dq[-1][1]  # (ts, payload) -> payload
+
+
+    def _recent_text_history_multi(
+        self,
+        rule_ids: list[str],
+        window_ms: int = 60000,
+        max_items: int = 10,
+    ) -> list[dict]:
+        """
+        Collect recent speech-like events from multiple rule_ids
+        (e.g., ['speech_final_any', 'robot_spoke_any']) within a time window.
+
+        Returns a list sorted oldest→newest:
+          [
+            {"rule_id": "speech_final_any", "speaker_id": "human_a", "text": "...", "ts": 123.4},
+            {"rule_id": "robot_spoke_any",  "speaker_id": "robot",   "text": "...", "ts": 124.0},
+            ...
+          ]
+        """
+        now = self._now()
+        thr = now - window_ms * 1e-3
+        entries = []
+
+        for rid in rule_ids:
+            dq = self.rule_hits.get(str(rid))
+            if not dq:
+                continue
+            for ts, payload in dq:
+                if ts < thr:
+                    continue
+                data = payload.get("data") if isinstance(payload, dict) else payload
+                if not isinstance(data, dict):
+                    continue
+                txt = (data.get("text") or "").strip()
+                if not txt:
+                    continue
+                spk = data.get("speaker_id")
+                entries.append({
+                    "rule_id": rid,
+                    "speaker_id": spk,
+                    "text": txt,
+                    "ts": float(ts),
+                })
+
+        # sort by time and keep the last max_items
+        entries.sort(key=lambda e: e["ts"])
+        if len(entries) > max_items:
+            entries = entries[-max_items:]
+        return entries
+
 
 
     # ---------- utils ----------
@@ -911,6 +1001,47 @@ class EventLayerNode(Node):
                 self.get_logger().info(f"Dropped {topic} (no longer desired)")
 
 
+    def _cb_mediation_control(self, msg: StringMsg):
+        """
+        Control channel from Broker/PlanMediator.
+
+        Expected JSON:
+          {
+            "session_id": "mediation:llm_speech_to_multiagent_plan:...",
+            "status": "pending" | "accept" | "reject" | "cancelled" | "idle",
+            "ts": <float>
+          }
+
+        When status == "pending" we *block* llm_speech_plan.
+        When status is terminal (accept/reject/cancelled/idle) we unblock it.
+        """
+        try:
+            obj = json.loads(msg.data or "{}")
+        except Exception:
+            self.get_logger().warn(f"Bad JSON on /mediation/control: {msg.data}")
+            return
+        status = (obj.get("status") or "").strip().lower()
+        session_id = obj.get("session_id")
+
+        if status == "pending":
+            if not self._mediation_block_llm_speech_plan:
+                self.get_logger().info(
+                    f"EventLayer: mediation pending (session={session_id}); "
+                    f"blocking llm_speech_plan rule."
+                )
+            self._mediation_block_llm_speech_plan = True
+
+        elif status in ("accept", "reject", "cancelled", "idle", "done"):
+            if self._mediation_block_llm_speech_plan:
+                self.get_logger().info(
+                    f"EventLayer: mediation ended with status={status} "
+                    f"(session={session_id}); unblocking llm_speech_plan rule."
+                )
+            self._mediation_block_llm_speech_plan = False
+
+        # else: unknown status → no change
+
+
     def _cb_vlm_answer(self, msg: StringMsg):
         """
         Handle VLM JSON envelope from /vlm/answer and evaluate vlm_inference rules.
@@ -992,29 +1123,35 @@ class EventLayerNode(Node):
     def _publish_basic(self, rule_id: str, payload: dict):
         ts_event = self._now()
 
-        # Derive zone:
-        # 1) if payload already has a robot_zone, use that
-        # 2) otherwise, try to infer from TF
-        zone = payload.get("robot_zone")
-        if zone is None:
-            try:
-                pose_map = self._lookup_robot_pose_map()
-                if pose_map is not None:
-                    rx, ry, ryaw, rts = pose_map
-                    zone = self._zone_from_xy(rx, ry)
-                else:
-                    zone = "unknown"
-            except Exception:
-                zone = "unknown"
+        # Derive zone…
+        # (existing code)
+
+        # Normalize "speech" style payloads so history code has text + speaker_id
+        data = dict(payload)
+        if rule_id in ("speech_final_any", "robot_spoke_any"):
+            # human ASR has text already in ctx["text"]
+            if rule_id == "speech_final_any":
+                text_val = (data.get("text") or "").strip()
+                spk = data.get("speaker_id")
+            else:
+                # robot: extract from inner_ctx if available
+                inner_ctx = data.get("inner_ctx") or {}
+                text_val = (inner_ctx.get("text") or "").strip()
+                spk = "robot"
+            if text_val:
+                data["text"] = text_val
+            if spk is not None:
+                data["speaker_id"] = spk
 
         evt = {
             "ts": ts_event,
             "rule": rule_id,
-            "data": payload,
-            "zone": zone,          # ← new top-level field
+            "data": data,
+            #"zone": zone,
         }
 
         self.pub_basic.publish(StringMsg(data=json.dumps(evt)))
+
 
     def _eval_for_rules(self, task: str, output: str, ctx: dict):
         if not self.enabled:
@@ -1334,6 +1471,10 @@ class EventLayerNode(Node):
             "inner_ts": float(inner.get("ts", ts_event)) if isinstance(inner, dict) else ts_event,
         }
 
+        req_env = env.get("request")
+        if isinstance(req_env, dict):
+            ctx["request"] = req_env
+
         self._eval_for_rules("llm_speech_check", "check.json", ctx)
 
 
@@ -1509,12 +1650,21 @@ class EventLayerNode(Node):
 
         # 2) NEW: LLM/VLM call rules (llm_call: {...})
         for r in self.llm_call_rules:
-        
-        
-        
+
             rid = str(r.get("id") or "")
             if not rid:
                 continue
+
+            # --- NEW: mediation gate for the speech→plan rule ---
+            # Adjust 'llm_speech_to_multiagent_plan' if your rule id is different.
+            if (
+                self._mediation_block_llm_speech_plan
+                and rid == "llm_speech_to_multiagent_plan"
+            ):
+                # We still allow normal speech events etc., but we do NOT
+                # start new llm_speech_plan calls while mediation is pending.
+                continue
+
 
             if rid in self.bad_rules:
                 self.get_logger().info(f"LLM/VLM rule {rid} is quarantined; skipping.")

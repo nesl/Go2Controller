@@ -40,7 +40,7 @@ rules:
     expr: "text and len(text) >= 3"
 
   - id: trigger_speech_final
-    enabled: true
+    enabled: false
     task: audio_asr
     output: text.final
     model_id: "small" 
@@ -79,7 +79,7 @@ rules:
     output: bt.reading
     mode: "level"
     # Fire on any reasonably strong reading; tune threshold as you like:
-    expr: "rssi >= -50"
+    expr: "rssi >= -90"
 
   - id: skill_done_any
     enabled: true
@@ -99,6 +99,7 @@ rules:
   - id: speech_intent_inferred
     enabled: true
     type: basic
+    mode: level
     task: llm_speech_check
     output: check.json
     expr: "success and json_text is not None and json_text != ''"
@@ -120,7 +121,7 @@ rules:
     expr: "kind == 'skill_started'"
 
   - id: trigger_idle
-    enabled: true
+    enabled: false
     one_shot: true
     type: composite
     expr: >
@@ -129,9 +130,21 @@ rules:
       and not exists('skill_started_any', 30000)
       and not exists('trigger_speech_final', 30000)
       
+
+  # in rules_init.yaml or dynamic rules
+  - id: robot_spoke_any
+    enabled: true
+    type: basic
+    task: "skill_status"
+    output: "skill.status"
+    mode: "edge"
+    expr: "kind == 'step_started' and skill == 'tts.say' and isinstance(inner_ctx.get('text'), str)"
+    publish: true
+
+      
   # ───────── LLM: interpret human intent from final utterance ─────────
   - id: llm_infer_intent
-    enabled: true
+    enabled: false
     type: composite
 
     # Trigger whenever we receive a final ASR utterance
@@ -195,7 +208,7 @@ rules:
 
   # ───────── VLM: describe scene when humans are around (rate-limited) ─────────
   - id: vlm_describe_scene_with_human
-    enabled: true
+    enabled: false
     type: composite
     # Only fire when we have a 3D human detection in the last 3 seconds
     expr: "exists('human_detected_3d', 3000)"
@@ -249,6 +262,283 @@ rules:
           }
         }
         
+  - id: llm_speech_to_multiagent_plan
+    enabled: true
+    type: composite
+
+    # Trigger whenever we receive a final ASR utterance
+    expr: "exists('speech_final_any', 5000)"
+
+    llm_call:
+      task: "llm_speech_check"        # your LLM backend task name
+      output_id: "check.json"     # EventLayer will parse this as JSON
+
+      min_period_ms: 0
+      text_from_rule_id: "speech_final_any"
+      history_source_rules_json: '["speech_final_any","robot_spoke_any"]'
+      history_window_ms: 60000
+      history_max_items: 8
+      tag: "command_to_plan"
+
+      prompt_template: |
+        You are the cognitive layer for robot Bob in an X/Y boxes task.
+
+        The environment:
+        - There are numbered boxes: box 1, box 2, ...
+        - Each box may have properties X and/or Y.
+        - There are three agents in the team:
+            * "robot"   : the robot
+            * "human_a" : Human A (X-specialist)
+            * "human_b" : Human B (Y-specialist)
+        - Each agent can perform two kinds of actions on boxes:
+            * "sense"   : move to a box and test a property (X or Y).
+            * "dispose" : pick up and dispose a box that has already been confirmed.
+
+        Your job:
+        Given ONE human utterance, decide whether it contains a DIRECT PLAN or COMMAND
+        that assigns actions to any of these agents (robot, human_a, human_b).
+        If so, normalize it into a short multi-agent plan.
+
+        1. COMMAND / PLAN DETECTION
+
+           Treat an utterance as a command/plan if it clearly specifies what any agent
+           (robot, human_a, or human_b) should do.
+
+           Examples of COMMAND/PLAN utterances:
+           - "Robot, go sense X on box 5."
+           - "I'll take the X boxes, you take the Y boxes."
+           - "Robot, check box 8 for Y, and Human A should dispose box 3."
+
+           Non-command examples:
+           - "What are you doing right now?"
+           - "This is hard."
+           - "Are we almost done?"
+
+        2. AGENT ASSIGNMENT
+
+           When the utterance refers to "you", assume it refers to the ROBOT unless it is
+           clearly part of a human-human conversation. If the utterance clearly assigns
+           tasks to humans, map them as:
+
+             - "I'll take X boxes"      -> typically the speaker (assume "human_a" if
+                                           the speaker is X-specialist; otherwise
+                                           use "human_a" or "human_b" only if the
+                                           utterance clearly names them).
+             - "You take the Y boxes"   -> assign to "human_b" if Y is clearly their domain.
+             - "B, go check box 3"      -> "human_b".
+             - "A, handle the X boxes"  -> "human_a".
+
+           If you cannot confidently assign a human, put that step in "other_humans".
+
+        3. PLAN NORMALIZATION
+
+           If the utterance IS a command/plan, extract a SEQUENCE of steps for each agent.
+
+           Each step must have:
+             - box_id   : integer box id, if mentioned explicitly (e.g., "box 5").
+                          If you cannot infer it, use null.
+             - property : "X", "Y", or null.
+                          Use:
+                            * "X" if they clearly refer to X-boxes.
+                            * "Y" if they clearly refer to Y-boxes.
+                            * null if the property is unclear or irrelevant.
+             - kind     : "sense" or "dispose".
+                          Use:
+                            * "sense"  for actions like "check", "test", "scan", "look at".
+                            * "dispose" for actions like "throw away", "remove", "take out".
+
+           Your output should organize plan steps by agent in an "agents_plan" object:
+
+             "agents_plan": {
+               "robot":   [ step, step, ... ],
+               "human_a": [ step, ... ],
+               "human_b": [ step, ... ],
+               "other_humans": [ step, ... ]
+             }
+
+           Any of these arrays may be empty. If there is no meaningful plan at all,
+           agents_plan must be null.
+
+           Guidelines:
+             - Keep the plan SHORT and EXECUTABLE, typically 1–5 steps per agent.
+             - Respect order within each agent's list if the utterance clearly imposes order
+               (e.g., "first do X on box 5, then Y on box 8").
+             - If the command is vague ("check the nearest X box"), you may:
+               * set box_id = null, property = "X", kind = "sense".
+
+        4. OUTPUT FORMAT
+
+           You MUST respond with STRICT JSON ONLY, no explanations or markdown.
+
+           Fields to output:
+             - is_command      : boolean (true if this is a plan/command involving any agent)
+             - command_type    : string, one of:
+                                 ["robot_only", "multi_agent_plan", "non_command", "ambiguous"]
+             - agents_plan     : null OR an object with per-agent plan arrays as described
+             - certainty       : number between 0.0 and 1.0 indicating your confidence
+                                 that this is correctly interpreted
+             - natural_summary : 1–2 sentence explanation in natural language of what
+                                 the human wants the agents to do.
+
+        Example 1 (for your understanding only):
+
+          Utterance: "Robot, go test X on box 5 and then check box 8 for Y."
+          =>
+          {
+            "is_command": true,
+            "command_type": "robot_only",
+            "agents_plan": {
+              "robot": [
+                { "box_id": 5, "property": "X", "kind": "sense" },
+                { "box_id": 8, "property": "Y", "kind": "sense" }
+              ],
+              "human_a": [],
+              "human_b": [],
+              "other_humans": []
+            },
+            "certainty": 0.95,
+            "natural_summary": "The human is asking the robot to first sense property X on box 5, then sense property Y on box 8."
+          }
+
+        Example 2:
+
+          Utterance: "I'll handle the X boxes, B, you take the Y boxes, and robot check box 3 for Y."
+          =>
+          {
+            "is_command": true,
+            "command_type": "multi_agent_plan",
+            "agents_plan": {
+              "robot": [
+                { "box_id": 3, "property": "Y", "kind": "sense" }
+              ],
+              "human_a": [
+                { "box_id": null, "property": "X", "kind": "sense" }
+              ],
+              "human_b": [
+                { "box_id": null, "property": "Y", "kind": "sense" }
+              ],
+              "other_humans": []
+            },
+            "certainty": 0.9,
+            "natural_summary": "The human is proposing that Human A handle X boxes, Human B handle Y boxes, and the robot should sense Y on box 3."
+          }
+
+        Example 3:
+
+          Utterance: "What are you doing right now?"
+          =>
+          {
+            "is_command": false,
+            "command_type": "non_command",
+            "agents_plan": null,
+            "certainty": 0.98,
+            "natural_summary": "The human is asking about the robot's current activity, not giving a command."
+          }
+
+      output_schema: |
+        {
+          "type": "object",
+          "required": [
+            "is_command",
+            "command_type",
+            "agents_plan",
+            "certainty",
+            "natural_summary"
+          ],
+          "properties": {
+            "is_command": {
+              "type": "boolean"
+            },
+            "command_type": {
+              "type": "string",
+              "enum": ["robot_only", "multi_agent_plan", "non_command", "ambiguous"]
+            },
+            "agents_plan": {
+              "type": ["object", "null"],
+              "properties": {
+                "robot": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["box_id", "property", "kind"],
+                    "properties": {
+                      "box_id":   { "type": ["integer", "null"] },
+                      "property": {
+                        "type": ["string", "null"],
+                        "enum": ["X", "Y", null]
+                      },
+                      "kind": {
+                        "type": "string",
+                        "enum": ["sense", "dispose"]
+                      }
+                    }
+                  }
+                },
+                "human_a": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["box_id", "property", "kind"],
+                    "properties": {
+                      "box_id":   { "type": ["integer", "null"] },
+                      "property": {
+                        "type": ["string", "null"],
+                        "enum": ["X", "Y", null]
+                      },
+                      "kind": {
+                        "type": "string",
+                        "enum": ["sense", "dispose"]
+                      }
+                    }
+                  }
+                },
+                "human_b": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["box_id", "property", "kind"],
+                    "properties": {
+                      "box_id":   { "type": ["integer", "null"] },
+                      "property": {
+                        "type": ["string", "null"],
+                        "enum": ["X", "Y", null]
+                      },
+                      "kind": {
+                        "type": "string",
+                        "enum": ["sense", "dispose"]
+                      }
+                    }
+                  }
+                },
+                "other_humans": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["box_id", "property", "kind"],
+                    "properties": {
+                      "box_id":   { "type": ["integer", "null"] },
+                      "property": {
+                        "type": ["string", "null"],
+                        "enum": ["X", "Y", null]
+                      },
+                      "kind": {
+                        "type": "string",
+                        "enum": ["sense", "dispose"]
+                      }
+                    }
+                  }
+                }
+              },
+              "additionalProperties": false
+            },
+            "certainty": {
+              "type": "number"
+            },
+            "natural_summary": {
+              "type": "string"
+            }
+          }
+        }
 
 
 

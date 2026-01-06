@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import os, json, math, sqlite3, threading, time, re, hashlib
-from typing import Optional, Tuple, Dict, Set, List
+from typing import Optional, Tuple, Dict, Set, List, Any
 from collections import deque
 
 import rclpy
@@ -23,6 +23,27 @@ from rcl_interfaces.msg import SetParametersResult  # NEW
 from groq import Groq
 
 from .optimizer_client import AgentState, BoxInfo, plan_assignments_gurobi
+
+from .optimizer_client import (
+    build_plan_from_llm_agents_plan,
+    evaluate_candidate_plan,
+    Plan,
+    PlannerWeights,
+    extend_plan_with_prefix,
+)
+
+from .broker_mediation import BrokerMediationMixin
+
+from .plan_mediator import (
+    PlanMediator,
+    MediationLLMConfig,
+    MediationState,
+    MediationObjectiveMetrics,
+    MediationSocialContext,
+    MediationInteractionContext,
+    MediationTurn,
+)
+
 
 # LLM reply must be STRICT JSON like: {"sql":"SELECT ...", "params": {...}, "purpose":"..."}
 LLM_SQL_SCHEMA = {
@@ -59,7 +80,7 @@ EVENT_SUMMARY_SCHEMA = {
 
 # ------------------------------ Broker Node ------------------------------
 
-class BrokerNode(Node):
+class BrokerNode(Node, BrokerMediationMixin):
     """
     State-owning broker with LLM-driven SQL:
       • Creates/owns SQLite DB
@@ -109,9 +130,9 @@ class BrokerNode(Node):
         self.declare_parameter("optimizer_time_human_b", 60.0)
 
         # Nominal walking speeds (m/s) used to turn distances into travel times
-        self.declare_parameter("optimizer_speed_robot_mps", 0.5)
-        self.declare_parameter("optimizer_speed_human_a_mps", 1.0)
-        self.declare_parameter("optimizer_speed_human_b_mps", 1.0)
+        self.declare_parameter("optimizer_speed_robot_mps", 0.2)
+        self.declare_parameter("optimizer_speed_human_a_mps", 0.2)
+        self.declare_parameter("optimizer_speed_human_b_mps", 0.2)
 
 
         # When to consider a new best/current as “meaningful change” for refresh
@@ -127,10 +148,9 @@ class BrokerNode(Node):
 
         # Allowed SQL objects (read-only)
         self.declare_parameter('allowed_objects_json', json.dumps([
-            "bt_nodes","nodes_state","bt_measurements",
+            "bt_nodes","nodes_state",
             "agent_node_labels",
-            "vw_bt_nodes_summary","vw_agent_node_labels",
-            "vw_backlog_counts","vw_object_sheet", "box_env_state","vw_box_env"
+             "box_env_state"
         ]))
 
         # Optional: mock LLM for offline dev (pass JSON {"sql": "...", "params": {...}, "purpose": "..."} in param)
@@ -140,12 +160,6 @@ class BrokerNode(Node):
 
         self.model = self.get_parameter("model").get_parameter_value().string_value
 
-        self.declare_parameter("llm_perf_topic", "/llm/broker_perf")
-        self.llm_perf_topic = (
-            self.get_parameter("llm_perf_topic")
-            .get_parameter_value()
-            .string_value
-        )
         
         self.optimizer_enabled = bool(self.get_parameter("optimizer_enabled").value)
         self.optimizer_base_url = (
@@ -175,7 +189,7 @@ class BrokerNode(Node):
             self.get_parameter("optimizer_speed_human_b_mps").value
         )
 
-        self._agent_det_agents, self._agent_det_default = self._load_agent_detection_params()
+
 
         # Last plan and “fingerprint” of box server state
         self._last_plan = None
@@ -197,10 +211,6 @@ class BrokerNode(Node):
         )
         
         # NEW: task registry path so we can subscribe to perf topics
-        self.declare_parameter(
-            "task_registry_path",
-            ""
-        )
         
         self.declare_parameter("human_agent_id", "human_a")  # or whatever label you use
         self.human_agent_id = (
@@ -210,8 +220,8 @@ class BrokerNode(Node):
         )
         
         # --- Event-trace summarizer parameters ---
-        self.declare_parameter("event_summary_enabled", True)
-        self.declare_parameter("event_summary_model", "gpt-4o-mini")  # fast, cheap, small context
+        self.declare_parameter("event_summary_enabled", False)
+        self.declare_parameter("event_summary_model", "gpt-5-mini")  # fast, cheap, small context
         self.declare_parameter("event_summary_batch_size", 8)         # run summary after N events
 
         self.event_summary_enabled = (
@@ -239,20 +249,21 @@ class BrokerNode(Node):
         self._event_summary_lock = threading.Lock()
 
         
-        self.task_registry_path = (
-            self.get_parameter("task_registry_path")
-            .get_parameter_value()
-            .string_value
-        )
 
         # simple EMA of broker LLM latency (ms)
         self._llm_lat_ema_ms: Optional[float] = None
         self._llm_lat_alpha: float = 0.3
 
-        self.pub_llm_perf = self.create_publisher(
-            StringMsg, self.llm_perf_topic, 10
-        )
 
+        # In BrokerNode.__init__:
+        self._plan_mediator = PlanMediator(
+            MediationLLMConfig(
+                model_name="gpt-5-mini",
+                llm_call=self._mediate_llm_call,  # small wrapper around self._chat_json
+            )
+        )
+        self._mediation_sessions = {}  # req_id -> MediationState
+        self._active_mediation_id: Optional[str] = None
 
         # Parameters → members
         self.db_path       = self.get_parameter('db_path').get_parameter_value().string_value
@@ -310,6 +321,7 @@ class BrokerNode(Node):
         self._current_trigger = None               # {"type": "...", "hints": {...}}
         self._ws = {}                               # ws_id -> {"hashes": set(), "iters": int}
 
+        self._init_mediation_tts()
 
         self._last_published_summary_fp = None
 
@@ -318,25 +330,14 @@ class BrokerNode(Node):
         self._robot_objective: Optional[str] = None
         self._start_time = time.time()
 
-        # NEW: /task_state publisher
-        self.pub_task_state = self.create_publisher(StringMsg, "/task_state", 10)
+        self._last_server_time: Optional[float] = None
 
-        # NEW: periodic TaskState tick (e.g., 2 Hz)
-        self.create_timer(0.5, self._tick_task_state)
+
 
         # NEW: last known robot zone (from event-layer)
         self._last_robot_zone: Optional[str] = None
 
-
-        # NEW: runtime perf database (EMA per task/model)
-        # key: (task_id, model_id or "default")
-        # val: {"lat_ms_ema": float, "n": int, "last_ts": float}
-        self._perf_ema = {}
-        self._perf_lock = threading.Lock()
-
-        # Subscribe to all perf topics from task_registry
-        self._perf_subscriptions = []
-        self._load_task_registry_and_subscribe_perf()
+        self._agent_det_agents, self._agent_det_default = self._load_agent_detection_params()
 
         # ------------ ROS I/O ------------
         # Events
@@ -347,37 +348,23 @@ class BrokerNode(Node):
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
         # Planner needs (reactive loop)
-        self.sub_needs = self.create_subscription(StringMsg, "/planner/needs", self._on_planner_needs, 20)
 
         # Optional DT profiles (if available)
         # self.create_subscription(StringMsg, "/digital_twin/profile/H1", self._on_profile_h1, 10)
         # self.create_subscription(StringMsg, "/digital_twin/profile/H2", self._on_profile_h2, 10)
 
-        # Publications for facts
-        self.pub_facts = self.create_publisher(StringMsg, "/broker/facts", 10)
-        self.pub_delta = self.create_publisher(StringMsg, "/broker/facts_delta", 10)
-        self.pub_sql_debug = self.create_publisher(StringMsg, "/broker/sql_plan_debug", 10)
-
         self.pub_capsule = self.create_publisher(StringMsg, "/broker/context_capsule", 10)
 
 
         # Services
-        self.srv_dump_db = self.create_service(Trigger, '/broker/dump_db_path', self._srv_dump_db)
-        self.srv_nodes_summary = self.create_service(Trigger, '/broker/query_nodes_summary', self._srv_query_nodes_summary)
-        self.srv_agent_labels  = self.create_service(Trigger, '/broker/query_agent_labels', self._srv_query_agent_labels)
-
-        # LLM-driven runs (no context args; broker owns context)
-        self.srv_run_initial = self.create_service(Trigger, '/broker/run_initial', self._srv_run_initial)
-        self.srv_run_more    = self.create_service(Trigger, '/broker/run_more',    self._srv_run_more)
 
         # Background contamination worker
-        self.create_timer(0.25, self._process_pending_refresh)
-        
-        self._save_registry_srv = self.create_service(
-            Trigger,
-            "/broker/save_task_registry_with_perf",
-            self._on_save_registry_with_perf,
+
+        # --- Mediation control publisher (for EventLayer) ---
+        self.pub_mediation_ctrl = self.create_publisher(
+            StringMsg, "/mediation/control", 10
         )
+
 
         if self.optimizer_enabled:
             # Small polling period; can tune (e.g. 0.5–2.0 s)
@@ -389,6 +376,8 @@ class BrokerNode(Node):
             f"target_frame={self.target_frame} zone_split_x={self.zone_split_x} server={self.server_url} "
             f"enable_server={self.enable_server}"
         )
+
+
 
 
     def _load_agent_detection_params(self):
@@ -446,266 +435,6 @@ class BrokerNode(Node):
 
     # ------------------------------ Perf topic discovery ------------------------------
     
-    def _on_save_registry_with_perf(self, req, resp):
-        out_path = None  # or e.g. self.task_registry_path.replace(".yaml","_runtime.yaml")
-        self.write_task_registry_with_perf(self.task_registry_path, out_path=out_path)
-        resp.success = True
-        resp.message = "task_registry updated with runtime perf EMA"
-        return resp
-    
-    def _load_task_registry_and_subscribe_perf(self):
-        """
-        Read task_registry.yaml, find all outputs with kind: perf,
-        and subscribe to their topics as std_msgs/String.
-
-        Expected structure (per your registry):
-          tasks:
-            task_id:
-              outputs:
-                - id: perf.json
-                  kind: perf
-                  ros:
-                    topic: "/yolo_perf"
-                    msg: "std_msgs/String"
-        """
-        path = self.task_registry_path
-        if not path or not os.path.isfile(path):
-            self.get_logger().warn(f"[broker] task_registry_path not found: {path}")
-            return
-
-        try:
-            with open(path, "r") as f:
-                doc = yaml.safe_load(f) or {}
-        except Exception as e:
-            self.get_logger().warn(f"[broker] failed to read task registry '{path}': {e}")
-            return
-
-        tasks = doc.get("tasks") or {}
-        seen_topics = set()
-
-        for task_id, task in tasks.items():
-            outputs = task.get("outputs") or []
-            for out in outputs:
-                # Perf outputs are marked with kind: perf in your registry
-                if str(out.get("kind", "")).lower() != "perf":
-                    continue
-                ros_cfg = out.get("ros") or {}
-                topic = ros_cfg.get("topic")
-                if not topic or topic in seen_topics:
-                    continue
-                seen_topics.add(topic)
-
-                # Subscribe as std_msgs/String; we parse JSON ourselves
-                self.get_logger().info(
-                    f"[broker] subscribing to perf topic '{topic}' for task '{task_id}'"
-                )
-                sub = self.create_subscription(
-                    StringMsg,
-                    topic,
-                    # capture task_id & topic in closure
-                    lambda msg, t_id=task_id, t_topic=topic: self._on_perf_msg(t_id, t_topic, msg),
-                    50,
-                )
-                self._perf_subscriptions.append(sub)
-
-    # ------------------------------ Perf ingestion ------------------------------
-    
-    def _perf_summary(self) -> dict:
-        """
-        Return a nested summary:
-        {
-          "task_id": {
-            "model_id": {
-              "lat_ms_ema": float,
-              "fps_ema": float | None,
-              "samples": int,
-              "last_ts": float
-            },
-            ...
-          },
-          ...
-        }
-        """
-        out: Dict[str, Dict[str, dict]] = {}
-        with self._perf_lock:
-            for (task_id, model_id), ent in self._perf_ema.items():
-                task_entry = out.setdefault(task_id, {})
-                task_entry[model_id] = {
-                    "lat_ms_ema": ent.get("lat_ms_ema"),
-                    "fps_ema": ent.get("fps_ema"),
-                    "samples": ent.get("n", 0),
-                    "last_ts": ent.get("last_ts"),
-                }
-        return out
-
-    def merge_perf_into_task_registry(self, registry: dict) -> dict:
-        """
-        Mutate a loaded task_registry dict to include current perf EMAs.
-
-        For each (task_id, model_id) in the perf summary, if there is a matching
-        task + model in registry["tasks"], we augment:
-
-          tasks[task_id].models[k].metrics.latency_ms:
-            ema_runtime_ms: <lat_ms_ema>
-            runtime_samples: <samples>
-            runtime_last_ts: <last_ts>
-
-          tasks[task_id].models[k].metrics.throughput_fps:
-            runtime_fps_ema: <fps_ema>  (if available)
-        """
-        summary = self._perf_summary()
-        tasks_cfg = registry.get("tasks")
-        if not isinstance(tasks_cfg, dict):
-            return registry
-
-        for task_id, models_perf in summary.items():
-            task_entry = tasks_cfg.get(task_id)
-            if not isinstance(task_entry, dict):
-                continue
-
-            models_list = task_entry.get("models")
-            if not isinstance(models_list, list):
-                continue
-
-            for model_cfg in models_list:
-                if not isinstance(model_cfg, dict):
-                    continue
-
-                # We use the 'id' field from YAML as the key to match perf.model_id.
-                model_key = str(model_cfg.get("id") or model_cfg.get("version") or "")
-                if not model_key:
-                    continue
-
-                perf_ent = models_perf.get(model_key)
-                if not perf_ent:
-                    continue
-
-                lat_ms_ema = perf_ent.get("lat_ms_ema")
-                fps_ema = perf_ent.get("fps_ema")
-                samples = perf_ent.get("samples", 0)
-                last_ts = perf_ent.get("last_ts")
-
-                metrics = model_cfg.setdefault("metrics", {})
-                lat_cfg = metrics.setdefault("latency_ms", {})
-
-                if isinstance(lat_ms_ema, (int, float)):
-                    lat_cfg["ema_runtime_ms"] = round(float(lat_ms_ema), 2)
-                lat_cfg["runtime_samples"] = int(samples)
-                if isinstance(last_ts, (int, float)):
-                    lat_cfg["runtime_last_ts"] = float(last_ts)
-
-                if isinstance(fps_ema, (int, float)):
-                    thr_cfg = metrics.setdefault("throughput_fps", {})
-                    thr_cfg["runtime_fps_ema"] = round(float(fps_ema), 2)
-
-        return registry
-
-    def write_task_registry_with_perf(self,
-                                      in_path: str,
-                                      out_path: Optional[str] = None) -> None:
-        """
-        Load task_registry YAML, merge in runtime perf EMAs, and write it back.
-
-        If out_path is None, overwrite in_path; otherwise write to out_path.
-        """
-        try:
-            with open(in_path, "r") as f:
-                registry = yaml.safe_load(f) or {}
-        except Exception as e:
-            self.get_logger().error(f"[broker] failed to load task_registry from {in_path}: {e}")
-            return
-
-        registry = self.merge_perf_into_task_registry(registry)
-
-        target_path = out_path or in_path
-        tmp_path = target_path + ".tmp"
-
-        try:
-            with open(tmp_path, "w") as f:
-                yaml.safe_dump(registry, f, sort_keys=False)
-            os.replace(tmp_path, target_path)
-            self.get_logger().info(f"[broker] wrote updated task registry with perf EMA to {target_path}")
-        except Exception as e:
-            self.get_logger().error(f"[broker] failed to write updated task_registry to {target_path}: {e}")
-
-
-    
-    def _on_perf_msg(self, task_id: str, topic: str, msg: StringMsg):
-        """
-        Generic perf handler.
-
-        We try to extract:
-          - model_id (if present, e.g., payload["model"])
-          - a latency value in ms (lat_ms or latency_ms{...})
-          - optional fps_ema (if present)
-        and maintain an EMA per (task_id, model_id).
-        """
-        try:
-            payload = json.loads(msg.data) if msg.data else {}
-        except Exception as e:
-            self.get_logger().warn(f"[broker] perf JSON parse error from {topic}: {e}")
-            return
-
-        ts = time.time()
-        model_id = None
-        lat_ms = None
-        fps_ema = None
-
-        if isinstance(payload, dict):
-            # LLM / TTS / VLM perf:
-            # {"node":"broker","model":str,"lat_ms":num,"ok":bool,"phase":str,...}
-            if "model" in payload and isinstance(payload.get("lat_ms"), (int, float)):
-                model_id = str(payload.get("model"))
-                lat_ms = float(payload.get("lat_ms"))
-
-            # Vision / audio perf: {"latency_ms": {...}, "fps_ema": ...}
-            if lat_ms is None and isinstance(payload.get("latency_ms"), dict):
-                lm = payload["latency_ms"]
-                for key in ("total", "det", "pose", "utter_infer_mean", "window_infer_mean"):
-                    v = lm.get(key)
-                    if isinstance(v, (int, float)):
-                        lat_ms = float(v)
-                        break
-
-            # Fallback: direct numeric latency_ms
-            if lat_ms is None and isinstance(payload.get("latency_ms"), (int, float)):
-                lat_ms = float(payload["latency_ms"])
-
-            # Optional throughput info
-            v_fps = payload.get("fps_ema")
-            if isinstance(v_fps, (int, float)):
-                fps_ema = float(v_fps)
-
-        if lat_ms is None:
-            # Nothing we can aggregate
-            return
-
-        if not model_id:
-            model_id = "default"
-
-        key = (task_id, model_id)
-        alpha = 0.3  # EMA smoothing factor
-
-        with self._perf_lock:
-            ent = self._perf_ema.get(key)
-            if ent is None:
-                ent = {
-                    "lat_ms_ema": lat_ms,
-                    "fps_ema": fps_ema,
-                    "n": 1,
-                    "last_ts": ts,
-                }
-            else:
-                # Update EMA for latency
-                ent["lat_ms_ema"] = (1.0 - alpha) * ent["lat_ms_ema"] + alpha * lat_ms
-                # Update fps EMA if we have it
-                if fps_ema is not None:
-                    old_fps = ent.get("fps_ema", fps_ema)
-                    ent["fps_ema"] = (1.0 - alpha) * old_fps + alpha * fps_ema
-                ent["n"] = ent.get("n", 0) + 1
-                ent["last_ts"] = ts
-
-            self._perf_ema[key] = ent
 
 
     # ------------------------------ Dynamic param handling ------------------------------
@@ -746,38 +475,6 @@ class BrokerNode(Node):
 
 
 
-    def _publish_llm_perf(self, lat_ms: int, ok: bool, phase: str):
-        """
-        Publish LLM latency as a small JSON perf record and keep a local EMA.
-        phase: e.g. 'proactive_sql' or 'reactive_sql'
-        """
-        try:
-            lat_ms = int(lat_ms)
-        except Exception:
-            lat_ms = -1
-
-        # Update EMA (if latency valid)
-        if lat_ms >= 0:
-            if self._llm_lat_ema_ms is None:
-                self._llm_lat_ema_ms = float(lat_ms)
-            else:
-                a = self._llm_lat_alpha
-                self._llm_lat_ema_ms = (1.0 - a) * self._llm_lat_ema_ms + a * float(lat_ms)
-
-        payload = {
-            "node": "broker",
-            "model": self.model,
-            "lat_ms": lat_ms,
-            "ok": bool(ok),
-            "phase": phase,
-            "ts": time.time(),
-        }
-        try:
-            self.pub_llm_perf.publish(StringMsg(data=json.dumps(payload)))
-        except Exception as e:
-            self.get_logger().warn(f"broker: failed to publish llm perf: {e}")
-
-
     def _publish_context_capsule(self, summary_only: bool = False):
         cap = self._context_capsule(summary_only=summary_only)
         self.pub_capsule.publish(StringMsg(data=json.dumps(cap)))
@@ -790,8 +487,7 @@ class BrokerNode(Node):
         cur.execute("PRAGMA foreign_keys = ON;")
 
         # Drop-and-create (for clean dev boots)
-        for obj in ["vw_bt_nodes_summary", "vw_agent_node_labels", "vw_backlog_counts", "vw_object_sheet"]:
-            cur.execute(f"DROP VIEW IF EXISTS {obj};")
+
         for trg in [
             "trg_best_on_current_insert_init",
             "trg_best_on_current_insert_if_better"
@@ -799,8 +495,8 @@ class BrokerNode(Node):
             cur.execute(f"DROP TRIGGER IF EXISTS {trg};")
         for tbl in [
             "contamination_records", "obj_measurements",
-            "bt_measurements", "nodes_state", "bt_nodes",
-            "agent_status", "agent_locations", "agent_node_labels"
+            "nodes_state", "bt_nodes",
+            "agent_status", "agent_locations", "agent_node_labels", "robot_exec_evals"
         ]:
             cur.execute(f"DROP TABLE IF EXISTS {tbl};")
 
@@ -824,26 +520,7 @@ class BrokerNode(Node):
             );
         """)
 
-        # Two slots per node: current / best
-        cur.execute("""
-            CREATE TABLE bt_measurements (
-                node_id     TEXT NOT NULL
-                            REFERENCES bt_nodes(node_id) ON DELETE CASCADE,
-                slot        TEXT NOT NULL CHECK(slot IN ('current','best')),
-                rssi        INTEGER NOT NULL,
-                ts          REAL    NOT NULL,
-                x           REAL,
-                y           REAL,
-                zone        TEXT NOT NULL CHECK(zone IN ('A','B')),
-                sensed_by   TEXT NOT NULL
-                            CHECK(sensed_by IN ('robot','human_a','human_b')),
-                PRIMARY KEY (node_id, slot)
-            );
-        """)
-        cur.execute("CREATE INDEX idx_bt_meas_slot   ON bt_measurements(slot);")
-        cur.execute("CREATE INDEX idx_bt_meas_ts     ON bt_measurements(ts);")
-        cur.execute("CREATE INDEX idx_bt_meas_zone   ON bt_measurements(zone);")
-        cur.execute("CREATE INDEX idx_bt_meas_sensed ON bt_measurements(sensed_by);")
+
 
         # Per-agent per-node contamination label
         cur.execute("""
@@ -899,163 +576,51 @@ class BrokerNode(Node):
                 last_sense_completed_at REAL      -- sim-time from server
             );
         """)
+        # Plan proposals (LLM speech, optimizer, etc.)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS plan_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                proposer_id TEXT,
+                source TEXT,
+                req_id TEXT,
+                adopted INTEGER NOT NULL DEFAULT 0,
+                better_than_current INTEGER NOT NULL DEFAULT 0,
+                score_optimal REAL,
+                score_candidate REAL,
+                suboptimal_pct REAL
+            );
+        """)
+
+
+        # Robot skill execution evals (mainly for sense/dispose actions)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS robot_exec_evals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                agent_id TEXT,
+                skill TEXT,
+                box_id INTEGER,
+                property TEXT,
+                kind TEXT,      -- 'sense' or 'dispose'
+                status TEXT,
+                detected INTEGER,
+                probability REAL,
+                deadline REAL,
+                completed_at REAL,
+                fulfilled INTEGER   -- 1 if confirmed in box server state, 0 if not, NULL if unknown
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_robot_exec_ts ON robot_exec_evals(ts);")
+
 
         
         cur.execute("CREATE INDEX idx_agent_loc_agent_ts ON agent_locations(agent_id, ts);")
 
         # Views
-        cur.execute("""
-            CREATE VIEW vw_bt_nodes_summary AS
-            SELECT
-                n.node_id,
-                s.in_basket,
-                s.disposed_to,
-                s.updated_ts AS node_updated_ts,
 
-                c.rssi   AS current_rssi,
-                c.ts     AS current_ts,
-                c.x      AS current_x,
-                c.y      AS current_y,
-                c.zone   AS current_zone,
-                c.sensed_by AS current_sensed_by,
 
-                b.rssi   AS best_rssi,
-                b.ts     AS best_ts,
-                b.x      AS best_x,
-                b.y      AS best_y,
-                b.zone   AS best_zone,
-                b.sensed_by AS best_sensed_by
-
-            FROM bt_nodes n
-            LEFT JOIN nodes_state s ON s.node_id = n.node_id
-            LEFT JOIN bt_measurements c ON c.node_id = n.node_id AND c.slot = 'current'
-            LEFT JOIN bt_measurements b ON b.node_id = n.node_id AND b.slot = 'best';
-        """)
-        cur.execute("""
-            CREATE VIEW vw_agent_node_labels AS
-            SELECT
-              n.node_id,
-              r.contaminated AS robot_contaminated,
-              r.probability  AS robot_probability,
-              a.contaminated AS human_a_contaminated,
-              a.probability  AS human_a_probability,
-              b.contaminated AS human_b_contaminated,
-              b.probability  AS human_b_probability
-            FROM bt_nodes n
-            LEFT JOIN agent_node_labels r ON r.node_id=n.node_id AND r.agent_id='robot'
-            LEFT JOIN agent_node_labels a ON a.node_id=n.node_id AND a.agent_id='human_a'
-            LEFT JOIN agent_node_labels b ON b.node_id=n.node_id AND b.agent_id='human_b';
-        """)
-        cur.execute("""
-            CREATE VIEW vw_backlog_counts AS
-            SELECT
-              SUM(CASE WHEN disposed_to='none' AND in_basket=0 THEN 1 ELSE 0 END) AS to_pick,
-              SUM(CASE WHEN disposed_to='none' AND in_basket=1 THEN 1 ELSE 0 END) AS in_basket,
-              SUM(CASE WHEN disposed_to='clean_bin' THEN 1 ELSE 0 END) AS delivered_clean,
-              SUM(CASE WHEN disposed_to='contaminated_bin' THEN 1 ELSE 0 END) AS delivered_contaminated
-            FROM nodes_state;
-        """)
-        cur.execute("""
-            CREATE VIEW vw_object_sheet AS
-            SELECT
-              s.node_id,
-              s.in_basket,
-              s.disposed_to,
-              c.rssi   AS current_rssi,  c.zone   AS current_zone,  c.ts AS current_ts,
-              b.rssi   AS best_rssi,     b.zone   AS best_zone,     b.ts AS best_ts,
-              alr.contaminated AS robot_contaminated,  alr.probability AS robot_probability,
-              ala.contaminated AS human_a_contaminated, ala.probability AS human_a_probability,
-              alb.contaminated AS human_b_contaminated, alb.probability AS human_b_probability
-            FROM nodes_state s
-            LEFT JOIN bt_measurements c ON c.node_id=s.node_id AND c.slot='current'
-            LEFT JOIN bt_measurements b ON b.node_id=s.node_id AND b.slot='best'
-            LEFT JOIN agent_node_labels alr ON alr.node_id=s.node_id AND alr.agent_id='robot'
-            LEFT JOIN agent_node_labels ala ON ala.node_id=s.node_id AND ala.agent_id='human_a'
-            LEFT JOIN agent_node_labels alb ON alb.node_id=s.node_id AND alb.agent_id='human_b';
-        """)
-        
-        cur.execute("""
-            CREATE VIEW IF NOT EXISTS vw_box_env AS
-            SELECT
-              b.node_id,
-              s.box_id,
-              s.deadline,
-              s.x,
-              s.y,
-              s.last_sense_status,
-              s.last_sense_detected,
-              s.last_sense_probability,
-              s.last_sense_agent,
-              s.last_sense_completed_at,
-              os.in_basket,
-              os.disposed_to,
-              os.disposed_to <> 'none' AS is_delivered
-            FROM bt_nodes b
-            LEFT JOIN box_env_state s ON s.node_id = b.node_id
-            LEFT JOIN nodes_state os ON os.node_id = b.node_id;
-        """)
-
-        
-        # ----- "best" maintenance via triggers -----
-        # 1) Initialize best from first current
-        cur.execute("""
-            CREATE TRIGGER trg_best_on_current_insert_init
-            AFTER INSERT ON bt_measurements
-            WHEN NEW.slot='current'
-                 AND NOT EXISTS (
-                     SELECT 1 FROM bt_measurements b
-                     WHERE b.node_id=NEW.node_id AND b.slot='best'
-                 )
-            BEGIN
-                INSERT INTO bt_measurements(node_id, slot, rssi, ts, x, y, zone, sensed_by)
-                VALUES (NEW.node_id, 'best', NEW.rssi, NEW.ts, NEW.x, NEW.y, NEW.zone, NEW.sensed_by);
-            END;
-        """)
-
-        # 2) If a new current is "better" than best, overwrite best
-        # NOTE: "best" here = LOWEST RSSI (more negative); if you want HIGHEST to be best, flip the comparator.
-        cur.execute("""
-            CREATE TRIGGER trg_best_on_current_insert_if_better
-            AFTER INSERT ON bt_measurements
-            WHEN NEW.slot='current'
-                 AND EXISTS (
-                     SELECT 1 FROM bt_measurements b
-                     WHERE b.node_id=NEW.node_id AND b.slot='best' AND NEW.rssi < b.rssi
-                 )
-            BEGIN
-                UPDATE bt_measurements
-                SET rssi=NEW.rssi, ts=NEW.ts, x=NEW.x, y=NEW.y, zone=NEW.zone, sensed_by=NEW.sensed_by
-                WHERE node_id=NEW.node_id AND slot='best';
-            END;
-        """)
-
-        # 3) Same logic when the current row is UPDATED via UPSERT
-        cur.execute("""
-            CREATE TRIGGER trg_best_on_current_update_if_better
-            AFTER UPDATE OF rssi, ts, x, y, zone, sensed_by ON bt_measurements
-            WHEN NEW.slot='current'
-                 AND EXISTS (
-                     SELECT 1 FROM bt_measurements b
-                     WHERE b.node_id=NEW.node_id AND b.slot='best' AND NEW.rssi < b.rssi
-                 )
-            BEGIN
-                UPDATE bt_measurements
-                SET rssi=NEW.rssi, ts=NEW.ts, x=NEW.x, y=NEW.y, zone=NEW.zone, sensed_by=NEW.sensed_by
-                WHERE node_id=NEW.node_id AND slot='best';
-            END;
-        """)
-
-        '''
-        # 4) Guard: no one should write directly to slot='best'
-        cur.execute("""
-            CREATE TRIGGER trg_best_guard_manual
-            BEFORE INSERT ON bt_measurements
-            WHEN NEW.slot='best'
-            BEGIN
-                SELECT RAISE(ABORT, 'best slot is managed by triggers; write to slot=current only');
-            END;
-        """)
-        '''
+       
         
         self.conn.commit()
         cur.close()
@@ -1098,6 +663,19 @@ class BrokerNode(Node):
                     except Exception:
                         pass  # keep raw only if parsing fails
 
+                elif k == "request" and isinstance(v, dict):
+                    # Extract just the scalar bits we care about
+                    speaker_id = v.get("speaker_id")
+                    if isinstance(speaker_id, str):
+                        trace_entry["data"]["speaker_id"] = speaker_id
+                    # Optionally keep the request id too:
+                    req_id = v.get("id")
+                    if isinstance(req_id, str):
+                        trace_entry["data"]["request_id"] = req_id
+                    req_text = v.get("text")
+                    if isinstance(req_text, str):
+                        trace_entry["data"]["request_text"] = req_text
+
                 # 2. Keep small scalar fields
                 elif isinstance(v, (str, int, float, bool)):
                     trace_entry["data"][k] = v
@@ -1107,6 +685,12 @@ class BrokerNode(Node):
         # Feed running event summary (async)
         self._record_event_for_summary(trace_entry, ts)
 
+
+        try:
+            if self._maybe_route_speech_to_mediation(rule, trace_entry):
+                return
+        except Exception as e:
+            self.get_logger().warn(f"[mediation] routing speech turn failed: {e}")
 
         # remember last robot zone for capsule
         if zone is not None:
@@ -1144,23 +728,35 @@ class BrokerNode(Node):
                 if skill_name:
                     self._robot_objective = f"execute:{skill_name}"
             elif rule == "skill_done_any":
-                # when a skill finishes, clear objective
                 if data.get("done", False):
+                    # Clear current objective
                     self._robot_objective = None
+
+                    # Log a skill execution record for objective metrics
+                    skill_name = (data.get("skill") or "").strip()
+                    inner_ctx = data.get("inner_ctx") or {}
+                    if skill_name:
+                        # For now we assume these are robot skills; you can pass a different
+                        # agent_id if you later emit human skill events.
+                        self._record_skill_execution(
+                            agent_id="robot",
+                            skill_name=skill_name,
+                            inner_ctx=inner_ctx,
+                            ts=ts,
+                        )
         except Exception as e:
             self.get_logger().debug(f"robot_objective update failed: {e}")
 
-        '''
-        # Proactive: if this event is a planning trigger, immediately run initial LLM-SQL
-        if trig_type in ("new_object", "finish_or_fail", "human_command", "idle", "presence", "planner_trigger"):
-            try:
-                self._publish_context_capsule()
-                pack = self._llm_sql_to_facts(proactive=True)
-                self.pub_facts.publish(StringMsg(data=json.dumps(pack)))
-                self._emit_sql_debug(pack)
-            except Exception as e:
-                self.get_logger().warn(f"proactive run failed: {e}")
-        '''
+        # --- NEW: handle LLM multi-agent speech plans ---
+        try:
+            d = trace_entry.get("data") or {}
+            # We stored the request id under "request_id" in the trace
+            req_id = d.get("request_id", "")
+            if isinstance(req_id, str) and req_id.startswith("llm_speech_to_multiagent_plan:"):
+                self._handle_llm_speech_plan(trace_entry, ts)
+        except Exception as e:
+            self.get_logger().warn(f"broker: error in LLM plan hook: {e}")
+
 
     def _on_comp_event(self, msg: StringMsg):
         try:
@@ -1254,7 +850,8 @@ class BrokerNode(Node):
         if zone is not None:
             self._current_trigger["zone"] = zone  # optional but handy
 
-        # (proactive runs are still commented out)
+
+
 
 
     def _ingest_human3d(self, data: dict, envelope: dict):
@@ -1301,10 +898,7 @@ class BrokerNode(Node):
 
         x, y = self._tf_to_map(frame_id)
         zone = self._zone_from_xy(x, y)
-        self._upsert_current(node_id, rssi, ts_epoch, x, y, zone, agent_id)
 
-        # Only fetch contamination if (agent,node) new
-        #self._maybe_queue_contamination_refresh(agent_id, node_id, rssi, ts_epoch)
 
     # ------------------------------ DB helpers ------------------------------
     def _ensure_node(self, node_id: str):
@@ -1316,16 +910,6 @@ class BrokerNode(Node):
             (node_id,)
         )
 
-    def _upsert_current(self, node_id: str, rssi: int, ts: float,
-                        x: Optional[float], y: Optional[float],
-                        zone: str, sensed_by: str):
-        self.conn.execute("""
-            INSERT INTO bt_measurements(node_id, slot, rssi, ts, x, y, zone, sensed_by)
-            VALUES (?, 'current', ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(node_id, slot) DO UPDATE SET
-                rssi=excluded.rssi, ts=excluded.ts, x=excluded.x, y=excluded.y,
-                zone=excluded.zone, sensed_by=excluded.sensed_by
-        """, (node_id, int(rssi), float(ts), x, y, zone, sensed_by))
 
     # ------------------------------ TF & Zone ------------------------------
     def _tf_to_map(self, frame_id: str) -> Tuple[Optional[float], Optional[float]]:
@@ -1345,45 +929,9 @@ class BrokerNode(Node):
         return 'A' if (x < self.zone_split_x) else 'B'
 
     # ------------------------------ Contamination pipeline ------------------------------
-    def _maybe_queue_contamination_refresh(self, agent_id: str, node_id: str, current_rssi: int, ts: float):
-        row = self.conn.execute("""
-            SELECT 1 FROM agent_node_labels WHERE agent_id=? AND node_id=? LIMIT 1
-        """, (agent_id, node_id)).fetchone()
-        if row is not None:
-            return
-        now = time.time()
-        key = (agent_id, node_id)
-        with self._lock:
-            ent = self._contam_cache.get(key)
-            if ent and (now - ent["ts"] < self.min_refresh):
-                return
-            self._pending_refresh.add(key)
 
-    def _process_pending_refresh(self):
-        batch = []
-        with self._lock:
-            while self._pending_refresh and len(batch) < 8:
-                batch.append(self._pending_refresh.pop())
-        for agent_id, node_id in batch:
-            self._refresh_one_label(agent_id, node_id)
+    # ------------------------------ Human planning conflict metrics ------------------------------
 
-    def _box_id_from_node(self, node_id: str) -> Optional[int]:
-        """
-        Map a bt node_id like 'CNode12' or 'Box_7' to an integer box_id
-        used by the FastAPI box server.
-
-        Returns None if we can't parse a positive integer.
-        """
-        m = re.search(r'(\d+)', node_id)
-        if not m:
-            self.get_logger().warn(f"[broker] cannot map node_id='{node_id}' to box_id")
-            return None
-        try:
-            val = int(m.group(1))
-            return val if val > 0 else None
-        except ValueError:
-            self.get_logger().warn(f"[broker] invalid numeric portion in node_id='{node_id}'")
-            return None
 
     def _node_id_from_box(self, box_id: int) -> str:
         """
@@ -1393,139 +941,211 @@ class BrokerNode(Node):
         return f"CNode{box_id}"
 
 
-    def _refresh_one_label(self, agent_id: str, node_id: str):
+
+    def _record_skill_execution(self, agent_id: str, skill_name: str, inner_ctx: dict, ts: float):
         """
-        NEW VERSION:
+        Store an objective record of a completed skill execution.
 
-        Instead of calling the old contamination '/check' endpoint, we call the
-        FastAPI box server's /sense endpoint for PROPERTY X and interpret its
-        detection outcome as this agent's label for the node.
+        For our current use:
+          - We only care about:
+              * 'box.sense_nearby' (or skills containing 'sense_nearby')
+              * 'box.dispose_nearby' (or skills containing 'dispose_nearby')
+              * optimizer skills like 'optimizer.robot.sense.<box_id>' / '.dispose.<box_id>'
+          - inner_ctx from EventLayer for sense/dispose_nearby looks like:
+              { "property": "X"|"Y", "target_node_id": "CNode1..." }
 
-        - node_id is mapped to an integer box_id via _box_id_from_node().
-        - We do a blocking POST /sense (the box server simulates sensing time).
-        - We write the result into:
-            * agent_node_labels   (contaminated + probability)
-            * box_env_state       (deadline, x,y, and last sense info)
+        We:
+          - Infer kind = 'sense' or 'dispose'
+          - Infer box_id from:
+              1) optimizer-style suffix ".sense.<id>" / ".dispose.<id>", OR
+              2) DB mapping: SELECT box_id FROM box_env_state WHERE node_id = target_node_id, OR
+              3) Regex on node_id: everything after "CNode1"
+          - Call /boxes/state to see what actually happened and fill:
+              status, detected, probability, deadline, completed_at, fulfilled
         """
-        now = time.time()
-        key = (agent_id, node_id)
-        with self._lock:
-            ent = self._contam_cache.get(key)
-            if ent and (now - ent["ts"] < self.min_refresh):
-                return
-
-        if not self.enable_server or not self.server_url:
-            return
-
-        box_id = self._box_id_from_node(node_id)
-        if box_id is None:
-            return
-
-        url = self.server_url.rstrip("/") + "/sense"
-        payload = {
-            "agent_id": agent_id,
-            "box_id": box_id,
-            "property": "X",  # we treat X as the contamination-like property
-        }
-
         try:
-            resp = requests.post(url, json=payload, timeout=self.req_timeout)
-            if resp.status_code != 200:
-                self.get_logger().warn(
-                    f"[broker] box server /sense non-200 for {(agent_id,node_id)}: {resp.status_code}"
-                )
+            s_lower = (skill_name or "").lower()
+
+            # Heuristics for sense vs dispose (we only care about these)
+            kind = None
+            if "sense_nearby" in s_lower:
+                kind = "sense"
+            elif "dispose_nearby" in s_lower:
+                kind = "dispose"
+            else:
+                # Not a skill we care about
                 return
 
-            data = resp.json()
-        except Exception as e:
-            self.get_logger().warn(f"[broker] box server /sense failed for {(agent_id,node_id)}: {e}")
-            return
+            if not isinstance(inner_ctx, dict):
+                inner_ctx = {}
 
-        # SenseResponse fields from the new server:
-        # {
-        #   "agent_id": str,
-        #   "box_id": int,
-        #   "property": "X"|"Y",
-        #   "status": "completed"|"cached"|"cancelled",
-        #   "detected": bool | null,
-        #   "probability": float | null,
-        #   "deadline": float,
-        #   "x": float,
-        #   "y": float,
-        #   "requested_at": float,
-        #   "completed_at": float | null
-        # }
-        status = data.get("status")
-        detected = data.get("detected")
-        probability = data.get("probability")
-        deadline = data.get("deadline")
-        bx = data.get("x")
-        by = data.get("y")
-        completed_at = data.get("completed_at")
+            # What EventLayer gives us for nearby skills
+            prop = inner_ctx.get("property")
+            node_id = inner_ctx.get("target_node_id") or inner_ctx.get("node_id")
 
-        # We only treat 'completed' or 'cached' with a boolean detected value as a usable label
-        if status not in ("completed", "cached") or detected is None or probability is None:
+            box_id = None
+
+            # 1) From optimizer-style skill names: optimizer.robot.sense.7 / .dispose.12
+            m = re.search(r"\.(sense|dispose)\.(\d+)$", skill_name)
+            if m:
+                try:
+                    box_id = int(m.group(2))
+                except Exception:
+                    box_id = None
+
+            # 2) From DB mapping: node_id -> box_id (box_env_state is filled by _sync_box_state_from_server)
+            if box_id is None and isinstance(node_id, str):
+                try:
+                    row = self.conn.execute(
+                        "SELECT box_id FROM box_env_state WHERE node_id = ?",
+                        (node_id,),
+                    ).fetchone()
+                    if row is not None:
+                        box_id = int(row[0])
+                except Exception as e:
+                    self.get_logger().warn(
+                        f"[exec-log] failed to map node_id={node_id} to box_id via DB: {e}"
+                    )
+
+            # 3) Fallback: regex from CNode1... pattern (box id = everything after 'CNode1')
+            if box_id is None and isinstance(node_id, str):
+                m = re.match(r"^CNode1(.+)$", node_id)
+                if m:
+                    suffix = m.group(1)
+                    try:
+                        box_id = int(suffix) if suffix.isdigit() else None
+                    except Exception:
+                        box_id = None
+
+            status = None
+            detected = None
+            probability = None
+            deadline = None
+            completed_at = None
+            fulfilled: Optional[int] = None
+
             self.get_logger().info(
-                f"[broker] box /sense returned unusable status='{status}' for {(agent_id,node_id)}"
+                f"[exec-log] inner_ctx={inner_ctx} skill={skill_name} → "
+                f"kind={kind}, node_id={node_id}, box_id={box_id}, prop={prop}"
             )
-            return
 
-        contaminated = bool(detected)  # our label semantics: detected X == contaminated
+            # 4) Cross-check with box server to see what actually happened
+            if box_id is not None and kind in ("sense", "dispose") and prop is not None:
+                try:
+                    base = self.optimizer_base_url.rstrip("/")
+                    url_state = base + "/boxes/state"
+                    r_state = requests.get(url_state, timeout=self.req_timeout)
 
-        # --- Update agent_node_labels (same schema as before) ---
-        self.conn.execute(
-            """
-            INSERT INTO agent_node_labels(agent_id, node_id, contaminated, probability, updated_ts)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(agent_id, node_id) DO UPDATE SET
-                contaminated = excluded.contaminated,
-                probability  = excluded.probability,
-                updated_ts   = excluded.updated_ts
-            """,
-            (agent_id, node_id, int(1 if contaminated else 0), float(probability), now),
-        )
+                    if r_state.status_code != 200:
+                        self.get_logger().warn(
+                            f"[exec-log] /boxes/state returned {r_state.status_code} "
+                            f"when checking fulfillment"
+                        )
+                    else:
+                        boxes_state = r_state.json() or []
+                        for b in boxes_state:
+                            try:
+                                bid = int(b.get("box_id"))
+                            except Exception:
+                                continue
+                            if bid != box_id:
+                                continue
 
-        # --- Update box_env_state with richer info from the server ---
-        self.conn.execute(
-            """
-            INSERT INTO box_env_state(
-                node_id, box_id, deadline, x, y,
-                last_sense_status, last_sense_detected,
-                last_sense_probability, last_sense_agent,
-                last_sense_completed_at
+                            # Common bits
+                            d_val = b.get("deadline")
+                            if d_val is not None:
+                                deadline = float(d_val)
+
+                            if kind == "sense":
+                                # Look for a completed sense result for this (agent, property)
+                                sense_results = b.get("sense_results") or []
+                                for sr in sense_results:
+                                    a_id = str(sr.get("agent_id") or "")
+                                    p = sr.get("property")
+                                    st = sr.get("status")
+
+                                    if a_id != agent_id or p != prop:
+                                        continue
+
+                                    status = st
+                                    det_raw = sr.get("detected")
+                                    if det_raw is not None:
+                                        detected = 1 if det_raw else 0
+
+                                    prob_val = sr.get("probability")
+                                    if prob_val is not None:
+                                        probability = float(prob_val)
+
+                                    comp_val = sr.get("completed_at")
+                                    if comp_val is not None:
+                                        completed_at = float(comp_val)
+
+                                    fulfilled = 1 if st == "completed" else 0
+                                    break
+
+                                if fulfilled is None:
+                                    # We saw the box but no matching completed sense result
+                                    fulfilled = 0
+
+                            else:  # kind == "dispose"
+                                disposed_X = bool(b.get("disposed_X", False))
+                                disposed_Y = bool(b.get("disposed_Y", False))
+
+                                if prop == "X":
+                                    status = "disposed" if disposed_X else "not_disposed"
+                                    fulfilled = 1 if disposed_X else 0
+                                elif prop == "Y":
+                                    status = "disposed" if disposed_Y else "not_disposed"
+                                    fulfilled = 1 if disposed_Y else 0
+                                else:
+                                    any_disp = disposed_X or disposed_Y
+                                    status = "disposed" if any_disp else "not_disposed"
+                                    fulfilled = 1 if any_disp else 0
+
+                            break  # stop after matching box
+                except Exception as e:
+                    self.get_logger().warn(f"[exec-log] server check failed: {e}")
+
+            # 5) Persist record
+            self.get_logger().info(
+                f"[exec-log] INSERT robot_exec_evals: "
+                f"agent={agent_id}, skill={skill_name}, kind={kind}, "
+                f"box_id={box_id}, prop={prop}, status={status}, "
+                f"detected={detected}, prob={probability}, "
+                f"deadline={deadline}, completed_at={completed_at}, "
+                f"fulfilled={fulfilled}"
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(node_id) DO UPDATE SET
-                box_id                 = excluded.box_id,
-                deadline               = excluded.deadline,
-                x                      = excluded.x,
-                y                      = excluded.y,
-                last_sense_status      = excluded.last_sense_status,
-                last_sense_detected    = excluded.last_sense_detected,
-                last_sense_probability = excluded.last_sense_probability,
-                last_sense_agent       = excluded.last_sense_agent,
-                last_sense_completed_at= excluded.last_sense_completed_at
-            """,
-            (
-                node_id,
-                int(box_id),
-                float(deadline) if deadline is not None else None,
-                float(bx) if bx is not None else None,
-                float(by) if by is not None else None,
-                status,
-                int(1 if contaminated else 0),
-                float(probability),
-                agent_id,
-                float(completed_at) if completed_at is not None else None,
-            ),
-        )
 
-        with self._lock:
-            self._contam_cache[key] = {
-                "ts": now,
-                "contaminated": contaminated,
-                "probability": probability,
-            }
+            self.conn.execute(
+                """
+                INSERT INTO robot_exec_evals(
+                    ts, agent_id, skill, box_id, property,
+                    kind, status, detected, probability,
+                    deadline, completed_at, fulfilled
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    float(ts),
+                    agent_id,
+                    skill_name,
+                    box_id,
+                    prop,
+                    kind,
+                    status,
+                    detected,
+                    probability,
+                    deadline,
+                    completed_at,
+                    fulfilled,
+                ),
+            )
+            self.conn.commit()
+
+        except Exception as e:
+            self.get_logger().warn(f"[exec-log] failed to record skill execution: {e}")
+
+
 
 
     def _sync_box_state_from_server(self, boxes_state: list):
@@ -1988,14 +1608,7 @@ class BrokerNode(Node):
                 pass
             objects.append(f"{name}({', '.join(cols)})")
         samples = {}
-        for name in ("vw_object_sheet","vw_bt_nodes_summary","vw_agent_node_labels","vw_backlog_counts"):
-            try:
-                cur = self.conn.execute(f"SELECT * FROM {name} LIMIT 2")
-                colnames = [d[0] for d in cur.description] if cur.description else []
-                rows = [dict(zip(colnames, r)) for r in cur.fetchall()]
-                samples[name] = rows
-            except Exception:
-                pass
+
         return {"objects": objects, "samples": samples}
 
     def _context_capsule(self, summary_only: bool = True) -> dict:
@@ -2026,76 +1639,6 @@ class BrokerNode(Node):
 
 
 
-    def _ws_id(self) -> str:
-        # one session per trigger time (coarse); override with planner-provided ws later if needed
-        if not self._current_trigger:
-            return "ws-default"
-        t = int(self._current_trigger.get("ts", time.time()) * 1000)
-        return f"ws-{t}"
-
-    def _ws_add(self, ws_id: str, sql: str, rows: List[List]):
-        h = hashlib.sha256(json.dumps({"sql": sql, "rows": rows}, sort_keys=True).encode("utf-8")).hexdigest()
-        ent = self._ws.setdefault(ws_id, {"hashes": set(), "iters": 0})
-        ent["hashes"].add(h)
-
-    def _ws_changed(self, ws_id: str, sql: str, rows: List[List]) -> bool:
-        h = hashlib.sha256(json.dumps({"sql": sql, "rows": rows}, sort_keys=True).encode("utf-8")).hexdigest()
-        ent = self._ws.setdefault(ws_id, {"hashes": set(), "iters": 0})
-        return h not in ent["hashes"]
-
-    def _emit_sql_debug(self, pack: dict):
-        meta = pack.get("sql_meta") or {}
-        dbg = {
-            "sql": meta.get("sql"),
-            "params": meta.get("params"),
-            "ms": meta.get("ms"),
-            "truncated": (pack.get("table") or {}).get("truncated", False),
-            "rationale": pack.get("rationale"),
-            "mode": pack.get("mode")
-        }
-        self.pub_sql_debug.publish(StringMsg(data=json.dumps(dbg)))
-
-    # ---- LLM call (replace with your real endpoint) ----
-    
-    def _build_llm_messages_proactive(self, schema_card: dict, context_capsule: dict) -> list:
-        system = (
-            "You are a SQLite query planner for a mobile robot. "
-            "Return ONE read-only SQL SELECT (no semicolons/DDL/DML/PRAGMA), using only allowed objects (prefer vw_*). "
-            "Keep results compact within the provided budgets. If the trigger hints an object_id, prioritize it. "
-            'Output STRICT JSON: {"sql":"... :named_params ...","params":{...},"purpose":"<=20 words"}'
-        )
-        fewshot_user = {"SchemaCard":{"objects":["vw_object_sheet(...)", "vw_backlog_counts(...)"]},
-                        "ContextCapsule":{"trigger":{"type":"new_object","hints":{"object_id":"CNode12"}}}}
-        fewshot_assistant = {"sql":"SELECT * FROM vw_object_sheet WHERE node_id=:object_id LIMIT 1",
-                             "params":{"object_id":"CNode12"},
-                             "purpose":"object sheet for hinted node"}
-        user = {"SchemaCard": schema_card, "ContextCapsule": context_capsule}
-        return [
-            {"role":"system","content":system},
-            {"role":"user","content":json.dumps(fewshot_user)},
-            {"role":"assistant","content":json.dumps(fewshot_assistant)},
-            {"role":"user","content":json.dumps(user)},
-        ]
-
-    def _build_llm_messages_reactive(self, schema_card: dict, context_capsule: dict,
-                                     planner_needs: dict, already_returned: dict) -> list:
-        system = (
-            "You extend prior facts. Produce ONE read-only SQL SELECT to resolve the most blocking OPEN need. "
-            "Do NOT repeat already returned facts. Use only allowed objects, prefer vw_*, respect budgets. "
-            'Output STRICT JSON: {"sql":"... :named_params ...","params":{...},"purpose":"<=20 words"}'
-        )
-        fewshot_user = {"PlannerNeeds":{"needs":[{"why":"confirm label","focus":"object","object_id":"CNode37"}]}}
-        fewshot_assistant = {"sql":"SELECT * FROM vw_object_sheet WHERE node_id=:object_id LIMIT 1",
-                             "params":{"object_id":"CNode37"},
-                             "purpose":"resolve object label gap"}
-        user = {"SchemaCard": schema_card, "ContextCapsule": context_capsule,
-                "PlannerNeeds": planner_needs or {}, "AlreadyReturned": already_returned or {}}
-        return [
-            {"role":"system","content":system},
-            {"role":"user","content":json.dumps(fewshot_user)},
-            {"role":"assistant","content":json.dumps(fewshot_assistant)},
-            {"role":"user","content":json.dumps(user)},
-        ]
 
 
     def _chat_json(
@@ -2160,21 +1703,20 @@ class BrokerNode(Node):
 
                 content = resp.choices[0].message.content
                 obj = json.loads(content)
-                validate(instance=obj, schema=used_schema)
-
+                
                 self.get_logger().info(
                     f"\n=== LLM RAW RESPONSE ({schema_name}) ===\n{content}\nLatency: {str(dt_ms)}\n"
                 )
+                
+                validate(instance=obj, schema=used_schema)
 
-                # publish perf (using the broker model, not used_model, for now)
-                # If you want per-task metrics, you could add a separate publisher.
-                self._publish_llm_perf(dt_ms, ok=True, phase=perf_phase)
+    
+
                 return obj
 
             except (json.JSONDecodeError, ValidationError) as e:
                 # schema/json error
                 dt_ms = int((time.time() - t0) * 1000)
-                self._publish_llm_perf(dt_ms, ok=False, phase=perf_phase + "_schema")
                 last_exc = e
                 messages = messages + [{
                     "role": "system",
@@ -2184,459 +1726,16 @@ class BrokerNode(Node):
 
             except Exception as e:
                 dt_ms = int((time.time() - t0) * 1000)
-                self._publish_llm_perf(dt_ms, ok=False, phase=perf_phase + "_api")
                 last_exc = e
                 continue
 
         raise ValueError(f"LLM did not return valid JSON ({schema_name}): {last_exc}")
 
 
-    
-
-    def _call_openai_chat(self, messages: list, model: str = "gpt-4o-mini", timeout_s: float = 8.0) -> str:
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY env var not set")
-        url = "https://api.openai.com/v1/chat/completions"
-        payload = {
-            "model": model,
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"},
-            "messages": messages,
-        }
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"]
-        return content
-
-    def _current_ws_summary(self) -> dict:
-        ws_id = self._ws_id()
-        ent = self._ws.get(ws_id, {"hashes": set(), "iters": 0})
-        return {"returned_sets": len(ent["hashes"]), "iters": ent["iters"]}
-
-    def _llm_plan_sql(self, proactive: bool, schema_card: dict, context_capsule: dict,
-                      planner_needs: Optional[dict]) -> tuple[str, dict, str]:
-        if self._llm_mock and "sql" in self._llm_mock:
-            return self._llm_mock["sql"], self._llm_mock.get("params", {}), self._llm_mock.get("purpose", "mock")
-
-        if proactive:
-            msgs = self._build_llm_messages_proactive(schema_card, context_capsule)
-        else:
-            msgs = self._build_llm_messages_reactive(schema_card, context_capsule,
-                                                     planner_needs or {}, self._current_ws_summary())
-        try:
-            obj = self._chat_json(msgs, temperature=0.2, max_tokens=300, retries=1)
-            sql    = (obj.get("sql") or "").strip()
-            params = obj.get("params") or {}
-            purpose= (obj.get("purpose") or "")[:80]
-            if not sql.lower().startswith("select"):
-                raise ValueError("LLM did not return a SELECT")
-            return sql, params, purpose
-
-        except Exception:
-            # NEW: reuse the same fallback for both errors and disabled LLM
-            self.get_logger().info(f"\nERROR BROKER\n")
-            return self._fallback_sql_from_capsule(context_capsule)
+  
 
 
-    # NEW: shared fallback logic used on errors *and* when LLM is disabled
-    def _fallback_sql_from_capsule(self, context_capsule: dict) -> tuple[str, dict, str]:
-        """
-        Produce a default SQL query when the LLM is disabled or fails.
 
-        Prefer a single hinted object, otherwise return a small shortlist.
-        """
-        hints = (context_capsule.get("trigger") or {}).get("hints") or {}
-        oid = hints.get("object_id")
-        if oid:
-            return (
-                "SELECT * FROM vw_object_sheet WHERE node_id=:object_id LIMIT 1",
-                {"object_id": oid},
-                "fallback object sheet"
-            )
-
-        return (
-            "SELECT node_id, best_zone, best_rssi, in_basket, disposed_to "
-            "FROM vw_object_sheet WHERE disposed_to='none' "
-            "ORDER BY best_ts DESC LIMIT 5",
-            {},
-            "fallback shortlist"
-        )
-
-
-    # ---- Turn LLM SQL into facts ----
-    def _llm_sql_to_facts(self, *, proactive: bool, needs: Optional[dict] = None) -> dict:
-        ws_id = self._ws_id()
-        ent = self._ws.setdefault(ws_id, {"hashes": set(), "iters": 0})
-        if not proactive and ent["iters"] >= self.iteration_limit:
-            return {"mode": "reactive", "done": True, "reason": "iteration_limit"}
-
-        schema = self._schema_card()
-        capsule = self._context_capsule()
-
-        # If LLM disabled, directly use fallback SQL
-        if not getattr(self, "llm_enabled", True):
-            sql, params, purpose = self._fallback_sql_from_capsule(capsule)
-            purpose = (purpose + " (llm_disabled)").strip()
-        else:
-            sql, params, purpose = self._llm_plan_sql(
-                proactive=proactive,
-                schema_card=schema,
-                context_capsule=capsule,
-                planner_needs=needs,
-            )
-
-        err = self._validate_sql_readonly(sql)
-        if err:
-            self.get_logger().warn(f"[broker] SQL validation failed ({err}); falling back.")
-            sql, params, purpose = self._fallback_sql_from_capsule(capsule)
-
-        try:
-            cols, rows, truncated, ms = self._exec_sql_safely(
-                sql, params, self.sql_max_rows, self.sql_max_bytes, self.sql_timeout_ms
-            )
-        except sqlite3.Error as e:
-            # Last line of defence: even if validation missed something, don't die.
-            self.get_logger().warn(f"[broker] SQL exec failed ({e}); using fallback.")
-            sql, params, purpose = self._fallback_sql_from_capsule(capsule)
-            cols, rows, truncated, ms = self._exec_sql_safely(
-                sql, params, self.sql_max_rows, self.sql_max_bytes, self.sql_timeout_ms
-            )
-
-        changed = self._ws_changed(ws_id, sql, rows)
-        if changed:
-            self._ws_add(ws_id, sql, rows)
-        if not proactive:
-            ent["iters"] += 1
-
-        pack = {
-            "mode": ("proactive" if proactive else "reactive"),
-            "ws_id": ws_id,
-            "rationale": purpose,
-            "table": {
-                "columns": cols,
-                "rows": rows,
-                "truncated": truncated,
-                "changed": changed,
-            },
-            "sql_meta": {"sql": sql, "params": params, "ms": ms},
-        }
-        return pack
-
-
-    # ------------------------------ Planner needs (reactive loop) ------------------------------
-    def _on_planner_needs(self, msg: StringMsg):
-        # Store last needs (structured or unstructured). We don't trust schemas here; just keep JSON.
-        self.get_logger().info(f"got needs message: {msg}")
-        try:
-            self._last_needs = json.loads(msg.data) if msg.data else {}
-        except Exception:
-            self._last_needs = {"open": [msg.data]}
-        # Optionally: auto-run a reactive turn on needs arrival
-        try:
-        
-            self._publish_context_capsule()
-        
-            pack = self._llm_sql_to_facts(proactive=False, needs=self._last_needs)
-            self.get_logger().info(f"reactive pack: {json.dumps(pack)[:500]}")
-            if pack.get("table"):
-                self.get_logger().info(f"publishing delta: {pack}")
-                self.pub_delta.publish(StringMsg(data=json.dumps(pack)))
-                self._emit_sql_debug(pack)
-        except Exception as e:
-            self.get_logger().warn(f"reactive run failed: {e}")
-
-    # ------------------------------ Services: run_initial / run_more ------------------------------
-    def _srv_run_initial(self, req, res):
-        try:
-        
-            self._publish_context_capsule()
-            pack = self._llm_sql_to_facts(proactive=True)
-            self.pub_facts.publish(StringMsg(data=json.dumps(pack)))
-            self._emit_sql_debug(pack)
-            res.success, res.message = True, "ok"
-        except Exception as e:
-            res.success, res.message = False, str(e)
-        return res
-
-    def _srv_run_more(self, req, res):
-        try:
-            needs = getattr(self, "_last_needs", None)
-            
-            self._publish_context_capsule()
-            
-            pack = self._llm_sql_to_facts(proactive=False, needs=needs)
-            if pack.get("table", {}).get("changed", False):
-                self.pub_delta.publish(StringMsg(data=json.dumps(pack)))
-                self._emit_sql_debug(pack)
-            res.success, res.message = True, "ok"
-        except Exception as e:
-            res.success, res.message = False, str(e)
-        return res
-
-    # ------------------------------ Legacy simple services ------------------------------
-    def _srv_dump_db(self, req, res):
-        res.success = True
-        res.message = self.db_path
-        return res
-
-    def _srv_query_nodes_summary(self, req, res):
-        rows = self.conn.execute("SELECT * FROM vw_bt_nodes_summary").fetchall()
-        cur = self.conn.execute("SELECT * FROM vw_bt_nodes_summary LIMIT 1")
-        colnames = [d[0] for d in cur.description] if cur.description else []
-        cur.close()
-        payload = []
-        for row in rows:
-            obj = {}
-            for i, k in enumerate(colnames):
-                obj[k] = row[i]
-            payload.append(obj)
-        res.success = True
-        res.message = json.dumps(payload)
-        return res
-
-    def _srv_query_agent_labels(self, req, res):
-        rows = self.conn.execute("""
-            SELECT agent_id, node_id, contaminated, probability, updated_ts
-            FROM agent_node_labels
-        """).fetchall()
-        payload = [
-            dict(agent_id=r[0], node_id=r[1], contaminated=bool(r[2]),
-                 probability=float(r[3]), updated_ts=float(r[4]))
-            for r in rows
-        ]
-        res.success = True
-        res.message = json.dumps(payload)
-        return res
-
-    # ------------------------------ TaskState aggregation ------------------------------
-
-    def _compute_task_state(self) -> dict:
-        """
-        Build a compact TaskState snapshot from the DB + agent status + recent events.
-
-        Shape (approx):
-
-          {
-            "ts": ...,
-            "robot": { ... },
-            "agents": { "robot": {...}, "human_a": {...}, "human_b": {...} },
-            "zones": {
-              "A": { "total":..., "pending":..., "in_basket":..., "delivered_clean":..., "delivered_contaminated":..., "progress": ... },
-              "B": {...},
-              "unknown": {...}
-            },
-            "bottlenecks": [...],
-            "robot_objective": "execute:<skill>" or null,
-            "subgoals": { "collect_zone_A": {...}, ... },
-            "time": { "elapsed_sec": ..., "remaining_estimate_sec": null },
-            "bt_summary": {
-              "by_zone": { "A": {...}, "B": {...}, "unknown": {...} },
-              "objects": { "CNode001": {...}, ... }
-            },
-            "high_level_objective": {
-              "kind": "unknown",
-              "note": "planner may override / refine this"
-            }
-          }
-        """
-        now = time.time()
-
-        # --- Agents (robot + humans) from agent_status ---
-        agents: Dict[str, dict] = {}
-        try:
-            rows = self.conn.execute(
-                "SELECT agent_id, zone, x, y, ts FROM agent_status"
-            ).fetchall()
-            for agent_id, zone, x, y, ts_row in rows:
-                agents[agent_id] = {
-                    "zone": zone,
-                    "x": x,
-                    "y": y,
-                    "ts": ts_row,
-                }
-        except Exception as e:
-            self.get_logger().warn(f"[task_state] failed to read agent_status: {e}")
-
-        robot_agent = agents.get("robot", {})
-
-        # --- Zone-level progress from vw_object_sheet ---
-        zones: Dict[str, dict] = {
-            "A": {
-                "total": 0,
-                "pending": 0,
-                "in_basket": 0,
-                "delivered_clean": 0,
-                "delivered_contaminated": 0,
-                "progress": None,
-            },
-            "B": {
-                "total": 0,
-                "pending": 0,
-                "in_basket": 0,
-                "delivered_clean": 0,
-                "delivered_contaminated": 0,
-                "progress": None,
-            },
-            "unknown": {
-                "total": 0,
-                "pending": 0,
-                "in_basket": 0,
-                "delivered_clean": 0,
-                "delivered_contaminated": 0,
-                "progress": None,
-            },
-        }
-
-        try:
-            cur = self.conn.execute(
-                """
-                SELECT
-                  COALESCE(best_zone, current_zone, 'unknown') AS zone,
-                  disposed_to,
-                  in_basket
-                FROM vw_object_sheet
-                """
-            )
-            for zone, disposed_to, in_basket in cur:
-                z = zone if zone in zones else "unknown"
-                st = zones[z]
-                st["total"] += 1
-
-                if disposed_to == "none":
-                    # Still somewhere in the environment
-                    st["pending"] += 1
-                    if in_basket:
-                        st["in_basket"] += 1
-                elif disposed_to == "clean_bin":
-                    st["delivered_clean"] += 1
-                elif disposed_to == "contaminated_bin":
-                    st["delivered_contaminated"] += 1
-        except Exception as e:
-            self.get_logger().warn(f"[task_state] failed to read vw_object_sheet: {e}")
-
-        # Progress fraction per zone
-        for z, st in zones.items():
-            total = st["total"]
-            done = st["delivered_clean"] + st["delivered_contaminated"]
-            st["progress"] = (float(done) / float(total)) if total > 0 else None
-
-        # --- BT summary: by_zone + per-object from vw_object_sheet ---
-        bt_by_zone: Dict[str, dict] = {
-            "A": {"count": 0},
-            "B": {"count": 0},
-            "unknown": {"count": 0},
-        }
-        objects: Dict[str, dict] = {}
-
-        try:
-            cur2 = self.conn.execute(
-                """
-                SELECT
-                  node_id,
-                  in_basket,
-                  disposed_to,
-                  current_rssi,
-                  current_zone,
-                  best_rssi,
-                  best_zone
-                FROM vw_object_sheet
-                """
-            )
-            for (
-                node_id,
-                in_basket,
-                disposed_to,
-                current_rssi,
-                current_zone,
-                best_rssi,
-                best_zone,
-            ) in cur2:
-                zone = best_zone or current_zone or "unknown"
-                if zone not in bt_by_zone:
-                    zone = "unknown"
-                bt_by_zone[zone]["count"] = bt_by_zone[zone].get("count", 0) + 1
-
-                objects[node_id] = {
-                    "zone": zone,
-                    "in_basket": bool(in_basket),
-                    "disposed_to": disposed_to,
-                    "current_rssi": current_rssi,
-                    "best_rssi": best_rssi,
-                }
-        except Exception as e:
-            self.get_logger().warn(f"[task_state] failed to build bt_summary: {e}")
-
-        # --- Bottlenecks (heuristic) ---
-        bottlenecks: List[str] = []
-        for z, st in zones.items():
-            # backlog: lots of pending items and no completed ones
-            if st["pending"] > 0 and (st["delivered_clean"] + st["delivered_contaminated"] == 0):
-                if st["pending"] >= 3:
-                    bottlenecks.append(f"zone_{z}_backlog")
-
-            # "bins" almost full ≈ many in_basket items in this zone
-            if st["in_basket"] >= 5:
-                bottlenecks.append(f"bin_{z}_almost_full")
-
-        # --- Subgoal status per zone ---
-        subgoals: Dict[str, dict] = {}
-        for z, st in zones.items():
-            label = f"collect_zone_{z}"
-            if st["total"] == 0:
-                status = "pending"  # nothing there yet, but conceptually not done
-            elif st["pending"] == 0:
-                status = "done"
-            elif st["pending"] == st["total"]:
-                status = "pending"
-            else:
-                status = "in_progress"
-            subgoals[label] = {
-                "zone": z,
-                "status": status,
-                "progress": st["progress"],
-            }
-
-        # --- Time info ---
-        elapsed = now - self._start_time
-        time_info = {
-            "elapsed_sec": elapsed,
-            "remaining_estimate_sec": None,  # planner can override
-        }
-
-        # --- Robot objective (from skill events) ---
-        robot_objective = self._robot_objective
-
-        task_state = {
-            "ts": now,
-            "robot": robot_agent,
-            "agents": agents,
-            "zones": zones,
-            "bottlenecks": bottlenecks,
-            "robot_objective": robot_objective,
-            "subgoals": subgoals,
-            "time": time_info,
-            "bt_summary": {
-                "by_zone": bt_by_zone,
-                "objects": objects,
-            },
-            "high_level_objective": {
-                "kind": "unknown",
-                "note": "planner may override / refine this",
-            },
-        }
-        return task_state
-
-    def _tick_task_state(self):
-        """
-        Periodic publisher for /task_state.
-        """
-        try:
-            state = self._compute_task_state()
-            self.pub_task_state.publish(StringMsg(data=json.dumps(state)))
-        except Exception as e:
-            self.get_logger().warn(f"[task_state] tick failed: {e}")
 
 
     def _optimizer_tick(self):
@@ -2646,6 +1745,12 @@ class BrokerNode(Node):
         If the world state fingerprint changed since last tick, recompute plan.
         """
         if self._optimizer_running or not self.optimizer_enabled:
+            return
+
+
+        # NEW: don't replan while a human–robot mediation is underway
+        if self._mediation_in_progress():
+            self.get_logger().info("[optimizer] mediation in progress; skipping replanning")
             return
 
         try:
@@ -2666,6 +1771,8 @@ class BrokerNode(Node):
             boxes_state = r_state.json()   # list[BoxState-like dicts]
             time_resp   = r_time.json()    # {"server_time": float}
             current_time = float(time_resp.get("server_time", 0.0))
+            self._last_server_time = current_time
+
 
         except Exception as e:
             self.get_logger().warn(f"[optimizer] failed to contact box server: {e}")
@@ -2682,6 +1789,11 @@ class BrokerNode(Node):
                         "box_id": b.get("box_id"),
                         "x": b.get("x"),
                         "y": b.get("y"),
+                        
+                        "sense_time_X": b.get("sense_time_X"),
+                        "sense_time_Y": b.get("sense_time_Y"),
+                        "dispose_time_X": b.get("dispose_time_X"),
+                        "dispose_time_Y": b.get("dispose_time_Y"),
 
                         # sensing + disposal state
                         # (we keep sense_results as-is so new completed senses
@@ -2735,6 +1847,10 @@ class BrokerNode(Node):
             # 2) build optimizer inputs
             agents = self._build_agents_for_optimizer()
             boxes, box_positions = self._build_boxes_for_optimizer(boxes_state)
+            self._last_boxes_state = boxes_state
+            self._last_boxes_for_optimizer = boxes
+            self._last_box_positions = box_positions
+            
             if not agents or not boxes:
                 self.get_logger().info(
                     "[optimizer] no agents or boxes available; skipping"
@@ -2744,28 +1860,7 @@ class BrokerNode(Node):
             horizon = self.optimizer_horizon_sec
             agent_positions = self._snapshot_agent_positions()
 
-            def travel_time_fn(agent_id: str, box_id: int) -> float:
-                ax, ay = agent_positions.get(agent_id, (None, None))
-                bx, by = box_positions.get(box_id, (None, None))
-                if ax is None or ay is None or bx is None or by is None:
-                    return 0.0
-
-                dx = ax - bx
-                dy = ay - by
-                dist = (dx * dx + dy * dy) ** 0.5
-
-                if agent_id == "robot":
-                    speed = self.optimizer_speed_robot
-                elif agent_id == "human_a":
-                    speed = self.optimizer_speed_human_a
-                elif agent_id == "human_b":
-                    speed = self.optimizer_speed_human_b
-                else:
-                    speed = 1.0
-
-                if speed <= 0.0:
-                    return 0.0
-                return dist / speed
+            travel_time_fn = self._make_travel_time_fn(agent_positions, box_positions)
 
             # 3) run Gurobi
             plan = plan_assignments_gurobi(
@@ -2869,6 +1964,41 @@ class BrokerNode(Node):
             self.get_logger().warn(f"[optimizer] failed to read agent_status: {e}")
         return positions
 
+    def _make_travel_time_fn(
+        self,
+        agent_positions: Dict[str, Tuple[float, float]],
+        box_positions: Dict[int, Tuple[float, float]],
+    ):
+        """
+        Build a travel_time_fn(agent_id, box_id) closure using the latest
+        agent_positions and box_positions plus the configured per-agent speeds.
+        """
+        def travel_time_fn(agent_id: str, box_id: int) -> float:
+            ax, ay = agent_positions.get(agent_id, (None, None))
+            bx, by = box_positions.get(box_id, (None, None))
+            if ax is None or ay is None or bx is None or by is None:
+                return 0.0
+
+            dx = ax - bx
+            dy = ay - by
+            dist = (dx * dx + dy * dy) ** 0.5
+
+            if agent_id == "robot":
+                speed = self.optimizer_speed_robot
+            elif agent_id == "human_a":
+                speed = self.optimizer_speed_human_a
+            elif agent_id == "human_b":
+                speed = self.optimizer_speed_human_b
+            else:
+                speed = 1.0
+
+            if speed <= 0.0:
+                return 0.0
+            return dist / speed
+
+        return travel_time_fn
+
+
     def _build_boxes_for_optimizer(
         self,
         boxes_state: list,
@@ -2895,12 +2025,17 @@ class BrokerNode(Node):
             y = float(b.get("y", 0.0))
             positions[box_id] = (x, y)
 
-            # If your /boxes/state does NOT yet include these,
-            # you can fall back to constants or broker params.
-            sense_time_X = float(b.get("sense_time_X", 3.0))
-            sense_time_Y = float(b.get("sense_time_Y", 3.0))
-            dispose_time_X = float(b.get("dispose_time_X", 4.0))
-            dispose_time_Y = float(b.get("dispose_time_Y", 4.0))
+            # Per-box durations are now supplied by /boxes/state
+            try:
+                sense_time_X = float(b["sense_time_X"])
+                sense_time_Y = float(b["sense_time_Y"])
+                dispose_time_X = float(b["dispose_time_X"])
+                dispose_time_Y = float(b["dispose_time_Y"])
+            except KeyError as e:
+                self.get_logger().warn(
+                    f"[optimizer] missing duration field {e} in box {box_id}; skipping"
+                )
+                continue
 
             disposed_X = bool(b.get("disposed_X", False))
             disposed_Y = bool(b.get("disposed_Y", False))
@@ -3017,7 +2152,7 @@ class BrokerNode(Node):
 
             # Map box_id -> node_id + location
             nodes_block = {
-                f"CNode{int(box_id)}": {
+                f"{int(box_id)}": {
                     "box_id": int(box_id),
                     "x": float(pos[0]),
                     "y": float(pos[1]),

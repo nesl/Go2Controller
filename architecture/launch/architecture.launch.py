@@ -54,16 +54,16 @@ def generate_launch_description():
                 'skills_composite_path': SKILLS_COMPOSITE_PATH,
             }]
         ),
-        Node(
-            package='architecture',
-            executable='hdt2_node',   # adjust if your console_script name differs
-            name='hdt2_node',
-            output='screen',
-            parameters=[{
-                'llm_enabled': True,
-                'model': 'gpt-5-mini',
-            }]
-        ),
+        #Node(
+        #    package='architecture',
+        #    executable='hdt2_node',   # adjust if your console_script name differs
+        #    name='hdt2_node',
+        #    output='screen',
+        #    parameters=[{
+        #        'llm_enabled': True,
+        #        'model': 'gpt-5-mini',
+        #    }]
+        #),
         Node(
             package='architecture',
             executable='taskstatemonitor_node',
@@ -85,18 +85,18 @@ def generate_launch_description():
                 'skills_composite_path': SKILLS_COMPOSITE_PATH,
             }]
         ),
-        Node(
-            package='architecture',
-            executable='coordinator_node',
-            name='coordinator_node',
-            output='screen',
-            parameters=[{
-                'llm_enabled': True,
-                'model': 'gpt-5-nano',
-                'skills_base_path': os.path.join(pkg_share, 'config', 'skills.yaml'),
-                'skills_composite_path': SKILLS_COMPOSITE_PATH,
-            }]
-        ),
+        #Node(
+        #    package='architecture',
+        #    executable='coordinator_node',
+        #    name='coordinator_node',
+        #    output='screen',
+        #    parameters=[{
+        #        'llm_enabled': True,
+        #        'model': 'gpt-5-nano',
+        #        'skills_base_path': os.path.join(pkg_share, 'config', 'skills.yaml'),
+        #        'skills_composite_path': SKILLS_COMPOSITE_PATH,
+        #    }]
+        #),
 
         # The following nodes are temporarily disabled.
         # If you want them back, remove the '#' on each line

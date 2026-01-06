@@ -694,6 +694,7 @@ class CocoDetectorNode(Node):
         def fmt(val, pattern):
             return pattern.format(val) if val is not None else "n/a"
 
+        '''
         self.get_logger().info(
             "[perf] EMA fps={fps} | det={det}ms | pose={pose}ms | total={total}ms | frames={frames}".format(
                 fps   = fmt(self.fps_ema, "{:.2f}"),
@@ -703,6 +704,7 @@ class CocoDetectorNode(Node):
                 frames=self.count_frames,
             )
         )
+        '''
 
 
 def main():

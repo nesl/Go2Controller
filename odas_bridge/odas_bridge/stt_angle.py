@@ -1283,7 +1283,7 @@ class STTFasterWhisperNode(Node):
                 #max_nsp <= self.wg_max_no_speech
             #)
 
-            self.get_logger().info(f"BEFORE!!! {avg_lp} {max_nsp} {text} {is_speech}")            
+            #self.get_logger().info(f"BEFORE!!! {avg_lp} {max_nsp} {text} {is_speech}")            
 
             if is_speech:
 

@@ -355,12 +355,18 @@ class InteractionLoopNode(Node):
     def _box_node_id_from_box_id(self, box_id: int) -> str:
         """
         Map optimizer box_id -> world node_id used by box.* skills.
-        Assumes naming like 'CNode<box_id>'.
+
+        Naming convention:
+          box_id = 7   -> 'CNode107'
+          box_id = 23  -> 'CNode123'
+
+        Pattern: 'CNode1##' where ## is zero-padded box_id.
         """
         try:
-            return f"CNode{int(box_id)}"
-        except Exception:
+            return f"CNode1{int(box_id):02d}"
+        except (TypeError, ValueError):
             return ""
+
 
     def _on_optimizer_plan(self, msg: StringMsg):
         """
@@ -469,6 +475,9 @@ class InteractionLoopNode(Node):
                     yaw = float(yaw_val) if yaw_val is not None else 0.0
                 except (TypeError, ValueError):
                     x = y = yaw = None
+                    self.get_logger().warn(
+                        f"[interaction_loop] error parsing pose {node_entry}"
+                    )
 
         skills_list: List[Dict[str, Any]] = []
 
