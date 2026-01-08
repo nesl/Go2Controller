@@ -95,6 +95,7 @@ class MediationInteractionContext:
     recent_utterances: List[MediationTurn] = field(default_factory=list)
     robot_role_description: Optional[str] = None  # short sentence: "Bob is a cooperative teammate..."
     session_notes: Optional[str] = None
+    human_profiles: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -111,7 +112,7 @@ class MediationLLMConfig:
     temperature: float = 0.3
     max_turns: int = 4
     llm_call: Optional[Callable[[List[dict]], Dict[str, Any]]] = None
-
+    include_baseline_proposer: bool = True
 
 @dataclass
 class MediationState:
@@ -124,11 +125,11 @@ class MediationState:
     objective: MediationObjectiveMetrics
     social: MediationSocialContext
     interaction: MediationInteractionContext
-
+    prefix_plan: Optional[Plan] = None
     status: Decision = "pending"
     turns: List[MediationTurn] = field(default_factory=list)
     turns_used: int = 0
-
+    baseline_provenance: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
 class PlanMediator:
     """
@@ -204,10 +205,34 @@ class PlanMediator:
         raw = self.config.llm_call(messages)
 
         # Interpret LLM response
-        decision: Decision = raw.get("decision", "pending")
         planner_action = raw.get("planner_action") or {}
         robot_utt = (raw.get("robot_utterance") or "").strip()
         log_tags = raw.get("log_tags") or {}
+        kind_raw = (planner_action.get("kind") or "").strip()
+        decision_raw = (raw.get("decision") or "").strip()
+
+        # --- Normalize decision ---
+        # Allowed canonical decisions
+        canonical_decisions = {"pending", "accept", "reject"}
+        # Planner action kinds that imply "accept" if used as decision
+        kind_values = {
+            "keep_baseline",
+            "adopt_candidate",
+            "merge_plans",
+            "request_new_plan",
+        }
+
+        if decision_raw in canonical_decisions:
+            decision: Decision = decision_raw  # type: ignore[assignment]
+        elif decision_raw in kind_values:
+            # e.g. decision="merge_plans" → treat as accept
+            decision = "accept"
+        elif not decision_raw and kind_raw in kind_values:
+            # If model forgets 'decision' but sets a kind, also treat as accept
+            decision = "accept"
+        else:
+            # Fallback: stay in the conversation
+            decision = "pending"
 
         # Append robot turn to dialogue history (if any)
         if robot_utt:
@@ -229,48 +254,235 @@ class PlanMediator:
 
     # ---- Internal helpers -----------------------------------------------
 
-    def _build_messages_for_llm(self, state: MediationState) -> List[Dict[str, Any]]:
+    def _build_planning_view(self, state: MediationState) -> Dict[str, Any]:
         """
-        Build a compact prompt exposing:
-          - baseline vs candidate plans (summarized),
-          - objective metrics,
-          - social / interaction context,
-          - recent dialogue history.
+        Build a structured view for the LLM:
+          - baseline_human_agreed_actions
+          - baseline_optimizer_suggestions
+          - human_proposed_changes
+          - optimizer_suggestions_for_changes
         """
-        # Summarize plans as short, inspectable structures suited for a prompt.
-        baseline_summary = self._summarize_plan(state.baseline_plan)
-        candidate_summary = self._summarize_plan(state.candidate_plan)
+        baseline = self._summarize_plan(state.baseline_plan)
+        candidate = self._summarize_candidate_with_sources(
+            state.candidate_plan,
+            state.prefix_plan,
+        )
+        provenance = state.baseline_provenance or {}
 
-        # Prepare a compact dialogue transcript (last N turns)
-        transcript = [
-            {"role": t.role, "text": t.text, "meta": t.meta}
-            for t in state.turns[-8:]
-        ]
+        # --- Split baseline into human vs optimizer origins ---
+        baseline_human_agreed = {}
+        baseline_opt_suggestions = {}
+        include_proposer = getattr(self.config, "include_baseline_proposer", True)
 
+        for aid, actions in (baseline or {}).items():
+            prov_actions = provenance.get(aid) or []
+            # (box, prop, kind) -> full provenance dict
+            origin_map = {
+                (int(p["box_id"]), p["property"], p["kind"]): p
+                for p in prov_actions
+                if "box_id" in p and "property" in p and "kind" in p
+            }
+
+            human_list = []
+            opt_list = []
+            for a in actions:
+                key = (int(a["box_id"]), a["property"], a["kind"])
+                pinfo = origin_map.get(key) or {}
+                origin = pinfo.get("origin", "optimizer")
+                proposed_by = pinfo.get("proposed_by")
+
+                if origin == "human":
+                    if include_proposer and proposed_by:
+                        a_with_meta = dict(a)
+                        a_with_meta["original_proposer"] = proposed_by
+                        human_list.append(a_with_meta)
+                    else:
+                        human_list.append(a)
+                else:
+                    opt_list.append(a)
+
+            if human_list:
+                baseline_human_agreed[aid] = human_list
+            if opt_list:
+                baseline_opt_suggestions[aid] = opt_list
+
+        # --- Human-proposed changes in this session (from prefix_plan) ---
+        human_proposed_changes = self._summarize_plan(state.prefix_plan or {})
+
+        # --- Optimizer suggestions tied to those changes ---
+        optimizer_suggestions_for_changes = {}
+        for aid, actions in (candidate or {}).items():
+            sugg = [
+                a for a in actions
+                if a.get("source") == "optimizer_completion"
+            ]
+            if sugg:
+                optimizer_suggestions_for_changes[aid] = sugg
+
+
+        planning_view = {
+            "baseline_human_agreed_actions": baseline_human_agreed,
+            "baseline_optimizer_suggestions": baseline_opt_suggestions,
+            "human_proposed_changes": human_proposed_changes,
+            "optimizer_suggestions_for_changes": optimizer_suggestions_for_changes,
+        }
+        
+        proposer = state.social.proposer_id
+
+        # --- NEW: detect conflicts ONLY w.r.t. human-agreed actions ---
+        conflicts = self._detect_human_conflicts(
+            planning_view=planning_view,
+            proposer_id=proposer,
+        )
+        if conflicts:
+            planning_view["direct_conflicts_with_other_human"] = conflicts
+
+        return planning_view
+
+
+    def _detect_human_conflicts(
+        self,
+        planning_view: Dict[str, Any],
+        proposer_id: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Detect conflicts where the current proposer's changes for the ROBOT
+        contradict past HUMAN-AGREED robot actions proposed by a *different* human.
+
+        For now:
+          - same agent: 'robot'
+          - same property: X or Y
+          - different box_id
+        """
+        conflicts: List[Dict[str, Any]] = []
+
+        baseline_human = planning_view.get("baseline_human_agreed_actions") or {}
+        human_changes = planning_view.get("human_proposed_changes") or {}
+
+        baseline_robot = baseline_human.get("robot") or []
+        change_robot = human_changes.get("robot") or []
+
+        for change in change_robot:
+            c_box = change.get("box_id")
+            c_prop = change.get("property")
+            if c_box is None or c_prop not in ("X", "Y"):
+                continue
+
+            for base in baseline_robot:
+                b_box = base.get("box_id")
+                b_prop = base.get("property")
+                orig = base.get("original_proposer")
+
+                # Only conflicts with human-origin actions from *other* humans
+                if not orig or orig == proposer_id:
+                    continue
+
+                # Heuristic: same property, different box → they want the robot
+                # to use its limited capacity differently.
+                if b_prop == c_prop and b_box != c_box:
+                    conflicts.append(
+                        {
+                            "previous_action": base,
+                            "new_action": change,
+                            "previous_proposer": orig,
+                            "current_proposer": proposer_id,
+                        }
+                    )
+
+        return conflicts
+
+
+    def build_messages_for_autoresolve(
+        self,
+        state: MediationState,
+        reason: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Build messages for a timeout-based auto-resolve.
+        Intentionally almost identical to _build_messages_for_llm, with ONLY:
+          - phase forced to "autoresolve"
+          - negotiation_suffix replaced with a finalize-now suffix
+          - payload includes autoresolve_reason
+        """
+        planning_view = self._build_planning_view(state)
+
+        # Recent dialogue (same)
+        source_turns = state.interaction.recent_utterances or []
+        N = 12
+        tail = source_turns[-N:] if N and N > 0 else source_turns
+        transcript = []
+        for idx, t in enumerate(tail):
+            ts_val = None
+            try:
+                if isinstance(t.meta, dict):
+                    ts_val = t.meta.get("ts")
+            except Exception:
+                ts_val = None
+            transcript.append(
+                {
+                    "role": t.role,
+                    "text": t.text,
+                    "ts": ts_val,
+                    "is_last": (idx == len(tail) - 1),
+                }
+            )
+
+        # --- DIFF #1: phase is forced ---
+        phase = "autoresolve"
+
+        # --- DIFF #2: negotiation suffix becomes finalize suffix ---
+        finalize_suffix = (
+            "\n- AUTO-RESOLVE mode: humans did not respond in time.\n"
+            "- You MUST end this step with decision=\"accept\" or decision=\"reject\" (NOT pending).\n"
+            "- Prefer a compromise: if there is a direct conflict, choose a middle-ground plan "
+            "or a minimal safe merge that reduces conflict.\n"
+            "- If unsure, keep_baseline.\n"
+        )
+
+        # System prompt: identical body + only this suffix change
         system_msg = {
             "role": "system",
             "content": (
                 "You are Bob's planning mediator in a mixed human-robot team.\n"
-                "- You see an OPTIMIZER baseline plan, a CANDIDATE plan proposed by a human or LLM,\n"
-                "  and objective metrics about both. You also see recent dialogue and social context.\n"
-                "- Your job is to decide whether Bob should ACCEPT, REJECT, or CONTINUE NEGOTIATING\n"
-                "  about the candidate plan, and to propose what Bob should SAY in one short utterance.\n"
-                "- Bob's goals are:\n"
-                "    1) Keep the team safe and task-effective (use objective metrics!),\n"
-                "    2) Maintain good collaboration and trust with humans,\n"
-                "    3) Avoid endless arguing; be decisive when needed.\n"
-                "- If the context (objective_metrics.notes or interaction.session_notes) indicates that some\n"
-                "  requested actions are impossible (deadline already passed, or action already fulfilled),\n"
-                "  you MUST explicitly mention this to the humans and briefly say which actions cannot\n"
-                "  be executed and why.\n"
-                "- Be concise, cooperative, and honest about trade-offs.\n"
+                "- You receive a planning view with four groups:\n"
+                "  - baseline_human_agreed_actions = tasks previously proposed by humans and already adopted\n"
+                "  - baseline_optimizer_suggestions = tasks the optimizer added earlier (not explicitly agreed)\n"
+                "  - human_proposed_changes = new tasks requested by the CURRENT proposer\n"
+                "  - optimizer_suggestions_for_changes = extra optimizer tasks supporting those changes (suggestions only)\n"
+                "- Treat human_proposed_changes as explicit wishes of the proposer.\n"
+                "- Treat both optimizer_* groups as robot suggestions that still require human agreement.\n"
+                "- Social conflict ONLY applies to changes that contradict baseline_human_agreed_actions "
+                "(especially where another human originally proposed them). Edits that only affect "
+                "optimizer_suggestions are NOT social conflict.\n"
+                "- When building planner_action.candidate_plan_delta you are NOT limited to only the latest human change.\n"
+                "  You may:\n"
+                "    - adopt the human_proposed_changes exactly, OR\n"
+                "    - keep the baseline plan unchanged, OR\n"
+                "    - combine human_proposed_changes with some optimizer_* suggestions so that humans and the robot\n"
+                "      cover more useful boxes (e.g., the human senses their requested box while the robot takes an\n"
+                "      optimizer-suggested box).\n"
+                "- Prefer such combined plans when they clearly improve safety/coverage/balance according to "
+                "objective_metrics (e.g., better deadlines, less imbalance) and do NOT create new social conflict.\n"
+                "- candidate_plan_delta should reflect the full recommended plan after this step (for all relevant agents), "
+                "not just the single last human request.\n"
+                "\n"
+                "- Use objective_metrics to modulate how assertive you are:\n"
+                "    - If deadline_risk is medium/high or suboptimality_pct is large, be more willing to suggest extra\n"
+                "      optimizer tasks that improve safety, while still framing them as options for humans.\n"
+                "    - If metrics look already good and there is no urgency, prefer minimal changes and lighter suggestions.\n"
+                "\n"
+                "- Never speak as if suggested tasks are already agreed; use wording like "
+                "\"If you agree, one option is…\".\n"
+                "- If notes indicate impossible actions (expired, already fulfilled), explicitly mention them.\n"
+                f"{finalize_suffix}"
             ),
         }
 
+        # User payload: identical + only reason field
         user_payload = {
-            "session_id": state.session_id,
-            "baseline_plan": baseline_summary,
-            "candidate_plan": candidate_summary,
+            "planning_view": planning_view,
+            "phase": phase,
+            "autoresolve_reason": reason,  # --- DIFF #3 ---
             "objective_metrics": state.objective.__dict__,
             "social_context": state.social.__dict__,
             "interaction_context": {
@@ -278,6 +490,7 @@ class PlanMediator:
                 "robot_role_description": state.interaction.robot_role_description,
                 "session_notes": state.interaction.session_notes,
                 "recent_dialogue": transcript,
+                "human_profiles": state.interaction.human_profiles or {},
             },
         }
 
@@ -301,13 +514,162 @@ class PlanMediator:
             ),
         }
 
-        # Add payload as a second user message to keep structure clean
         user_payload_msg = {
             "role": "user",
             "content": self._to_json_str(user_payload),
         }
 
         return [system_msg, user_msg, user_payload_msg]
+
+
+    def _build_messages_for_llm(self, state: MediationState) -> List[Dict[str, Any]]:
+        # Build planning view
+        planning_view = self._build_planning_view(state)
+
+        # Recent dialogue as before (with ts + is_last)
+        source_turns = state.interaction.recent_utterances or []
+        N = 12
+        tail = source_turns[-N:] if N and N > 0 else source_turns
+        transcript = []
+        for idx, t in enumerate(tail):
+            ts_val = None
+            try:
+                if isinstance(t.meta, dict):
+                    ts_val = t.meta.get("ts")
+            except Exception:
+                ts_val = None
+            transcript.append(
+                {
+                    "role": t.role,
+                    "text": t.text,
+                    "ts": ts_val,
+                    "is_last": (idx == len(tail) - 1),
+                }
+            )
+
+        phase = "initial" if state.turns_used == 0 else "negotiation"
+
+        negotiation_suffix = ""
+        if phase == "negotiation":
+            negotiation_suffix = (
+                "\n- Ongoing negotiation mode: prefer decision=\"pending\" when humans disagree "
+                "or when changes affect another human’s agreed actions. In pending mode, acknowledge "
+                "both preferences, mention the key trade-off, and invite them to confirm a shared choice. "
+                "Use ACCEPT only when there is clear consensus; use REJECT only for unsafe or impossible actions.\n"
+
+            )
+
+
+        '''
+        system_msg = {
+            "role": "system",
+            "content": (
+                "You are Bob's planning mediator in a mixed human-robot team.\n"
+                "- You receive a planning view with four groups:\n"
+                "  - baseline_human_agreed_actions = tasks previously proposed by humans and already adopted\n"
+                "  - baseline_optimizer_suggestions = tasks the optimizer added earlier (not explicitly agreed)\n"
+                "  - human_proposed_changes = new tasks requested by the CURRENT proposer\n"
+                "  - optimizer_suggestions_for_changes = extra optimizer tasks supporting those changes (suggestions only)\n"
+                "- Treat human_proposed_changes as explicit wishes of the proposer.\n"
+                "- Treat both optimizer_* groups as robot suggestions that still require human agreement.\n"
+                "- Social conflict ONLY applies to changes that contradict baseline_human_agreed_actions "
+                "(especially where another human originally proposed them). Edits that only affect "
+                "optimizer_suggestions are NOT social conflict.\n"
+                "- If direct_conflicts_with_other_human is present, prefer CONTINUE NEGOTIATING and prompt for consensus, "
+                "rather than immediately accepting one side.\n"
+                "- Your output decides: ACCEPT | REJECT | PENDING, and provides one short utterance Bob will say.\n"
+                "- Never speak as if suggested tasks are already agreed; use wording like "
+                "\"If you agree, one option is…\".\n"
+                "- If notes indicate impossible actions (expired, already fulfilled), explicitly mention them.\n"
+                f"{negotiation_suffix}"
+            ),
+        }
+        '''
+        system_msg = {
+            "role": "system",
+            "content": (
+                "You are Bob's planning mediator in a mixed human-robot team.\n"
+                "- You receive a planning view with four groups:\n"
+                "  - baseline_human_agreed_actions = tasks previously proposed by humans and already adopted\n"
+                "  - baseline_optimizer_suggestions = tasks the optimizer added earlier (not explicitly agreed)\n"
+                "  - human_proposed_changes = new tasks requested by the CURRENT proposer\n"
+                "  - optimizer_suggestions_for_changes = extra optimizer tasks supporting those changes (suggestions only)\n"
+                "- Treat human_proposed_changes as explicit wishes of the proposer.\n"
+                "- Treat both optimizer_* groups as robot suggestions that still require human agreement.\n"
+                "- Social conflict ONLY applies to changes that contradict baseline_human_agreed_actions "
+                "(especially where another human originally proposed them). Edits that only affect "
+                "optimizer_suggestions are NOT social conflict.\n"
+                "- If direct_conflicts_with_other_human is present, prefer CONTINUE NEGOTIATING and prompt for consensus, "
+                "rather than immediately accepting one side.\n"
+                "\n"
+                "- When building planner_action.candidate_plan_delta you are NOT limited to only the latest human change.\n"
+                "  You may:\n"
+                "    - adopt the human_proposed_changes exactly, OR\n"
+                "    - keep the baseline plan unchanged, OR\n"
+                "    - combine human_proposed_changes with some optimizer_* suggestions so that humans and the robot\n"
+                "      cover more useful boxes (e.g., the human senses their requested box while the robot takes an\n"
+                "      optimizer-suggested box).\n"
+                "- Prefer such combined plans when they clearly improve safety/coverage/balance according to "
+                "objective_metrics (e.g., better deadlines, less imbalance) and do NOT create new social conflict.\n"
+                "- candidate_plan_delta should reflect the full recommended plan after this step (for all relevant agents), "
+                "not just the single last human request.\n"
+                "\n"
+                "- Use objective_metrics to modulate how assertive you are:\n"
+                "    - If deadline_risk is medium/high or suboptimality_pct is large, be more willing to suggest extra\n"
+                "      optimizer tasks that improve safety, while still framing them as options for humans.\n"
+                "    - If metrics look already good and there is no urgency, prefer minimal changes and lighter suggestions.\n"
+                "\n"
+                "- Your output decides: ACCEPT | REJECT | PENDING, and provides one short utterance Bob will say.\n"
+                "- Never speak as if suggested tasks are already agreed; use wording like "
+                "\"If you agree, one option is…\".\n"
+                "- If notes indicate impossible actions (expired, already fulfilled), explicitly mention them.\n"
+                f"{negotiation_suffix}"
+            ),
+        }
+
+
+
+        user_payload = {
+            "planning_view": planning_view,
+            "phase": phase,
+            "objective_metrics": state.objective.__dict__,
+            "social_context": state.social.__dict__,
+            "interaction_context": {
+                "event_summary": state.interaction.event_summary,
+                "robot_role_description": state.interaction.robot_role_description,
+                "session_notes": state.interaction.session_notes,
+                "recent_dialogue": transcript,
+                "human_profiles": state.interaction.human_profiles or {},
+            },
+        }
+
+        user_msg = {
+            "role": "user",
+            "content": (
+                "Here is the current mediation context.\n"
+                "Return STRICT JSON with keys:\n"
+                '{\n'
+                '  "decision": "pending | accept | reject",\n'
+                '  "planner_action": {\n'
+                '    "kind": "keep_baseline | adopt_candidate | merge_plans | request_new_plan",\n'
+                '    "candidate_plan_delta": { ... optional ... }\n'
+                '  },\n'
+                '  "robot_utterance": "one short sentence Bob will say to the team",\n'
+                '  "log_tags": {\n'
+                '    "strategy": "persuade | concede | negotiate | assert | other",\n'
+                '    "rationale": "very short explanation (<= 1 sentence)"\n'
+                '  }\n'
+                '}\n'
+            ),
+        }
+
+        user_payload_msg = {
+            "role": "user",
+            "content": self._to_json_str(user_payload),
+        }
+
+        return [system_msg, user_msg, user_payload_msg]
+
 
     def _summarize_plan(self, plan: Plan) -> Dict[str, Any]:
         """
@@ -326,6 +688,46 @@ class PlanMediator:
                 )
             summary[aid] = out_actions
         return summary
+
+    def _summarize_candidate_with_sources(
+        self,
+        candidate: Plan,
+        prefix: Optional[Plan],
+    ) -> Dict[str, Any]:
+        """
+        Summarize the candidate plan, tagging each action with a 'source':
+          - 'human_prefix' if it was in the original prefix_plan
+          - 'optimizer_completion' otherwise
+        """
+        summary: Dict[str, Any] = {}
+
+        # Build a set of (agent_id, (box_id, prop, kind)) for prefix actions
+        prefix_set = set()
+        if prefix:
+            for aid, actions in (prefix or {}).items():
+                for tup in actions:
+                    # tup is (box_id, prop, kind)
+                    prefix_set.add((aid, tup))
+
+        for aid, actions in (candidate or {}).items():
+            out_actions = []
+            for (box_id, prop, kind) in actions:
+                source = "optimizer_completion"
+                if (aid, (box_id, prop, kind)) in prefix_set:
+                    source = "human_prefix"
+
+                out_actions.append(
+                    {
+                        "box_id": int(box_id),
+                        "property": prop,
+                        "kind": kind,
+                        "source": source,  # NEW
+                    }
+                )
+            summary[aid] = out_actions
+
+        return summary
+
 
     def _apply_candidate_delta(self, current: Plan, delta: Dict[str, Any]) -> Plan:
         """

@@ -67,6 +67,17 @@ LLM_SQL_SCHEMA = {
     "additionalProperties": False,
 }
 
+CHAT_REPLY_SCHEMA = {
+    "type": "object",
+    "required": ["robot_utterance", "should_reply"],
+    "properties": {
+        "robot_utterance": {"type": "string"},
+        "should_reply": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
+
+
 
 EVENT_SUMMARY_SCHEMA = {
     "type": "object",
@@ -156,7 +167,7 @@ class BrokerNode(Node, BrokerMediationMixin):
         # Optional: mock LLM for offline dev (pass JSON {"sql": "...", "params": {...}, "purpose": "..."} in param)
         self.declare_parameter('llm_mock_json', '')
         
-        self.declare_parameter("model", "gpt-5-nano")
+        self.declare_parameter("model", "gpt-4.1-mini")
 
         self.model = self.get_parameter("model").get_parameter_value().string_value
 
@@ -322,8 +333,15 @@ class BrokerNode(Node, BrokerMediationMixin):
         self._ws = {}                               # ws_id -> {"hashes": set(), "iters": int}
 
         self._init_mediation_tts()
+        # in BrokerNode.__init__ after self._init_mediation_tts()
+        self._mediation_watchdog_timer = self.create_timer(0.5, self._mediation_watchdog_tick)
+
 
         self._last_published_summary_fp = None
+
+        # In BrokerMediationMixin.__init__ or some init method:
+        self._profile_msg_counts = {}          # human_id -> int
+        self.profile_reflection_every = 5     # e.g. every 10 utterances per human
 
 
         # NEW: robot objective & timing for task state
@@ -639,6 +657,9 @@ class BrokerNode(Node, BrokerMediationMixin):
         ts   = float(o.get("ts") or time.time())
         zone = o.get("zone")  # NEW: top-level zone from EventLayer
         
+        # --- NEW: log human utterances from speech_final_any events ---
+        self._log_human_utterance_from_basic_event(rule, data, ts)
+        
         # compact trace entry with json_text support
         trace_entry = {
             "rule": rule,
@@ -747,15 +768,99 @@ class BrokerNode(Node, BrokerMediationMixin):
         except Exception as e:
             self.get_logger().debug(f"robot_objective update failed: {e}")
 
-        # --- NEW: handle LLM multi-agent speech plans ---
+        # --- LLM multi-agent speech plans (COMMANDS ONLY) ---
         try:
             d = trace_entry.get("data") or {}
             # We stored the request id under "request_id" in the trace
             req_id = d.get("request_id", "")
+
+            # Only consider events that are responses from llm_speech_to_multiagent_plan
             if isinstance(req_id, str) and req_id.startswith("llm_speech_to_multiagent_plan:"):
+                # The classifier / planner output is in d["json"] or d["json_text"]
+                plan_json = d.get("json")
+                if not isinstance(plan_json, dict):
+                    json_text = d.get("json_text")
+                    if isinstance(json_text, str) and json_text.strip():
+                        try:
+                            plan_json = json.loads(json_text)
+                        except Exception:
+                            plan_json = None
+
+                # If we can't parse JSON, bail
+                if not isinstance(plan_json, dict):
+                    self.get_logger().warn(
+                        "[broker] llm_speech plan hook: missing or invalid JSON; skipping"
+                    )
+                    return
+
+                # We only care about is_command here
+                is_command = bool(plan_json.get("is_command"))
+
+                # Non-command utterances should NOT start a new mediation session here.
+                # They are handled via _maybe_route_speech_to_mediation on speech_final_any,
+                # and during the race window they should just be ignored in this hook.
+                if not is_command:
+                    # Non-command utterances:
+                    #   - do NOT start a new mediation session
+                    #   - may trigger a chatty/explanatory reply from Bob if appropriate
+                    utterance = (
+                        (d.get("request_text") or "")
+                        or (plan_json.get("natural_summary") or "")
+                    )
+                    speaker_id = d.get("speaker_id") or "unknown"
+
+                    self.get_logger().info(
+                        "[broker] llm_speech plan is_command=False; "
+                        "skipping _handle_llm_speech_plan, maybe chatting back."
+                    )
+
+                    try:
+                        self._maybe_chat_reply_to_utterance(
+                            utterance=utterance,
+                            speaker_id=speaker_id,
+                            plan_json=plan_json,
+                            ts=ts,
+                        )
+                    except Exception as e:
+                        self.get_logger().warn(f"[chat] chat reply handler failed: {e}")
+
+                    return
+
+                # COMMAND path: delegate to the BrokerMediationMixin handler
                 self._handle_llm_speech_plan(trace_entry, ts)
+
         except Exception as e:
             self.get_logger().warn(f"broker: error in LLM plan hook: {e}")
+
+
+    def _log_human_utterance_from_basic_event(
+        self,
+        rule: str,
+        data: dict,
+        default_ts: float,
+    ):
+        if not rule.startswith("speech_final_any"):
+            return
+
+        text = (data.get("text") or "").strip()
+        if not text:
+            text = (data.get("utterance") or "").strip()
+
+        if not text:
+            return
+
+        speaker_id = data.get("speaker_id") or "unknown"
+        ts = float(data.get("ts") or default_ts or time.time())
+
+        # 1) Log in global chat history (mixin)
+        self._append_chat_turn(speaker_id, text, ts)
+
+        # 2) Let the mixin handle per-human reflection counters
+        try:
+            self._on_human_utterance_for_profile_reflection(speaker_id, ts)
+        except Exception as e:
+            self.get_logger().warn(f"[profiles] periodic reflection hook failed: {e}")
+
 
 
     def _on_comp_event(self, msg: StringMsg):
@@ -850,6 +955,9 @@ class BrokerNode(Node, BrokerMediationMixin):
         if zone is not None:
             self._current_trigger["zone"] = zone  # optional but handy
 
+        # --- NEW: idle trigger forces optimization + plan publish ---
+        if rid == "trigger_idle":
+            self._trigger_optimizer_once(reason="trigger_idle", ts=ts)
 
 
 
@@ -1518,6 +1626,181 @@ class BrokerNode(Node, BrokerMediationMixin):
             return None
 
 
+    def _maybe_chat_reply_to_utterance(
+        self,
+        utterance: str,
+        speaker_id: str,
+        plan_json: Optional[dict],
+        ts: float,
+    ) -> None:
+        """
+        If LLM chat is enabled, no mediation is in progress, and the utterance
+        looks like it's directed at the robot, call a small LLM to craft a
+        natural-language reply using:
+          - current box state (from box server or last cached)
+          - current multi-agent plan (self._last_plan)
+          - optional running event summary
+
+        The LLM returns JSON { "robot_utterance": str, "should_reply": bool }.
+        If should_reply is true and robot_utterance is non-empty, we TTS it
+        via _robot_say.
+        """
+
+        if self._mediation_in_progress():
+            # Don't do casual chat during a plan mediation.
+            return
+
+        utterance = (utterance or "").strip()
+        if not utterance:
+            return
+
+
+        # 2) Get box state context (prefer last cached; fall back to fresh /boxes/state).
+        boxes_state = getattr(self, "_last_boxes_state", None)
+        if boxes_state is None:
+            try:
+                base = self.optimizer_base_url.rstrip("/")
+                url_state = base + "/boxes/state"
+                r_state = requests.get(url_state, timeout=self.req_timeout)
+                if r_state.status_code == 200:
+                    boxes_state = r_state.json()
+            except Exception as e:
+                self.get_logger().warn(f"[chat] failed to pull /boxes/state for context: {e}")
+                boxes_state = None
+
+        # Compact world state for the prompt (avoid dumping everything).
+        simple_boxes: List[dict] = []
+        if isinstance(boxes_state, list):
+            for b in boxes_state[:20]:  # cap at 20 boxes for prompt size
+                try:
+                    simple_boxes.append(
+                        {
+                            "box_id": b.get("box_id"),
+                            "x": b.get("x"),
+                            "y": b.get("y"),
+                            "deadline": b.get("deadline"),
+                            "disposed_X": bool(b.get("disposed_X", False)),
+                            "disposed_Y": bool(b.get("disposed_Y", False)),
+                        }
+                    )
+                except Exception:
+                    continue
+
+        # 3) Split current plan into:
+        #    - agreed_plan: actions originally proposed by humans/robot
+        #    - optimizer_suggestions: actions added by the optimizer
+        current_plan: Plan = getattr(self, "_last_plan", {}) or {}
+        prov = getattr(self, "_last_plan_provenance", {}) or {}
+
+        agreed_plan: dict = {}
+        optimizer_suggestions: dict = {}
+
+        for aid, actions in current_plan.items():
+            agreed_plan[aid] = []
+            optimizer_suggestions[aid] = []
+
+            for (box_id, prop, kind) in actions:
+                origin = "optimizer"
+
+                # Look up provenance if available
+                for meta in prov.get(aid, []):
+                    if (
+                        int(meta.get("box_id", -1)) == int(box_id)
+                        and meta.get("property") == prop
+                        and meta.get("kind") == kind
+                    ):
+                        origin = meta.get("origin", origin) or origin
+                        break
+
+                entry = {
+                    "box_id": int(box_id),
+                    "property": prop,
+                    "kind": kind,
+                }
+
+                if origin in ("human", "robot"):
+                    agreed_plan[aid].append(entry)
+                else:
+                    optimizer_suggestions[aid].append(entry)
+
+
+        # 4) Running event summary if available.
+        with self._event_summary_lock:
+            summary_text = self._event_summary_text
+
+        recent_chat = self._get_recent_chat_turns(limit=8)
+
+        # 5) Build payload for the LLM.
+        context_payload = {
+            "ts": ts,
+            "speaker_id": speaker_id,
+            "utterance": utterance,
+            "recent_conversation": recent_chat,
+            "world_state": {
+                "boxes": simple_boxes,
+            },
+            "plan_view": {
+                "agreed_plan": agreed_plan,
+                "optimizer_suggestions": optimizer_suggestions,
+            },
+            "event_summary": summary_text,
+        }
+
+        system_msg = {
+            "role": "system",
+            "content": (
+                "You are Bob, a helpful mobile robot collaborating with humans to sense and "
+                "dispose dangerous boxes (X/Y).\n"
+                "- You see world_state and plan_view = {agreed_plan, optimizer_suggestions}.\n"
+                "- agreed_plan: actions that humans (or you earlier) proposed and everyone has agreed on.\n"
+                "- optimizer_suggestions: extra actions currently suggested by the optimizer, not yet agreed.\n"
+                "- In THIS MODULE you only explain; you cannot change the plan or promise changes.\n"
+                "- When humans ask what you/others will do, describe the agreed_plan; you may mention\n"
+                "  optimizer_suggestions as additional options.\n"
+                "- If they ask you to change the plan, acknowledge the request, restate agreed_plan, and say that\n"
+                "  changes must go through the planning/mediation step.\n"
+                "- Never claim you will add/drop/change actions that are not in agreed_plan.\n"
+                "- Keep answers 1–2 short sentences. No emojis.\n"
+                "- If the utterance is clearly not for you, set should_reply=false and use an empty robot_utterance.\n"
+            ),
+        }
+
+
+        user_msg = {
+            "role": "user",
+            "content": (
+                "Here is the current context and the latest human utterance. "
+                "Return STRICT JSON of the form:\n"
+                '{ "robot_utterance": "...", "should_reply": true/false }.\n\n'
+                f"{json.dumps(context_payload, ensure_ascii=False)}"
+            ),
+        }
+
+        try:
+            obj = self._chat_json(
+                messages=[system_msg, user_msg],
+                temperature=0.4,
+                max_tokens=80,
+                retries=1,
+                schema=CHAT_REPLY_SCHEMA,
+                schema_name="BrokerChatReply",
+                model=self.model,          # or a dedicated chat model param if you add one
+                perf_phase="chat_reply",
+            )
+        except Exception as e:
+            self.get_logger().warn(f"[chat] LLM chat reply failed: {e}")
+            return
+
+        robot_utt = (obj.get("robot_utterance") or "").strip()
+        should_reply = bool(obj.get("should_reply"))
+
+        if should_reply and robot_utt:
+            self.get_logger().info(f"[chat] Bob replies to {speaker_id}: {robot_utt}")
+            try:
+                self._robot_say(robot_utt)
+            except Exception as e:
+                self.get_logger().warn(f"[chat] failed to publish TTS reply: {e}")
+
 
     # ------------------------------ LLM SQL layer ------------------------------
     # Strict validators
@@ -1662,7 +1945,7 @@ class BrokerNode(Node, BrokerMediationMixin):
         """
         last_exc = None
         used_schema = schema or LLM_SQL_SCHEMA
-        used_model = model or self.model
+        used_model = self.model #model or self.model
 
         for attempt in range(retries + 1):
             t0 = time.time()
@@ -1878,6 +2161,58 @@ class BrokerNode(Node, BrokerMediationMixin):
             self.get_logger().warn(f"[optimizer] optimization failed: {e}")
         finally:
             self._optimizer_running = False
+
+
+    def _trigger_optimizer_once(self, reason: str, ts: float):
+        """
+        Force a single optimizer run ASAP, independent of fingerprint changes.
+        Uses the same background thread as _optimizer_tick().
+        """
+        if self._optimizer_running or not self.optimizer_enabled:
+            return
+
+        if self._mediation_in_progress():
+            self.get_logger().info(f"[optimizer] {reason}: mediation in progress; skip")
+            return
+
+        # Simple cooldown to avoid repeated trigger_idle spam
+        cooldown = 2.0  # seconds (tune)
+        last = getattr(self, "_last_idle_opt_ts", None)
+        if last is not None and (ts - float(last)) < cooldown:
+            return
+        self._last_idle_opt_ts = float(ts)
+
+        try:
+            base = self.optimizer_base_url.rstrip("/")
+            url_state = base + "/boxes/state"
+            url_time  = base + "/time"
+
+            r_state = requests.get(url_state, timeout=self.req_timeout)
+            r_time  = requests.get(url_time, timeout=self.req_timeout)
+
+            if r_state.status_code != 200 or r_time.status_code != 200:
+                self.get_logger().warn(
+                    f"[optimizer] {reason}: box server unavailable: "
+                    f"state={r_state.status_code}, time={r_time.status_code}"
+                )
+                return
+
+            boxes_state = r_state.json()
+            time_resp   = r_time.json()
+            current_time = float(time_resp.get("server_time", 0.0))
+            self._last_server_time = current_time
+
+        except Exception as e:
+            self.get_logger().warn(f"[optimizer] {reason}: failed to contact box server: {e}")
+            return
+
+        self.get_logger().info(f"[optimizer] {reason}: forcing optimizer run")
+        self._optimizer_running = True
+        threading.Thread(
+            target=self._run_optimizer_thread,
+            args=(boxes_state, current_time),
+            daemon=True,
+        ).start()
 
 
     def _build_agents_for_optimizer(self) -> List[AgentState]:

@@ -23,19 +23,19 @@ def generate_launch_description():
     use_llm_speech_check = LaunchConfiguration('use_llm_speech_check', default='true')
 
     # NEW: Coverage toggle + params
-    use_coverage     = LaunchConfiguration('use_coverage', default='true')
-    coverage_spacing_m = LaunchConfiguration('coverage_spacing_m', default='1.0')
-    coverage_visited_radius_m = LaunchConfiguration('coverage_visited_radius_m', default='0.6')
-    coverage_dwell_sec = LaunchConfiguration('coverage_dwell_sec', default='3.0')
-    coverage_persist_path = LaunchConfiguration('coverage_persist_path', default='/tmp/coverage_wait_visited.json')
+    use_coverage     = LaunchConfiguration('use_coverage')
+    coverage_spacing_m = LaunchConfiguration('coverage_spacing_m')
+    coverage_visited_radius_m = LaunchConfiguration('coverage_visited_radius_m')
+    coverage_dwell_sec = LaunchConfiguration('coverage_dwell_sec')
+    coverage_persist_path = LaunchConfiguration('coverage_persist_path')
 
 
-    llm_speech_model       = LaunchConfiguration('llm_speech_model',       default='gpt-5-mini')
+    llm_speech_model       = LaunchConfiguration('llm_speech_model')
 
     # I/O topics
-    cam_img      = LaunchConfiguration('cam_img',      default='/camera/image_raw')
-    cam_info     = LaunchConfiguration('cam_info',     default='/camera/camera_info')
-    cloud_topic  = LaunchConfiguration('cloud_topic',  default='/point_cloud2')
+    cam_img      = LaunchConfiguration('cam_img')
+    cam_info     = LaunchConfiguration('cam_info')
+    cloud_topic  = LaunchConfiguration('cloud_topic')
 
     return LaunchDescription([
         # ---- Declare args
@@ -53,7 +53,7 @@ def generate_launch_description():
         DeclareLaunchArgument('cam_info',       default_value='/camera/camera_info'),
         DeclareLaunchArgument('cloud_topic',    default_value='/point_cloud2'),
         DeclareLaunchArgument('eleven_api_key', default_value=EnvironmentVariable('ELEVEN_API_KEY', default_value='')),
-        DeclareLaunchArgument('llm_speech_model',       default_value='gpt-5-mini'),
+        DeclareLaunchArgument('llm_speech_model',       default_value='gpt-4.1-mini'),
         DeclareLaunchArgument('use_coverage', default_value='true'),
         DeclareLaunchArgument('coverage_spacing_m', default_value='1.0'),
         DeclareLaunchArgument('coverage_visited_radius_m', default_value='0.6'),

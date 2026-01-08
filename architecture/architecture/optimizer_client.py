@@ -204,6 +204,23 @@ class PlanConstraintMetrics:
     num_unknown_boxes: int
 
 
+@dataclass
+class PlanParseIssue:
+    """
+    Diagnostics for a single step in the LLM 'agents_plan'.
+
+    Fields:
+      agent_id: which agent this step was for ("robot", "human_a", ...)
+      step_index: index in that agent's list (0-based)
+      raw_step: the original dict from agents_plan[agent_id][step_index]
+      problem: human-readable string explaining what's missing/invalid
+    """
+    agent_id: str
+    step_index: int
+    raw_step: Any
+    problem: str
+
+
 # ---------------------------------------------------------------------------
 # Main planner
 # ---------------------------------------------------------------------------
@@ -543,7 +560,8 @@ def plan_assignments_gurobi(
 def build_plan_from_llm_agents_plan(
     agents_plan: dict,
     allowed_agents: Optional[List[str]] = None,
-) -> Plan:
+    collect_issues: bool = False,
+) -> Plan | Tuple[Plan, List[PlanParseIssue]]:
     """
     Convert an LLM 'agents_plan' JSON object into an optimizer-style plan:
 
@@ -556,44 +574,128 @@ def build_plan_from_llm_agents_plan(
     - agents_plan is expected to match the schema in the speech rule.
     - If allowed_agents is provided, only those agent_ids are included
       (e.g., ["robot"] for robot-only overrides).
-    - Steps without a valid box_id/property/kind are ignored.
+    - Steps without a valid box_id/property/kind are ignored, but if
+      collect_issues=True we also return a list of PlanParseIssue to
+      explain what was missing/invalid for each dropped step.
+
+    Returns:
+      If collect_issues is False (default):
+        Plan
+      If collect_issues is True:
+        (Plan, List[PlanParseIssue])
     """
     if not isinstance(agents_plan, dict):
-        return {}
+        return ({}, [] if collect_issues else {})
 
     if allowed_agents is None:
         allowed_agents = ["robot", "human_a", "human_b"]
 
     plan: Plan = {}
+    issues: List[PlanParseIssue] = []
 
     for aid in allowed_agents:
         steps = agents_plan.get(aid) or []
         if not isinstance(steps, list):
+            if collect_issues:
+                issues.append(
+                    PlanParseIssue(
+                        agent_id=aid,
+                        step_index=-1,
+                        raw_step=steps,
+                        problem="steps list is not a valid list",
+                    )
+                )
             continue
 
-        for step in steps:
+        for idx, step in enumerate(steps):
             if not isinstance(step, dict):
+                if collect_issues:
+                    issues.append(
+                        PlanParseIssue(
+                            agent_id=aid,
+                            step_index=idx,
+                            raw_step=step,
+                            problem="step is not a JSON object",
+                        )
+                    )
                 continue
 
             box_id = step.get("box_id")
             prop = step.get("property")
             kind = step.get("kind")
 
-            if prop not in ("X", "Y"):
-                continue
-            if kind not in ("sense", "dispose"):
-                continue
+            problems: List[str] = []
+
             if box_id is None:
+                problems.append("missing box_id")
+            if prop not in ("X", "Y"):
+                problems.append("property must be 'X' or 'Y'")
+            if kind not in ("sense", "dispose"):
+                problems.append("kind must be 'sense' or 'dispose'")
+
+            # If any problems, record issue and skip
+            if problems:
+                if collect_issues:
+                    issues.append(
+                        PlanParseIssue(
+                            agent_id=aid,
+                            step_index=idx,
+                            raw_step=step,
+                            problem=", ".join(problems),
+                        )
+                    )
                 continue
 
+            # Validate box_id is an int
             try:
                 box_id_int = int(box_id)
             except Exception:
+                if collect_issues:
+                    issues.append(
+                        PlanParseIssue(
+                            agent_id=aid,
+                            step_index=idx,
+                            raw_step=step,
+                            problem=f"box_id '{box_id}' is not an integer",
+                        )
+                    )
                 continue
 
             plan.setdefault(aid, []).append((box_id_int, prop, kind))
 
+    if collect_issues:
+        return plan, issues
     return plan
+
+
+def summarize_plan_parse_issues(issues: List[PlanParseIssue]) -> str:
+    """
+    Turn a list of PlanParseIssue into a short natural-language summary
+    the robot can say to the humans.
+    """
+    if not issues:
+        return ""
+
+    by_agent: Dict[str, List[PlanParseIssue]] = {}
+    for iss in issues:
+        by_agent.setdefault(iss.agent_id, []).append(iss)
+
+    parts: List[str] = []
+    for agent_id, agent_issues in by_agent.items():
+        if agent_id == "robot":
+            who = "my actions"
+        elif agent_id.startswith("human_"):
+            who = f"{agent_id.replace('_', ' ')}'s actions"
+        else:
+            who = f"{agent_id}'s actions"
+
+        problems = []
+        for iss in agent_issues:
+            problems.append(f"step {iss.step_index + 1}: {iss.problem}")
+        problems_text = "; ".join(problems)
+        parts.append(f"For {who}, I couldn't use some steps ({problems_text})")
+
+    return "I couldn't fully understand your plan. " + " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -834,10 +936,6 @@ def evaluate_plan_constraints(
     horizon: float,
     weights: PlannerWeights,
 ) -> PlanConstraintMetrics:
-    """
-    Evaluate constraint-related diagnostics for a given plan (no MILP solve).
-    Uses weights.info_threshold_for_dispose for the info constraint.
-    """
     box_by_id = {b.box_id: b for b in boxes}
 
     total_actions = 0
@@ -855,11 +953,29 @@ def evaluate_plan_constraints(
                 num_unknown += 1
                 continue
 
+            # --- SENSE ---
             if kind == "sense":
                 num_sense += 1
+
+                # Use the SAME feasibility notion as plan_assignments_gurobi
+                if prop == "X":
+                    base_time = b.sense_time_X
+                else:
+                    base_time = b.sense_time_Y
+
+                travel = travel_time_fn(aid, box_id)
+                total_t = base_time + travel
+                finish_time = current_time + total_t
+
+                # Count as a deadline/horizon violation if it wouldn't fit
+                if total_t > horizon or (
+                    b.deadline is not None and finish_time > b.deadline
+                ):
+                    num_deadline_viol += 1
+
                 continue
 
-            # kind == "dispose"
+            # --- DISPOSE ---
             num_disp += 1
 
             info = b.info_X if prop == "X" else b.info_Y
@@ -871,7 +987,9 @@ def evaluate_plan_constraints(
             total_t = base_time + travel
             finish_time = current_time + total_t
 
-            if total_t > horizon or (b.deadline is not None and finish_time > b.deadline):
+            if total_t > horizon or (
+                b.deadline is not None and finish_time > b.deadline
+            ):
                 num_deadline_viol += 1
 
     return PlanConstraintMetrics(

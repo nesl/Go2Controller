@@ -26,6 +26,7 @@ from action_msgs.msg import GoalStatus
 from tf2_ros import Buffer, TransformListener
 from go2_interfaces.msg import WebRtcReq
 import requests
+from nav2_msgs.srv import GetCostmap
 
 
 from dataclasses import dataclass, field
@@ -1366,6 +1367,16 @@ class SkillsAgent(Node):
         self._load_skills_initial()
 
 
+        # Nav snapping (goal projection onto nearest free cell)
+        self.declare_parameter("nav_snap_enable", True)
+        self.declare_parameter("nav_snap_radius_m", 0.8)          # search radius
+        self.declare_parameter("nav_snap_cost_threshold", 65)     # <= is acceptable (0 free, higher = closer to obstacles)
+        self.declare_parameter("nav_snap_use_local_costmap", True)
+        self.declare_parameter("nav_snap_costmap_timeout_s", 0.25)
+
+        self._local_costmap_cli = self.create_client(GetCostmap, "/local_costmap/get_costmap")
+        self._global_costmap_cli = self.create_client(GetCostmap, "/global_costmap/get_costmap")
+
 
         # ── Planning & Execution APIs ─────────────────────────────────────────
         # Topics:
@@ -1407,6 +1418,148 @@ class SkillsAgent(Node):
 
         # call engine.tick() ~10–20 Hz, lightweight
         self.create_timer(0.05, self._tick_engine)
+
+    def _get_costmap(self, use_local: bool, timeout_s: float):
+        cli = self._local_costmap_cli if use_local else self._global_costmap_cli
+        if not cli.service_is_ready():
+            if not cli.wait_for_service(timeout_sec=float(timeout_s)):
+                return None
+
+        req = GetCostmap.Request()
+        fut = cli.call_async(req)
+        # Small blocking wait is ok here (your skill tick is already periodic)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=float(timeout_s))
+        if not fut.done():
+            return None
+        try:
+            return fut.result().map
+        except Exception:
+            return None
+
+
+
+    def _snap_goal_to_free_costmap_cell(
+        self,
+        x: float,
+        y: float,
+        *,
+        use_local: bool,
+        radius_m: float,
+        cost_threshold: int,
+        timeout_s: float,
+    ):
+        """
+        Return (snapped_x, snapped_y, info_dict) or (None, None, info_dict) if not found.
+
+        cost_threshold: accept cells with cost <= threshold.
+          Typical Nav2 costs:
+            0 = free, 255 = unknown, 254 = lethal
+            253/252 often represent inflated/inscribed zones depending on plugins.
+        """
+        info = {
+            "used_costmap": "local" if use_local else "global",
+            "radius_m": float(radius_m),
+            "cost_threshold": int(cost_threshold),
+            "snapped": False,
+            "reason": "",
+        }
+
+        cm = self._get_costmap(use_local=use_local, timeout_s=timeout_s)
+        if cm is None:
+            info["reason"] = "costmap_unavailable"
+            return None, None, info
+
+        meta = cm.metadata
+        res = float(meta.resolution)
+        ox = float(meta.origin.position.x)
+        oy = float(meta.origin.position.y)
+        sx = int(meta.size_x)
+        sy = int(meta.size_y)
+        data = list(cm.data)  # uint8 array
+
+        def world_to_map(wx, wy):
+            mx = int((wx - ox) / res)
+            my = int((wy - oy) / res)
+            return mx, my
+
+        def map_to_world(mx, my):
+            wx = ox + (mx + 0.5) * res
+            wy = oy + (my + 0.5) * res
+            return wx, wy
+
+        def in_bounds(mx, my):
+            return 0 <= mx < sx and 0 <= my < sy
+
+        def cost_at(mx, my):
+            return int(data[my * sx + mx])
+
+        mx0, my0 = world_to_map(float(x), float(y))
+        if not in_bounds(mx0, my0):
+            info["reason"] = "target_out_of_costmap_bounds"
+            return None, None, info
+
+        c0 = cost_at(mx0, my0)
+        info["target_cost"] = c0
+
+        # If already acceptable, no snapping needed
+        if c0 != 255 and c0 < 254 and c0 <= int(cost_threshold):
+            info["snapped"] = False
+            info["reason"] = "target_already_free_enough"
+            return float(x), float(y), info
+
+        # Search outward in grid cells
+        max_r_cells = max(1, int(float(radius_m) / res))
+        best = None  # (dist2, mx, my, cost)
+
+        for r in range(1, max_r_cells + 1):
+            # iterate a square ring around (mx0,my0)
+            for dx in range(-r, r + 1):
+                for dy in (-r, r):
+                    mx = mx0 + dx
+                    my = my0 + dy
+                    if not in_bounds(mx, my):
+                        continue
+                    c = cost_at(mx, my)
+                    if c == 255 or c >= 254:   # unknown/lethal
+                        continue
+                    if c > int(cost_threshold):
+                        continue
+                    dist2 = (dx * dx + dy * dy)
+                    if best is None or dist2 < best[0]:
+                        best = (dist2, mx, my, c)
+
+            for dy in range(-r + 1, r):
+                for dx in (-r, r):
+                    mx = mx0 + dx
+                    my = my0 + dy
+                    if not in_bounds(mx, my):
+                        continue
+                    c = cost_at(mx, my)
+                    if c == 255 or c >= 254:
+                        continue
+                    if c > int(cost_threshold):
+                        continue
+                    dist2 = (dx * dx + dy * dy)
+                    if best is None or dist2 < best[0]:
+                        best = (dist2, mx, my, c)
+
+            if best is not None:
+                break
+
+        if best is None:
+            info["reason"] = "no_free_cell_found_within_radius"
+            return None, None, info
+
+        _, mx_best, my_best, c_best = best
+        sxw, syw = map_to_world(mx_best, my_best)
+
+        info["snapped"] = True
+        info["snapped_cost"] = int(c_best)
+        info["snapped_cell"] = [int(mx_best), int(my_best)]
+        info["snapped_xy"] = [float(sxw), float(syw)]
+        info["reason"] = "snapped_to_nearest_free_cell"
+        return float(sxw), float(syw), info
+
 
     def _srv_cancel_all(self, req, resp):
         """
@@ -2629,56 +2782,131 @@ class SkillsAgent(Node):
             # return a handle that completes when the chained timers finish
             return self._move_relative_handle(float(azimuth_deg), float(dist_m))
 
-        def move_absolute(frame: str, x: float, y: float, yaw: float):
+        def move_absolute(frame: str, x: float, y: float, yaw: float, ctx: dict = None):
             h = StepHandle()
+            if ctx is None:
+                ctx = {}
 
             if not self.nav_client.wait_for_server(timeout_sec=0.5):
                 self.say("Navigation is not available.")
+                h.outcome = "error"
                 h.mark_done()
                 return h
 
+            frame = str(frame or "map")
+            x = float(x); y = float(y); yaw = float(yaw)
+
+            # ---- snap-to-free-cell behavior ----
+            snap_enable = bool(self.get_parameter("nav_snap_enable").value)
+            use_local   = bool(self.get_parameter("nav_snap_use_local_costmap").value)
+            radius_m    = float(self.get_parameter("nav_snap_radius_m").value)
+            thr         = int(self.get_parameter("nav_snap_cost_threshold").value)
+            cm_timeout  = float(self.get_parameter("nav_snap_costmap_timeout_s").value)
+
+            nav_info = {"requested": {"frame": frame, "x": x, "y": y, "yaw": yaw}}
+
+            sx, sy = x, y
+            if snap_enable and frame == "map":
+                snapped_x, snapped_y, info = self._snap_goal_to_free_costmap_cell(
+                    x, y,
+                    use_local=use_local,
+                    radius_m=radius_m,
+                    cost_threshold=thr,
+                    timeout_s=cm_timeout,
+                )
+                nav_info["snap"] = info
+
+                if snapped_x is None or snapped_y is None:
+                    # Couldn’t find a safe alternative; fail gracefully
+                    self.get_logger().warn(f"[move_absolute] snap failed: {info}")
+                    self.say("That location is blocked.")
+                    h.outcome = "error"
+                    h.mark_done()
+                    ctx["nav"] = nav_info
+                    return h
+
+                sx, sy = snapped_x, snapped_y
+
+                if info.get("snapped", False):
+                    self.get_logger().info(f"[move_absolute] snapped goal ({x:.2f},{y:.2f}) -> ({sx:.2f},{sy:.2f})")
+                    # Optional voice line (can remove if you want it silent)
+                    # self.say("Goal is blocked. Moving to the closest reachable spot.")
+
+            nav_info["final_goal"] = {"frame": frame, "x": sx, "y": sy, "yaw": yaw}
+            ctx["nav"] = nav_info
+
+            # ---- send nav2 goal ----
             goal = NavigateToPose.Goal()
             ps = PoseStamped()
-            ps.header.frame_id = str(frame)
+            ps.header.frame_id = frame
             ps.header.stamp = self.get_clock().now().to_msg()
-            ps.pose.position.x = float(x)
-            ps.pose.position.y = float(y)
+            ps.pose.position.x = float(sx)
+            ps.pose.position.y = float(sy)
             ps.pose.orientation = yaw_to_q(float(yaw))
             goal.pose = ps
 
+            canceled = {"v": False}
+            goal_handle_box = {"gh": None}
+
+            def _cancel():
+                canceled["v"] = True
+                try:
+                    gh = goal_handle_box["gh"]
+                    if gh is not None:
+                        gh.cancel_goal_async()
+                except Exception:
+                    pass
+                finally:
+                    h.outcome = "timeout"  # or "canceled" if you prefer
+                    h.mark_done()
+
+            h._cancel = _cancel
+
             def _goal_done(fut):
+                if canceled["v"]:
+                    return
                 try:
                     goal_handle = fut.result()
                 except Exception as e:
                     self.get_logger().error(f"Nav goal error: {e}")
                     self.say("Navigation failed.")
+                    h.outcome = "error"
                     h.mark_done()
                     return
 
                 if not goal_handle or not goal_handle.accepted:
                     self.say("Navigation goal was rejected.")
+                    h.outcome = "error"
                     h.mark_done()
                     return
 
+                goal_handle_box["gh"] = goal_handle
+
                 def _result_done(res_fut):
+                    if canceled["v"]:
+                        return
                     try:
                         res = res_fut.result()
                     except Exception as e:
                         self.get_logger().error(f"Nav result error: {e}")
                         self.say("Navigation failed.")
+                        h.outcome = "error"
                         h.mark_done()
                         return
 
                     if getattr(res, "status", 0) == GoalStatus.STATUS_SUCCEEDED:
-                        self.say("Arrived at the destination.")
+                        self.say("Arrived.")
+                        h.outcome = "ok"
                     else:
                         self.say("Navigation failed.")
+                        h.outcome = "error"
                     h.mark_done()
 
                 goal_handle.get_result_async().add_done_callback(_result_done)
 
             self.nav_client.send_goal_async(goal).add_done_callback(_goal_done)
             return h
+
 
 
         def query_beacons(top_n: int, ctx: dict):
