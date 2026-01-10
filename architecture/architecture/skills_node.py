@@ -34,1196 +34,15 @@ import time
 
 from typing import Tuple
 
-@dataclass
-class SkillInstance:
-    name: str
-    ctx: dict
-    started_ms: int
-    activated: bool = False
-    done: bool = False
-
-    # State-machine specific fields
-    state_id: Optional[str] = None      # logical state id (string)
-    state_idx: int = 0                  # index in states[]
-    state_started_ms: int = 0           # when we entered this state (ms)
-
-    # Active primitive handle for action states
-    handle: "StepHandle" | None = None
-    is_root: bool = True
-    
-    
-# ───────────────────────────────────────────────────────────────────────────────
-#                          Number → words helpers (TTS)
-# ───────────────────────────────────────────────────────────────────────────────
-# Integer-only token (standalone, not part of a decimal)
-_INT_TOKEN_RE = re.compile(r'(?<![\w.])(-?\d+)(?![\w.])')
-
-# Decimal token: captures "-12.34", "0.56", ".75", etc.
-_DECIMAL_RE = re.compile(r'(?<![\w])(-?\d*\.\d+)(?![\w])')
-
-# CNode pattern
-_CNODE_RE = re.compile(r'\bCNode(\d+)\b', re.IGNORECASE)
-
-def _num_to_words(n: int) -> str:
-    """
-    Convert small-ish integers to words. For large values, just return the digits
-    so we don't blow up on indexing.
-    """
-    # Hard guard to avoid gigantic indices / unexpected values
-    if abs(n) > 999:
-        return str(n)
-
-    nums0_19 = [
-        "zero", "one", "two", "three", "four", "five", "six", "seven",
-        "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
-        "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
-    ]
-    tens = [
-        "", "", "twenty", "thirty", "forty", "fifty",
-        "sixty", "seventy", "eighty", "ninety",
-    ]
-
-    neg = n < 0
-    n = abs(n)
-    parts: list[str] = []
-
-    if n >= 100:
-        parts.append(nums0_19[n // 100])
-        parts.append("hundred")
-        n %= 100
-        if n:
-            parts.append("and")
-
-    if n >= 20:
-        parts.append(tens[n // 10])
-        if n % 10:
-            parts.append(nums0_19[n % 10])
-    elif n > 0 or not parts:
-        parts.append(nums0_19[n])
-
-    spoken = " ".join(parts)
-    return f"minus {spoken}" if neg else spoken
-
-
-def _fraction_to_words(frac_str: str) -> str:
-    """
-    Fractional part after the decimal point.
-    Choose **digit-by-digit** or **full number** style.
-    """
-
-    # DIGIT-BY-DIGIT STYLE (recommended)
-    # "23" -> "two three"
-    digit_words = {
-        "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
-        "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine"
-    }
-    spoken = " ".join(digit_words[d] for d in frac_str)
-    return spoken
-
-    # FULL NUMBER STYLE (the one you asked for: "1.23" -> "one point twenty three")
-    # return _num_to_words(int(frac_str))
-
-
-def _normalize_tts_text(text: str) -> str:
-    """
-    Safe TTS normalizer:
-      - CNode### → spoken if ID <= 999
-      - Integers → spoken if |n| <= 999
-      - Decimals → fully spoken: "1.23" → "one point two three"
-      - Large numbers left untouched
-    """
-
-    # 1) CNode### (before decimal/integer replacement)
-    def repl_cnode(m: re.Match) -> str:
-        nid_str = m.group(1)
-        try:
-            nid = int(nid_str)
-        except:
-            return m.group(0)
-        if abs(nid) > 999:
-            return f"node {nid_str}"
-        return f"node {_num_to_words(nid)}"
-
-    out = _CNODE_RE.sub(repl_cnode, text)
-
-    # 2) Decimals: handle BEFORE integer replacement
-    def repl_decimal(m: re.Match) -> str:
-        s = m.group(0)       # e.g. "-12.34"
-        negative = s.startswith("-")
-        if negative:
-            s2 = s[1:]       # strip sign for processing
-        else:
-            s2 = s
-
-        if "." not in s2:
-            return s  # shouldn't happen due to regex
-
-        whole_str, frac_str = s2.split(".", 1)
-
-        # numeric safety: only speak if not crazy huge
-        if whole_str.isdigit() and abs(int(whole_str)) > 999:
-            return s  # keep as digits
-
-        # whole part (if empty, treat ".5" as "zero")
-        whole_val = int(whole_str) if whole_str else 0
-        whole_spoken = _num_to_words(whole_val)
-
-        # fractional part
-        frac_spoken = _fraction_to_words(frac_str)
-
-        spoken = f"{whole_spoken} point {frac_spoken}"
-        if negative:
-            spoken = "minus " + spoken
-        return spoken
-
-    out = _DECIMAL_RE.sub(repl_decimal, out)
-
-    # 3) Standalone integers
-    def repl_int(m: re.Match) -> str:
-        s = m.group(0)
-        try:
-            n = int(s)
-        except:
-            return s
-        if abs(n) > 999:
-            return s
-        return _num_to_words(n)
-
-    out = _INT_TOKEN_RE.sub(repl_int, out)
-
-    return out
-
-
-
-def _box_id_from_node_id(node_id: str) -> Optional[int]:
-    """
-    Map a node name like 'CNode1##' (e.g., 'CNode107') or a bare numeric
-    string to an integer box_id.
-
-    We just extract the digits from 'CNode###' and interpret as the box_id.
-    """
-    s = str(node_id or "").strip()
-    if not s:
-        return None
-
-    m = _CNODE_RE.search(s)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-
-    try:
-        return int(s)
-    except Exception:
-        return None
-
-# ───────────────────────────────────────────────────────────────────────────────
-#                               Skills YAML (inline fallback)
-# ───────────────────────────────────────────────────────────────────────────────
-DEFAULT_SKILLS_V2 = r"""
-version: 2
-defaults:
-  window_ms: 3000
-
-skills:
-  # === PRIMITIVES (wired to SkillsAgent methods) ===
-  - name: tts.say
-    kind: primitive
-    action: tts
-    params:
-      text: "{{ctx.text | default:'OK'}}"
-
-  - name: gesture.greet
-    kind: primitive
-    action: gesture
-    params:
-      kind: "greet"
-
-  - name: nav.move_relative
-    kind: primitive
-    action: move_relative
-    params:
-      azimuth_deg: "{{rule.speech_final_any.azimuth_deg | default:0}}"
-      dist_m: "{{ctx.dist_m | default:0.6}}"
-
-  - name: nav.move_absolute
-    kind: primitive
-    action: move_absolute
-    params:
-      frame: "{{ctx.frame | default:'map'}}"
-      x: "{{ctx.x | default:0}}"
-      y: "{{ctx.y | default:0}}"
-      yaw: "{{ctx.yaw | default:0}}"
-
-  - name: base.turn_search
-    kind: primitive
-    action: turn_search
-    params:
-      azimuth_deg: "{{rule.speech_final_any.azimuth_deg | default:0}}"
-      timeout_s: "{{ctx.timeout_s | default:8}}"
-
-  - name: db.query_top_beacons
-    kind: primitive
-    action: query_beacons
-    params:
-      top_n: "{{ctx.top_n | default:3}}"
-
-  # === COMPOSITES (step-level triggers on rule hits) ===
-  - name: greet.with_presence
-    kind: composite
-    steps:
-      - use: gesture.greet
-        when:
-          all:
-            - exists: pose_present_precise
-              within_ms: 2500
-            - exists: speech_keyword
-              within_ms: 2500
-      - use: tts.say
-        with:
-          text: "Hi! How can I help?"
-        when:
-          any:
-            - exists: speech_final_any
-              within_ms: 3000
-
-  - name: sense.here
-    kind: composite
-    steps:
-      - use: base.turn_search
-        with:
-          timeout_s: 8
-        when:
-          any:
-            - exists: pose_present_precise
-              within_ms: 3000
-            - exists: speech_final_any
-              within_ms: 3000
-      - use: nav.move_relative
-        with:
-          dist_m: 0.6
-        when:
-          exists: pose_present_precise
-          within_ms: 3000
-      - use: tts.say
-        with:
-          text: "Scanning this area."
-        when:
-          any:
-            - exists: pose_present_precise
-              within_ms: 3000
-
-  - name: beacons.report_top3
-    kind: composite
-    steps:
-      - use: db.query_top_beacons
-        with: { top_n: 3 }
-        when:
-          any:
-            - exists: speech_keyword
-              within_ms: 5000
-            - exists: speech_final_any
-              within_ms: 5000
-      - use: tts.say
-        with:
-          text: "{{ctx.last_query_beacons_speech | default:'Done.'}}"
-"""
-class StepHandle:
-    """Represents an in-progress primitive. Engine polls .done() and can .cancel()."""
-    def __init__(self, cancel_fn=None):
-        self._done = False
-        self._cancel = cancel_fn or (lambda: None)
-        self.outcome = "ok"   # "ok" | "timeout" | "error" | whatever you need
-
-    def mark_done(self):
-        self._done = True
-
-    def done(self) -> bool:
-        return self._done
-
-    def cancel(self):
-        try:
-            self._cancel()
-        finally:
-            self._done = True
-
-# ───────────────────────────────────────────────────────────────────────────────
-#                        Core Engine (step-level ‘when’)
-# ───────────────────────────────────────────────────────────────────────────────
-_PLACEHOLDER = re.compile(r"""{{\s*([^}]+?)\s*}}""")
-
-def _get_path(root: dict, path: str) -> Any:
-    cur = root
-    for part in path.split('.'):
-        if isinstance(cur, dict) and part in cur:
-            cur = cur[part]
-        else:
-            return None
-    return cur
-
-class RulesView:
-    """In-memory rule hit store. In ROS, see RulesViewROS below."""
-    def __init__(self, now_ms: Optional[int] = None):
-        self._events: List[dict] = []
-        self._now_ms = now_ms or int(time.time() * 1000)
-
-    def _now(self) -> int:
-        return int(time.time() * 1000)
-
-    def add(self, rule_id: str, payload: dict, ts_ms: Optional[int] = None):
-        self._events.append({
-            'id': str(rule_id),
-            'ts_ms': ts_ms if ts_ms is not None else self._now(),
-            'payload': payload or {}
-        })
-
-    def exists(self, rule_id: str, within_ms: int) -> bool:
-        cutoff = self._now() - within_ms
-        rid = str(rule_id)
-        last = None
-        for e in self._events:
-            if e.get('id') == rid and e.get('ts_ms', 0) >= cutoff:
-                if last is None or e['ts_ms'] > last['ts_ms']:
-                    last = e
-        if not last:
-            return False
-        # default to True if no 'active' key (for backward compatibility)
-        return bool(last.get('payload', {}).get('active', True))
-
-    def latest_payload(self, rule_id: str, within_ms: int) -> Optional[dict]:
-        cutoff = (self._now() - within_ms)
-        cand = [e for e in self._events if e['id'] == str(rule_id) and e['ts_ms'] >= cutoff]
-        if not cand:
-            return None
-        cand.sort(key=lambda e: e['ts_ms'], reverse=True)
-        return cand[0]['payload']
-
-def _render_scalar(expr: str, ctx: dict, rules: RulesView, defaults_window_ms: int) -> str:
-
-    def _is_missing(v: Any) -> bool:
-        if v is None:
-            return True
-        if isinstance(v, str) and v.strip() == "":
-            return True
-        return False
-
-    # 1) Handle "| default:" first
-    if "| default:" in expr:
-        left, default_str = expr.split("| default:", 1)
-        left = left.strip()
-        default_str = default_str.strip()
-
-        # parse default value: allow numbers/booleans/etc via JSON, else treat as string
-        try:
-            default_val = json.loads(default_str)
-        except Exception:
-            default_val = default_str.strip("'\"")
-
-        # rule.<id>.<field>
-        if left.startswith("rule."):
-            parts = left.split(".")
-            if len(parts) >= 3:
-                rid = parts[1]
-                field = ".".join(parts[2:])
-                payload = rules.latest_payload(rid, defaults_window_ms)
-                if payload is not None:
-                    val = _get_path(payload, field)
-                    if not _is_missing(val):
-                        return str(val)
-            return str(default_val)
-
-        # ctx.<path>
-        if left.startswith("ctx."):
-            val = _get_path({"ctx": ctx}, left)
-            return str(val) if not _is_missing(val) else str(default_val)
-
-        # bare key → interpret as ctx.<key>
-        val = _get_path({"ctx": ctx}, f"ctx.{left}")
-        return str(val) if not _is_missing(val) else str(default_val)
-
-    # 2) Legacy simple forms (no default)
-    if expr.startswith("rule."):
-        parts = expr.split(".")
-        if len(parts) >= 3:
-            rid = parts[1]
-            field = ".".join(parts[2:])
-            payload = rules.latest_payload(rid, defaults_window_ms)
-            if payload is None:
-                return ""
-            val = _get_path(payload, field) if field else payload
-            return "" if val is None else str(val)
-        return ""
-
-    if expr.startswith("ctx."):
-        val = _get_path({"ctx": ctx}, expr)
-        return "" if val is None else str(val)
-
-    # Unknown reference → empty
-    return ""
-
-
-def _render_any(value: Any, ctx: dict, rules: RulesView, defaults_window_ms: int) -> Any:
-    if not isinstance(value, str):
-        return value
-    def repl(m):
-        return _render_scalar(m.group(1).strip(), ctx, rules, defaults_window_ms)
-    return _PLACEHOLDER.sub(repl, value)
-
-def _render_params(params: dict, ctx: dict, rules: RulesView, defaults_window_ms: int) -> dict:
-    out = {}
-    for k, v in (params or {}).items():
-        if isinstance(v, dict):
-            out[k] = _render_params(v, ctx, rules, defaults_window_ms)
-        elif isinstance(v, list):
-            out[k] = [_render_any(i, ctx, rules, defaults_window_ms) for i in v]
-        else:
-            out[k] = _render_any(v, ctx, rules, defaults_window_ms)
-    # coerce common scalars
-    for k, v in list(out.items()):
-        if isinstance(v, str):
-            low = v.strip().lower()
-            try:
-                if low in ('true', 'false'):
-                    out[k] = (low == 'true')
-                elif v.replace('.', '', 1).replace('-', '', 1).isdigit():
-                    out[k] = float(v) if ('.' in v or '-' in v) else int(v)
-            except Exception:
-                pass
-    return out
-
-def _cond_pass(cond: dict, rules: RulesView, defaults_window_ms: int, empty_means=True) -> bool:
-    if not cond:
-        return empty_means
-    if 'exists' in cond:
-        rid = cond.get('exists')
-        win = int(cond.get('within_ms') or defaults_window_ms)
-        return rules.exists(rid, win)
-    if "not_exists" in cond:
-        rid = cond.get('not_exists')
-        win = int(cond.get('within_ms') or defaults_window_ms)
-        return not rules.exists(rid, win)
-    if 'any' in cond:
-        return any(_cond_pass(c, rules, defaults_window_ms) for c in (cond['any'] or []))
-    if 'all' in cond:
-        return all(_cond_pass(c, rules, defaults_window_ms) for c in (cond['all'] or []))
-    return empty_means
-
-class SkillEngineV2:
-    """
-    Executes primitive skills and state-machine skills.
-
-    Skill kinds:
-      - kind: "primitive"
-          name: "tts.say"
-          action: "tts"
-          params: {...}
-
-      - kind: "state_machine"
-          name: "assist.carry_query_and_wait"
-          when: {...}        # optional composite-level gate
-          until: {...}       # optional composite-level stop
-          initial_state: "ask_clarify"
-          states:
-            - id: "ask_clarify"
-              type: "action"
-              action:
-                use: "tts.say"
-                with: {...}
-              on_complete: "wait_for_carry_event"
-              on_failure: "done"   # optional
-
-            - id: "wait_for_carry_event"
-              type: "wait"
-              wait_for:
-                any_of:
-                  - { rule_id: "carry_event", within_ms: 10000 }
-              on_event: "ack_and_ready"
-              on_timeout: "prompt_again"
-
-            - id: "done"
-              type: "action"
-              action: {...}
-              on_complete: null   # or omitted => skill finishes
-    """
-
-    def __init__(
-        self,
-        bindings: Dict[str, callable],
-        rules_view: RulesView,
-        defaults_window_ms: int = 3000,
-        logger=None,
-        event_cb=None,
-    ):
-        self.bindings = dict(bindings or {})
-        self.rules = rules_view
-        self.defaults_window_ms = int(defaults_window_ms)
-        self.registry: Dict[str, dict] = {}
-        self._loaded_path: Optional[str] = None
-        self.logger = logger
-        self._active: List[SkillInstance] = []
-        self.event_cb = event_cb  # function(event_dict) -> None
-        # NEW: skills that have thrown runtime errors in this process
-        self.bad_skills: set[str] = set()
-
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
-    
-    def _quarantine_skill(self, inst: SkillInstance, reason: str, exc: Exception | None = None):
-        name = inst.name
-        self.bad_skills.add(name)
-        if self.logger:
-            self.logger.error(
-                f"[SkillEngine] Quarantining skill '{name}' due to {reason}: {exc!r}"
-            )
-        # Emit an error event for observability
-        self._emit_event(
-            "skill_error",
-            inst,
-            {
-                "reason": reason,
-                "error": str(exc) if exc else "",
-            },
-        )
-
-    
-    def _now_ms(self) -> int:
-        return int(time.time() * 1000)
-
-    def _emit_event(self, kind: str, inst: SkillInstance, extra: dict | None = None):
-        """
-        Emit an event to the callback and /skills/status.
-
-        kind: "skill_started", "skill_finished", "state_entered"
-        """
-        if not self.event_cb:
-            return
-
-        payload = {
-            "kind": kind,
-            "skill": inst.name,
-            "step_idx": int(getattr(inst, "state_idx", 0)),
-            "state_id": inst.state_id,
-            "ctx": inst.ctx,
-            "started_ms": inst.started_ms,
-            "activated": inst.activated,
-            "done": inst.done,
-            "is_root": getattr(inst, "is_root", True),
-        }
-        if extra:
-            payload.update(extra)
-        self.event_cb(payload)
-
-    def _start_child_state_machine(
-        self,
-        parent_inst: SkillInstance,
-        action_spec: dict,
-        child_skill: dict,
-    ) -> StepHandle:
-        """
-        Treat a state_machine referenced in action_spec['use'] as a nested sub-skill.
-
-        - Build child ctx: parent ctx + rendered action_spec['with']
-        - Create a child SkillInstance and add it to self._active
-        - Return a StepHandle whose done() mirrors child.done
-        """
-        ref_name = child_skill["name"]
-
-        # Render "with" block against parent ctx/rules
-        with_overrides = _render_params(
-            action_spec.get("with") or {},
-            parent_inst.ctx,
-            self.rules,
-            self.defaults_window_ms,
-        )
-        child_ctx = dict(parent_inst.ctx)
-        child_ctx.update(with_overrides)
-        
-        child = SkillInstance(
-            name=ref_name,
-            ctx=child_ctx,
-            started_ms=self._now_ms(),
-            is_root=False,          # NEW
-        )
-        # State-machine specific fields: start inactive, no state yet
-        child.activated = False
-        child.state_id = None
-        child.state_idx = 0
-        child.state_started_ms = 0
-        child.handle = None
-        child.done = False
-
-        self._active.append(child)
-
-        def _cancel_child():
-            # cancel any running primitive in the child, then mark done
-            if child.handle is not None and not child.handle.done():
-                try:
-                    child.handle.cancel()
-                except Exception:
-                    pass
-            child.done = True
-
-        h = StepHandle(cancel_fn=_cancel_child)
-
-        # Proxy handle.done() to child.done
-        def _done_proxy(self_handle=h, child_inst=child):
-            return child_inst.done
-
-        h.done = _done_proxy  # override instance method
-        if self.logger:
-            self.logger.info(
-                f"[SkillEngine] Nested state_machine '{ref_name}' started as child of '{parent_inst.name}'"
-            )
-        return h
-
-
-    def _exec_primitive_get_handle(self, action: str, params: dict, ctx: dict) -> StepHandle:
-        """
-        Call the bound primitive; normalize return to a StepHandle:
-          - if primitive returns a StepHandle -> use it
-          - otherwise -> create a StepHandle and mark done immediately
-        """
-        fn = self.bindings.get(action)
-        if not callable(fn):
-            if self.logger:
-                self.logger.error(f"[SkillEngine] No binding for action '{action}' "
-                                  f"– completing step as no-op.")
-            h = StepHandle()
-            h.mark_done()
-            return h
-
-
-        rendered = _render_params(params or {}, ctx, self.rules, self.defaults_window_ms)
-
-        sig = inspect.signature(fn)
-        ret = fn(**rendered, ctx=ctx) if "ctx" in sig.parameters else fn(**rendered)
-
-        if isinstance(ret, StepHandle):
-            return ret
-
-        h = StepHandle()
-        h.mark_done()
-        return h
-
-    # ------------------------------------------------------------------
-    # Loading
-    # ------------------------------------------------------------------
-    def load_from_string(self, yaml_text: str):
-        data = yaml.safe_load(yaml_text)
-        self.defaults_window_ms = int(data.get("defaults", {}).get("window_ms", self.defaults_window_ms))
-        self.registry = {s["name"]: s for s in data.get("skills", [])}
-        self._loaded_path = None
-        return self
-
-    def load_from_path(self, path: str):
-        with open(path, "r") as f:
-            data = yaml.safe_load(f.read())
-        self.defaults_window_ms = int(data.get("defaults", {}).get("window_ms", self.defaults_window_ms))
-        self.registry = {s["name"]: s for s in data.get("skills", [])}
-        self._loaded_path = path
-        return self
-
-    # ------------------------------------------------------------------
-    # Planning helpers
-    # ------------------------------------------------------------------
-    def state_machine_names(self) -> List[str]:
-        return [n for n, s in self.registry.items() if s.get("kind") == "state_machine"]
-
-    def _skill_when_passes(self, skill: dict) -> bool:
-        cond = skill.get("when") or {}
-        return _cond_pass(cond, self.rules, self.defaults_window_ms)
-
-    def plan_eligible(self) -> List[dict]:
-        """
-        Simple planning view: which state_machine skills have their top-level
-        'when' condition satisfied right now.
-        """
-        out = []
-        for name in self.state_machine_names():
-            s = self.registry.get(name) or {}
-            if self._skill_when_passes(s):
-                out.append({"name": name})
-        return out
-
-    # ------------------------------------------------------------------
-    # State-machine operations
-    # ------------------------------------------------------------------
-    def arm(self, skill_name: str, ctx: dict, is_root: bool = True):
-        s = self.registry.get(skill_name)
-        if not s:
-            raise KeyError(f"Unknown skill: {skill_name}")
-
-        if skill_name in getattr(self, "bad_skills", set()):
-            raise RuntimeError(
-                f"Skill '{skill_name}' is quarantined due to previous errors; refusing to arm."
-            )
-
-        kind = s.get("kind")
-        if kind != "state_machine":
-            raise KeyError(f"Skill '{skill_name}' is not a state_machine (kind={kind})")
-
-        inst = SkillInstance(
-            name=skill_name,
-            ctx=dict(ctx or {}),
-            started_ms=self._now_ms(),
-            is_root=is_root,        # ← NEW
-        )
-        self._active.append(inst)
-        if self.logger:
-            self.logger.info(f"[SkillEngine] Armed state_machine '{skill_name}' ctx={ctx}")
-
-        return inst
-
-        
-    def _spawn_nested_child(self, parent: SkillInstance, skill_name: str, ctx: dict) -> StepHandle:
-        """
-        Spawn a nested state_machine/composite as a child of `parent`
-        and return a StepHandle that tracks its completion.
-        """
-        # Arm child skill with merged ctx
-        child_ctx = dict(parent.ctx)
-        child_ctx.update(ctx or {})
-
-        child_inst = self.arm(skill_name, child_ctx, is_root=False)
-
-        h = StepHandle()
-
-        def cancel_child():
-            # Best-effort cancel: stop its primitive and mark done
-            child_inst.done = True
-            if child_inst.handle is not None and not child_inst.handle.done():
-                try:
-                    child_inst.handle.cancel()
-                except Exception:
-                    pass
-            h.mark_done()
-
-        h._cancel = cancel_child  # replace cancel with child-aware version
-
-        # Make this handle's done() proxy the child's done
-        def done_proxy(self):
-            return child_inst.done
-
-        h.done = done_proxy.__get__(h, StepHandle)
-        return h
-
-        
-    def run(self, skill_name: str, ctx: dict):
-        """
-        Backwards-compatible helper: arm + tick once.
-        Usually you just call arm() and let the timer tick.
-        """
-        self.arm(skill_name, ctx)
-        self.tick()
-
-    def active_count(self) -> int:
-        return sum(1 for i in self._active if not i.done)
-
-    # ------------------------------------------------------------------
-    # State lookup and transitions
-    # ------------------------------------------------------------------
-    def _find_state(self, skill: dict, state_id: str | None) -> Optional[dict]:
-        if not state_id:
-            return None
-        for idx, st in enumerate(skill.get("states", [])):
-            if st.get("id") == state_id:
-                st = dict(st)  # copy
-                st["_idx"] = idx
-                return st
-        return None
-
-    def _enter_state(self, inst: SkillInstance, skill: dict, state: dict):
-        """Enter a new state: set ids, start primitive or nested skill if action, emit events."""
-        now_ms = self._now_ms()
-        inst.state_id = state.get("id")
-        inst.state_idx = int(state.get("_idx", inst.state_idx))
-        inst.state_started_ms = now_ms
-        inst.handle = None
-
-        st_type = state.get("type", "action")
-        extra = {"state_type": st_type}
-        self._emit_event("state_entered", inst, extra)
-
-        if self.logger:
-            self.logger.info(
-                f"[SkillEngine] Skill '{inst.name}': entering state "
-                f"'{inst.state_id}' (idx={inst.state_idx}, type={st_type})"
-            )
-
-        if st_type != "action":
-            # wait states and others don't launch a step here
-            return
-
-        action_spec = state.get("action") or {}
-        use_name = action_spec.get("use")
-        with_ctx = action_spec.get("with") or {}
-
-        if not use_name:
-            if self.logger:
-                self.logger.warn(f"[SkillEngine] action state '{inst.state_id}' missing 'use'")
-            return
-
-        base = self.registry.get(use_name)
-
-        # Case 1: registry primitive → normal primitive execution
-        if base and base.get("kind") == "primitive":
-            params = dict(base.get("params") or {})
-            params.update(with_ctx)
-
-            if self.logger:
-                self.logger.info(
-                    f"[SkillEngine] state '{inst.state_id}' executing primitive '{use_name}' params={params}"
-                )
-
-            # Emit step_started with primitive field
-            self._emit_event(
-                "step_started",
-                inst,
-                {"primitive": use_name, "state_type": "action"},
-            )
-
-            inst.handle = self._exec_primitive_get_handle(base["action"], params, inst.ctx)
-            return
-
-        # Case 2: registry state_machine/composite → nested skill
-        if base and base.get("kind") in ("state_machine", "composite"):
-            if self.logger:
-                self.logger.info(
-                    f"[SkillEngine] state '{inst.state_id}' spawning nested skill '{use_name}' with ctx={with_ctx}"
-                )
-
-            # Emit step_started with composite field
-            self._emit_event(
-                "step_started",
-                inst,
-                {"composite": use_name, "state_type": "action"},
-            )
-
-            inst.handle = self._spawn_nested_child(inst, use_name, with_ctx)
-            return
-
-        # Case 3: direct binding (no registry entry, `use_name` is binding key)
-        params = with_ctx
-        if self.logger:
-            self.logger.info(
-                f"[SkillEngine] state '{inst.state_id}' executing bound action '{use_name}' params={params}"
-            )
-
-        # Emit step_started as a primitive-like bound action
-        self._emit_event(
-            "step_started",
-            inst,
-            {"primitive": use_name, "state_type": "action"},
-        )
-
-        inst.handle = self._exec_primitive_get_handle(use_name, params, inst.ctx)
-
-    def _transition_to(self, inst: SkillInstance, skill: dict, next_id: Optional[str]):
-        """Transition to next state id or finish skill if next_id is falsy."""
-        cur_state = inst.state_id
-        
-        if not next_id:
-            inst.done = True
-            if self.logger:
-                self.logger.info(f"[SkillEngine] Skill '{inst.name}' finished (no next state)")
-            self._emit_event("skill_finished", inst, {"reason": "no_next_state"})
-            return
-
-        if self.logger:
-            self.logger.info(
-                f"[SkillEngine] Skill '{inst.name}': state '{cur_state}' -> '{next_id}'"
-            )
-
-        st = self._find_state(skill, next_id)
-        if not st:
-            # If the next state does not exist, consider the skill finished.
-            inst.done = True
-            if self.logger:
-                self.logger.warn(
-                    f"[SkillEngine] Skill '{inst.name}' next state '{next_id}' not found; finishing."
-                )
-            self._emit_event("skill_finished", inst, {"reason": "missing_state"})
-            return
-
-        self._enter_state(inst, skill, st)
-
-    def _resolve_wait_next_state(self, state: dict, rule_id: str) -> Optional[str]:
-        """
-        Given a WAIT state and the rule_id that fired, decide next state.
-
-        Priority:
-          1) First matching entry in state['branches'] (if present)
-          2) state['on_event'] (if present)
-          3) None (no transition)
-        """
-        branches = state.get("branches") or []
-        for br in branches:
-            if br.get("rule_id") == rule_id:
-                return br.get("next")
-
-        # fallback: plain on_event
-        return state.get("on_event")
-
-
-    # ------------------------------------------------------------------
-    # Main tick
-    # ------------------------------------------------------------------
-    def tick(self):
-        """
-        Advance all active state_machine instances.
-        Call this at 10-20 Hz from the ROS node.
-        """
-        now_ms = self._now_ms()
-
-        for inst in list(self._active):
-            if inst.done:
-                continue
-
-            try:
-                skill = self.registry.get(inst.name) or {}
-                kind = skill.get("kind")
-
-                if kind != "state_machine":
-                    # Should not happen, but guard anyway
-                    inst.done = True
-                    continue
-
-                comp_when = skill.get("when") or {}
-                comp_until = skill.get("until") or {}
-
-                # If not activated yet, wait for top-level "when"
-                if not inst.activated:
-                    if _cond_pass(comp_when, self.rules, self.defaults_window_ms):
-                        inst.activated = True
-                        inst.started_ms = now_ms
-                        if self.logger:
-                            self.logger.info(
-                                f"[SkillEngine] Activating state_machine '{inst.name}' "
-                                f"with ctx={inst.ctx}"
-                            )
-                        self._emit_event("skill_started", inst, {})
-
-                        if not inst.state_id:
-                            # Enter initial state
-                            init_id = skill.get("initial_state")
-                            st = self._find_state(skill, init_id)
-                            if not st and self.logger:
-                                self.logger.error(
-                                    f"[SkillEngine] Skill '{inst.name}' missing initial_state '{init_id}'"
-                                )
-                                # Quarantine this skill for future runs
-                                self._quarantine_skill(inst, "missing_initial_state", None)
-                                inst.done = True
-                                self._emit_event(
-                                    "skill_finished",
-                                    inst,
-                                    {"reason": "missing_initial_state"},
-                                )
-                                continue
-                            self._enter_state(inst, skill, st)
-                    else:
-                        # Still not activated
-                        continue
-
-                # Composite-level until: stop skill even if current state has not finished
-                if _cond_pass(comp_until, self.rules, self.defaults_window_ms, empty_means=False):
-                    # cancel running primitive if any
-                    if inst.handle is not None and not inst.handle.done():
-                        try:
-                            inst.handle.cancel()
-                        except Exception:
-                            pass
-                    inst.done = True
-                    if self.logger:
-                        self.logger.info(
-                            f"[SkillEngine] Finished '{inst.name}' due to composite-level 'until'"
-                        )
-                    self._emit_event("skill_finished", inst, {"reason": "composite_until"})
-                    continue
-
-                # No current state? Nothing to do.
-                st = self._find_state(skill, inst.state_id)
-                if not st:
-                    inst.done = True
-                    # structural problem -> quarantine
-                    self._quarantine_skill(inst, "missing_state", None)
-                    self._emit_event("skill_finished", inst, {"reason": "no_state"})
-                    continue
-
-                st_type = st.get("type", "action")
-
-                # 1) Action states: wait for primitive handle to complete
-                if st_type == "action":
-                    if inst.handle is None:
-                        # We entered state but did not start primitive (should not happen)
-                        if self.logger:
-                            self.logger.warn(
-                                f"[SkillEngine] Skill '{inst.name}' state '{inst.state_id}' "
-                                "has no active handle; starting primitive now."
-                            )
-                        self._enter_state(inst, skill, st)
-                        continue
-
-                    if not inst.handle.done():
-                        continue
-
-                    if self.logger:
-                        self.logger.info(
-                            f"[SkillEngine] Skill '{inst.name}' action state '{inst.state_id}' "
-                            "completed; selecting transition based on outcome."
-                        )
-
-                    # NEW: choose next state based on handle.outcome
-                    outcome = getattr(inst.handle, "outcome", "ok")
-
-                    if outcome == "timeout":
-                        if "on_timeout" in st:
-                            next_id = st.get("on_timeout")
-                        else:
-                            next_id = None
-                    elif outcome == "error":
-                        next_id = st.get("on_failure") or st.get("on_complete")
-                    else:
-                        # default success
-                        next_id = st.get("on_complete")
-
-                    self._transition_to(inst, skill, next_id)
-                    continue
-
-                # 2) Wait states: look for rule events or timeout
-                if st_type == "wait":
-                    wait_spec = st.get("wait_for") or {}
-                    any_of = wait_spec.get("any_of") or []
-
-                    # a) event fired?
-                    fired = False
-                    fired_rule = None
-                    for cond in any_of:
-                        rid = cond.get("rule_id")
-                        win = int(cond.get("within_ms") or self.defaults_window_ms)
-                        if rid and self.rules.exists(rid, win):
-                            fired = True
-                            fired_rule = rid
-                            break
-
-                    if fired:
-                        if self.logger:
-                            self.logger.info(
-                                f"[SkillEngine] Skill '{inst.name}' wait state '{inst.state_id}' "
-                                f"event fired (rule='{fired_rule}'); resolving branches/on_event."
-                            )
-                        next_id = self._resolve_wait_next_state(st, fired_rule)
-                        self._transition_to(inst, skill, next_id)
-                        continue
-
-                    # b) timeout?
-                    if any_of:
-                        max_wait = max(int(c.get("within_ms") or self.defaults_window_ms) for c in any_of)
-                    else:
-                        max_wait = self.defaults_window_ms
-
-                    if now_ms - inst.state_started_ms >= max_wait:
-                        if self.logger:
-                            self.logger.info(
-                                f"[SkillEngine] Skill '{inst.name}' wait state '{inst.state_id}' "
-                                f"timed out after {max_wait} ms; transitioning via on_timeout."
-                            )
-                        next_id = st.get("on_timeout")
-                        self._transition_to(inst, skill, next_id)
-                        continue
-
-                    # still waiting
-                    continue
-
-                # 3) Unknown state type -> finish + quarantine
-                if self.logger:
-                    self.logger.warn(
-                        f"[SkillEngine] Skill '{inst.name}' state '{inst.state_id}' has unknown type '{st_type}'"
-                    )
-                inst.done = True
-                self._quarantine_skill(inst, "bad_state_type", None)
-                self._emit_event("skill_finished", inst, {"reason": "bad_state_type"})
-
-            except Exception as e:
-                # RUNTIME ERROR: quarantine for future runs,
-                # but for THIS instance try to advance to a reasonable next state.
-                if self.logger:
-                    self.logger.error(
-                        f"[SkillEngine] Runtime error in skill '{inst.name}' "
-                        f"state='{inst.state_id}': {e!r}"
-                    )
-                self._quarantine_skill(inst, "runtime_exception", e)
-
-                # Try to move to "next" state instead of killing the instance
-                skill = self.registry.get(inst.name) or {}
-                st = self._find_state(skill, inst.state_id)
-                st_type = st.get("type", "action") if st else "action"
-
-                next_id = None
-                if st_type == "action":
-                    # Prefer explicit on_failure, else fall back to on_complete
-                    next_id = st.get("on_failure") or st.get("on_complete")
-                elif st_type == "wait":
-                    # Prefer timeout path, else generic event path
-                    next_id = st.get("on_timeout") or st.get("on_event")
-
-                # If we couldn't find anything, finishing is still safe
-                self._transition_to(inst, skill, next_id)
-
-        # prune finished instances
-        self._active = [i for i in self._active if not i.done]
-
-
-
-# ───────────────────────────────────────────────────────────────────────────────
-#                          ROS RulesView + Orchestrator
-# ───────────────────────────────────────────────────────────────────────────────
-class RulesViewROS(RulesView):
-    """
-    Bridge EventLayerNode topics into a RulesView for the engine.
-    Subscribes to:
-      /events/basic     {"ts": <float>, "rule": <id>, "data": {...}}
-      /events/composite {"ts": <float>, "rule": <id>, "expr": <str>}
-    """
-    def __init__(self, node: Node, window_ms: int = 3000):
-        super().__init__(now_ms=None)
-        self.node = node
-        self.window_ms_default = int(window_ms)
-        self.sub_basic = node.create_subscription(StringMsg, '/events/basic', self._on_basic, 100)
-        self.sub_comp  = node.create_subscription(StringMsg, '/events/composite', self._on_comp, 100)
-
-    def _now(self) -> int:
-        return int(self.node.get_clock().now().nanoseconds * 1e-6)
-
-    def add(self, rule_id: str, payload: dict, ts_ms: Optional[int] = None):
-        entry = {'id': str(rule_id), 'ts_ms': ts_ms if ts_ms is not None else self._now(), 'payload': payload or {}}
-        self._events.append(entry)
-        cutoff = self._now() - self.window_ms_default
-        self._events[:] = [e for e in self._events if e['ts_ms'] >= cutoff]
-
-    def _on_basic(self, msg: StringMsg):
-        try:
-            obj = json.loads(msg.data)
-            ts_ms = int(float(obj.get('ts', time.time())) * 1000)
-            rid = obj.get('rule')
-            payload = obj.get('data') or {}
-            if rid:
-                self.add(str(rid), payload, ts_ms=ts_ms)
-        except Exception as e:
-            self.node.get_logger().warn(f"RulesViewROS basic parse error: {e}")
-
-    def _on_comp(self, msg: StringMsg):
-        try:
-            obj = json.loads(msg.data)
-            ts_ms = int(float(obj.get('ts', time.time())) * 1000)
-            rid = obj.get('rule')
-            payload = {'expr': obj.get('expr', '')}
-            if rid:
-                self.add(str(rid), payload, ts_ms=ts_ms)
-        except Exception as e:
-            self.node.get_logger().warn(f"RulesViewROS composite parse error: {e}")
+from .skills_engine_v2 import (  # adjust to ".skills_engine_v2" if inside a package
+    SkillEngineV2,
+    RulesViewROS,
+    StepHandle,
+    DEFAULT_SKILLS_V2,
+    _normalize_tts_text,
+    _num_to_words,
+    _box_id_from_node_id,
+)
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -1370,7 +189,7 @@ class SkillsAgent(Node):
         # Nav snapping (goal projection onto nearest free cell)
         self.declare_parameter("nav_snap_enable", True)
         self.declare_parameter("nav_snap_radius_m", 0.8)          # search radius
-        self.declare_parameter("nav_snap_cost_threshold", 65)     # <= is acceptable (0 free, higher = closer to obstacles)
+        self.declare_parameter("nav_snap_cost_threshold", 0)     # <= is acceptable (0 free, higher = closer to obstacles)
         self.declare_parameter("nav_snap_use_local_costmap", True)
         self.declare_parameter("nav_snap_costmap_timeout_s", 0.25)
 
@@ -1419,52 +238,178 @@ class SkillsAgent(Node):
         # call engine.tick() ~10–20 Hz, lightweight
         self.create_timer(0.05, self._tick_engine)
 
-    def _get_costmap(self, use_local: bool, timeout_s: float):
+    def _send_nav_goal_handle(self, frame: str, x: float, y: float, yaw: float,
+                              h: StepHandle, ctx: dict) -> StepHandle:
+        """
+        Send a Nav2 NavigateToPose goal and complete StepHandle when done.
+        Uses h._cancel if caller sets it, but also installs a nav cancel hook.
+        """
+        goal = NavigateToPose.Goal()
+        ps = PoseStamped()
+        ps.header.frame_id = str(frame or "map")
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose.position.x = float(x)
+        ps.pose.position.y = float(y)
+        ps.pose.orientation = yaw_to_q(float(yaw))
+        goal.pose = ps
+
+        canceled = {"v": False}
+        goal_handle_box = {"gh": None}
+
+        # If caller already set a cancel, keep it, but also cancel nav goal if possible.
+        prev_cancel = getattr(h, "_cancel", None)
+
+        def _cancel():
+            canceled["v"] = True
+            try:
+                gh = goal_handle_box["gh"]
+                if gh is not None:
+                    gh.cancel_goal_async()
+            except Exception:
+                pass
+            try:
+                if callable(prev_cancel):
+                    prev_cancel()
+            finally:
+                if not h.done():
+                    h.outcome = "canceled"
+                    h.mark_done()
+
+        h._cancel = _cancel
+
+        def _goal_done(fut):
+            if canceled["v"] or h.done():
+                return
+            try:
+                goal_handle = fut.result()
+            except Exception as e:
+                self.get_logger().error(f"Nav goal error: {e}")
+                self.say("Navigation failed.")
+                h.outcome = "error"
+                h.mark_done()
+                return
+
+            if not goal_handle or not goal_handle.accepted:
+                self.say("Navigation goal was rejected.")
+                h.outcome = "error"
+                h.mark_done()
+                return
+
+            goal_handle_box["gh"] = goal_handle
+
+            def _result_done(res_fut):
+                if canceled["v"] or h.done():
+                    return
+                try:
+                    res = res_fut.result()
+                except Exception as e:
+                    self.get_logger().error(f"Nav result error: {e}")
+                    self.say("Navigation failed.")
+                    h.outcome = "error"
+                    h.mark_done()
+                    return
+
+                status = getattr(res, "status", 0)
+                ctx.setdefault("nav", {})
+                ctx["nav"]["status"] = int(status)
+
+                if status == GoalStatus.STATUS_SUCCEEDED:
+                    self.say("Arrived.")
+                    h.outcome = "ok"
+                else:
+                    self.say("Navigation failed.")
+                    h.outcome = "error"
+                h.mark_done()
+
+            goal_handle.get_result_async().add_done_callback(_result_done)
+
+        self.nav_client.send_goal_async(goal).add_done_callback(_goal_done)
+        return h
+
+
+    def _get_costmap_async(self, use_local: bool, timeout_s: float, on_done):
+        """
+        Request costmap asynchronously. Calls on_done(costmap_msg_or_None).
+        Returns StepHandle that completes when response (or timeout) happens.
+        """
+        h = StepHandle()
+
         cli = self._local_costmap_cli if use_local else self._global_costmap_cli
-        if not cli.service_is_ready():
-            if not cli.wait_for_service(timeout_sec=float(timeout_s)):
-                return None
+        which = "local" if use_local else "global"
+
+        # Ensure service is available
+        if not cli.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn(f"[costmap] {which} get_costmap service not ready")
+            on_done(None)
+            h.outcome = "error"
+            h.mark_done()
+            return h
 
         req = GetCostmap.Request()
         fut = cli.call_async(req)
-        # Small blocking wait is ok here (your skill tick is already periodic)
-        rclpy.spin_until_future_complete(self, fut, timeout_sec=float(timeout_s))
-        if not fut.done():
-            return None
-        try:
-            return fut.result().map
-        except Exception:
-            return None
+
+        done = {"v": False}
+
+        def _finish(cm, outcome):
+            if done["v"]:
+                return
+            done["v"] = True
+            try:
+                on_done(cm)
+            finally:
+                h.outcome = outcome
+                h.mark_done()
+
+        # Timeout guard
+        def _timeout():
+        
+            try: t.cancel()
+            except Exception: pass
+            self._live_timers.discard(t)
+            self.get_logger().warn(f"[costmap] {which} get_costmap timeout after {timeout_s:.2f}s")
+            _finish(None, "timeout")
+
+        t = self.create_timer(float(timeout_s), _timeout)
+        self._live_timers.add(t)
+
+        def _cb(f):
+            # cancel timeout timer
+            try:
+                t.cancel()
+            except Exception:
+                pass
+            self._live_timers.discard(t)
+
+            try:
+                resp = f.result()
+                cm = resp.map if resp else None
+                _finish(cm, "ok" if cm is not None else "error")
+            except Exception as e:
+                self.get_logger().warn(f"[costmap] {which} get_costmap call failed: {e}")
+                _finish(None, "error")
+
+        fut.add_done_callback(_cb)
+        return h
 
 
 
-    def _snap_goal_to_free_costmap_cell(
+    def _snap_goal_to_free_costmap_cell_from_msg(
         self,
+        cm,                     # nav2_msgs/msg/Costmap
         x: float,
         y: float,
-        *,
-        use_local: bool,
         radius_m: float,
         cost_threshold: int,
-        timeout_s: float,
+        used_costmap: str = "local",   # just for info/debug
     ):
-        """
-        Return (snapped_x, snapped_y, info_dict) or (None, None, info_dict) if not found.
-
-        cost_threshold: accept cells with cost <= threshold.
-          Typical Nav2 costs:
-            0 = free, 255 = unknown, 254 = lethal
-            253/252 often represent inflated/inscribed zones depending on plugins.
-        """
         info = {
-            "used_costmap": "local" if use_local else "global",
+            "used_costmap": str(used_costmap),
             "radius_m": float(radius_m),
             "cost_threshold": int(cost_threshold),
             "snapped": False,
             "reason": "",
         }
 
-        cm = self._get_costmap(use_local=use_local, timeout_s=timeout_s)
         if cm is None:
             info["reason"] = "costmap_unavailable"
             return None, None, info
@@ -1475,7 +420,7 @@ class SkillsAgent(Node):
         oy = float(meta.origin.position.y)
         sx = int(meta.size_x)
         sy = int(meta.size_y)
-        data = list(cm.data)  # uint8 array
+        data = cm.data  # already a sequence of uint8
 
         def world_to_map(wx, wy):
             mx = int((wx - ox) / res)
@@ -1501,18 +446,15 @@ class SkillsAgent(Node):
         c0 = cost_at(mx0, my0)
         info["target_cost"] = c0
 
-        # If already acceptable, no snapping needed
+        # already ok?
         if c0 != 255 and c0 < 254 and c0 <= int(cost_threshold):
-            info["snapped"] = False
             info["reason"] = "target_already_free_enough"
             return float(x), float(y), info
 
-        # Search outward in grid cells
         max_r_cells = max(1, int(float(radius_m) / res))
         best = None  # (dist2, mx, my, cost)
 
         for r in range(1, max_r_cells + 1):
-            # iterate a square ring around (mx0,my0)
             for dx in range(-r, r + 1):
                 for dy in (-r, r):
                     mx = mx0 + dx
@@ -1520,11 +462,11 @@ class SkillsAgent(Node):
                     if not in_bounds(mx, my):
                         continue
                     c = cost_at(mx, my)
-                    if c == 255 or c >= 254:   # unknown/lethal
+                    if c == 255 or c >= 254:
                         continue
                     if c > int(cost_threshold):
                         continue
-                    dist2 = (dx * dx + dy * dy)
+                    dist2 = dx * dx + dy * dy
                     if best is None or dist2 < best[0]:
                         best = (dist2, mx, my, c)
 
@@ -1539,7 +481,7 @@ class SkillsAgent(Node):
                         continue
                     if c > int(cost_threshold):
                         continue
-                    dist2 = (dx * dx + dy * dy)
+                    dist2 = dx * dx + dy * dy
                     if best is None or dist2 < best[0]:
                         best = (dist2, mx, my, c)
 
@@ -1559,6 +501,7 @@ class SkillsAgent(Node):
         info["snapped_xy"] = [float(sxw), float(syw)]
         info["reason"] = "snapped_to_nearest_free_cell"
         return float(sxw), float(syw), info
+
 
 
     def _srv_cancel_all(self, req, resp):
@@ -2796,116 +1739,82 @@ class SkillsAgent(Node):
             frame = str(frame or "map")
             x = float(x); y = float(y); yaw = float(yaw)
 
-            # ---- snap-to-free-cell behavior ----
             snap_enable = bool(self.get_parameter("nav_snap_enable").value)
-            use_local   = bool(self.get_parameter("nav_snap_use_local_costmap").value)
             radius_m    = float(self.get_parameter("nav_snap_radius_m").value)
             thr         = int(self.get_parameter("nav_snap_cost_threshold").value)
             cm_timeout  = float(self.get_parameter("nav_snap_costmap_timeout_s").value)
 
             nav_info = {"requested": {"frame": frame, "x": x, "y": y, "yaw": yaw}}
-
-            sx, sy = x, y
-            if snap_enable and frame == "map":
-                snapped_x, snapped_y, info = self._snap_goal_to_free_costmap_cell(
-                    x, y,
-                    use_local=use_local,
-                    radius_m=radius_m,
-                    cost_threshold=thr,
-                    timeout_s=cm_timeout,
-                )
-                nav_info["snap"] = info
-
-                if snapped_x is None or snapped_y is None:
-                    # Couldn’t find a safe alternative; fail gracefully
-                    self.get_logger().warn(f"[move_absolute] snap failed: {info}")
-                    self.say("That location is blocked.")
-                    h.outcome = "error"
-                    h.mark_done()
-                    ctx["nav"] = nav_info
-                    return h
-
-                sx, sy = snapped_x, snapped_y
-
-                if info.get("snapped", False):
-                    self.get_logger().info(f"[move_absolute] snapped goal ({x:.2f},{y:.2f}) -> ({sx:.2f},{sy:.2f})")
-                    # Optional voice line (can remove if you want it silent)
-                    # self.say("Goal is blocked. Moving to the closest reachable spot.")
-
-            nav_info["final_goal"] = {"frame": frame, "x": sx, "y": sy, "yaw": yaw}
             ctx["nav"] = nav_info
 
-            # ---- send nav2 goal ----
-            goal = NavigateToPose.Goal()
-            ps = PoseStamped()
-            ps.header.frame_id = frame
-            ps.header.stamp = self.get_clock().now().to_msg()
-            ps.pose.position.x = float(sx)
-            ps.pose.position.y = float(sy)
-            ps.pose.orientation = yaw_to_q(float(yaw))
-            goal.pose = ps
+            if not (snap_enable and frame == "map"):
+                # no snapping: just send goal directly
+                return self._send_nav_goal_handle(frame, x, y, yaw, h, ctx)
 
             canceled = {"v": False}
-            goal_handle_box = {"gh": None}
-
             def _cancel():
                 canceled["v"] = True
-                try:
-                    gh = goal_handle_box["gh"]
-                    if gh is not None:
-                        gh.cancel_goal_async()
-                except Exception:
-                    pass
-                finally:
-                    h.outcome = "timeout"  # or "canceled" if you prefer
-                    h.mark_done()
-
+                h.outcome = "timeout"
+                h.mark_done()
             h._cancel = _cancel
 
-            def _goal_done(fut):
-                if canceled["v"]:
-                    return
-                try:
-                    goal_handle = fut.result()
-                except Exception as e:
-                    self.get_logger().error(f"Nav goal error: {e}")
-                    self.say("Navigation failed.")
-                    h.outcome = "error"
-                    h.mark_done()
+            # ---- Step 1: request local costmap; if OOB then request global ----
+            def after_local(cm_local):
+                if canceled["v"] or h.done():
                     return
 
-                if not goal_handle or not goal_handle.accepted:
-                    self.say("Navigation goal was rejected.")
-                    h.outcome = "error"
-                    h.mark_done()
+                snapped_x = snapped_y = None
+                info_local = {"reason": "costmap_unavailable"} if cm_local is None else None
+
+                if cm_local is not None:
+                    snapped_x, snapped_y, info_local = self._snap_goal_to_free_costmap_cell_from_msg(
+                        cm_local, x, y, radius_m=radius_m, cost_threshold=thr
+                    )
+                nav_info["snap_local"] = info_local
+
+                # if local succeeded, proceed
+                if snapped_x is not None and snapped_y is not None:
+                    nav_info["final_goal"] = {"frame": frame, "x": snapped_x, "y": snapped_y, "yaw": yaw}
+                    return self._send_nav_goal_handle(frame, snapped_x, snapped_y, yaw, h, ctx)
+
+                # If local couldn’t help because goal outside local bounds -> try global
+                if info_local and info_local.get("reason") == "target_out_of_costmap_bounds":
+                    def after_global(cm_global):
+                        if canceled["v"] or h.done():
+                            return
+
+                        if cm_global is None:
+                            nav_info["snap_global_fallback"] = {"reason": "costmap_unavailable"}
+                            self.say("That location is blocked.")
+                            h.outcome = "error"
+                            h.mark_done()
+                            return
+
+                        gx, gy, info_g = self._snap_goal_to_free_costmap_cell_from_msg(
+                            cm_global, x, y, radius_m=max(1.5, radius_m * 2.0), cost_threshold=thr
+                        )
+                        nav_info["snap_global_fallback"] = info_g
+
+                        if gx is None or gy is None:
+                            self.say("That location is blocked.")
+                            h.outcome = "error"
+                            h.mark_done()
+                            return
+
+                        nav_info["final_goal"] = {"frame": frame, "x": gx, "y": gy, "yaw": yaw}
+                        return self._send_nav_goal_handle(frame, gx, gy, yaw, h, ctx)
+
+                    self._get_costmap_async(use_local=False, timeout_s=max(0.6, cm_timeout * 2.0), on_done=after_global)
                     return
 
-                goal_handle_box["gh"] = goal_handle
+                # Other local failures: treat as blocked
+                self.say("That location is blocked.")
+                h.outcome = "error"
+                h.mark_done()
 
-                def _result_done(res_fut):
-                    if canceled["v"]:
-                        return
-                    try:
-                        res = res_fut.result()
-                    except Exception as e:
-                        self.get_logger().error(f"Nav result error: {e}")
-                        self.say("Navigation failed.")
-                        h.outcome = "error"
-                        h.mark_done()
-                        return
-
-                    if getattr(res, "status", 0) == GoalStatus.STATUS_SUCCEEDED:
-                        self.say("Arrived.")
-                        h.outcome = "ok"
-                    else:
-                        self.say("Navigation failed.")
-                        h.outcome = "error"
-                    h.mark_done()
-
-                goal_handle.get_result_async().add_done_callback(_result_done)
-
-            self.nav_client.send_goal_async(goal).add_done_callback(_goal_done)
+            self._get_costmap_async(use_local=True, timeout_s=max(0.6, cm_timeout * 2.0), on_done=after_local)
             return h
+
 
 
 
