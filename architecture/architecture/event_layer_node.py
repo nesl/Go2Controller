@@ -1537,6 +1537,17 @@ class EventLayerNode(Node):
         primitive_name = obj.get("primitive")  # present on step_started for primitives
         nested_composite = obj.get("composite")  # present on step_started for nested composites
 
+        # --- NEW: re-arm one-shot rules at the start of each skill episode ---
+        if kind == "skill_started":
+            if self._one_shot_fired:
+                self.get_logger().info(
+                    f"EventLayer: resetting one-shot fired set ({len(self._one_shot_fired)}) "
+                    f"due to skill_started: {skill_name}"
+                )
+            self._one_shot_fired.clear()
+            #self._last_text_fingerprint.clear()  # optional: reprocess speech once per skill
+
+
         # --- NEW: reset edge-based rules based on skill events ---
         # Per composite skill reset when it starts
         if kind == "skill_started" and skill_name:

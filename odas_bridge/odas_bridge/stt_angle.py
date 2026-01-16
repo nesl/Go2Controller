@@ -401,7 +401,7 @@ class STTFasterWhisperNode(Node):
 
         # NEW: role-specific model configs
         # Final transcription (heavier) defaults
-        self.declare_parameter("stt_model_size", "medium")
+        self.declare_parameter("stt_model_size", "large-v3")
         self.declare_parameter("stt_device", "cuda")
         self.declare_parameter("stt_compute_type", "float16")
 
@@ -469,7 +469,7 @@ class STTFasterWhisperNode(Node):
         # --- Speaker ID / enrollment ---
         self.declare_parameter("spk_profiles_dir", "/tmp/spk_profiles")
         self.declare_parameter("spk_threshold", 0.85)   # tune later
-        self.declare_parameter("spk_save_wav", False)
+        self.declare_parameter("spk_save_wav", True)
 
         self.profiles_dir = str(self.get_parameter("spk_profiles_dir").value)
         os.makedirs(self.profiles_dir, exist_ok=True)
@@ -502,6 +502,7 @@ class STTFasterWhisperNode(Node):
 
         self._last_spk = None  # {"id":..., "score":..., "match":..., "ts_ns":..., "threshold":...}
 
+        self._spk_by_stamp = {}  # (sec, nanosec) -> spk dict
 
         # Load params
         self.fs = int(self.get_parameter("fs_hz").value)
@@ -680,14 +681,37 @@ class STTFasterWhisperNode(Node):
 
     def _srv_enroll(self, req, resp):
         # person id comes from a parameter for simplicity
-        # (Trigger has no request fields)
         pid = str(self.get_parameter("speaker_id").value) if self.has_parameter("speaker_id") else "person"
+
+        # ---- FLUSH all audio/utterance state so enrollment starts clean ----
+        self._utt_active = False
+        self._utt_start_time_ns = None
+        self._utt_samples = []
+        self._last_speech_time_ns = None
+
+        # clear ring buffer and any partial frame residue
+        try:
+            self._mono_ring.clear()
+        except Exception:
+            pass
+        self._partial_bytes = bytearray()
+
+        # clear DoA speech cache / marker direction (optional but consistent)
+        self.doa_hist_speech = []
+        self._dir_vec = None
+        self._dir_vec_ts = 0.0
+
+        # reset gate window scheduler so we don't immediately analyze stale audio
+        self._next_window_at_ns = self.get_clock().now().nanoseconds + int(self.wg_hop_ms * 1e6)
+
+        # ---- arm enrollment ----
         self._spk_mode = "enroll"
         self._spk_target = pid
         resp.success = True
         resp.message = f"Enrollment armed for '{pid}'. Say a sentence now."
         self.get_logger().info(resp.message)
         return resp
+
 
     def _srv_verify(self, req, resp):
         # In the new behavior, "verify" = "identify among all enrolled speakers".
@@ -1158,6 +1182,16 @@ class STTFasterWhisperNode(Node):
                 "kind": "enroll_done",
             }
             
+            key = (int(stamp_msg.sec), int(stamp_msg.nanosec))
+            self._spk_by_stamp[key] = dict(self._last_spk)
+
+            # optional prune: keep last ~100
+            if len(self._spk_by_stamp) > 100:
+                # drop oldest inserted
+                for k in list(self._spk_by_stamp.keys())[:-100]:
+                    self._spk_by_stamp.pop(k, None)
+
+            
             payload = {
                 "kind": "enroll_done",
                 "speaker_id": pid,
@@ -1206,6 +1240,16 @@ class STTFasterWhisperNode(Node):
                     # optional: scores per speaker if you want to debug
                     "scores": {sid: float(s) for sid, s in all_scores},
                 }
+
+                key = (int(stamp_msg.sec), int(stamp_msg.nanosec))
+                self._spk_by_stamp[key] = dict(self._last_spk)
+
+                # optional prune: keep last ~100
+                if len(self._spk_by_stamp) > 100:
+                    # drop oldest inserted
+                    for k in list(self._spk_by_stamp.keys())[:-100]:
+                        self._spk_by_stamp.pop(k, None)
+
 
                 payload = {
                     "kind": "verify_done",
@@ -1562,7 +1606,11 @@ class STTFasterWhisperNode(Node):
                 self.lat_asr_ms_ema = self._ema(self.lat_asr_ms_ema, lat_asr_ms, self._ema_alpha)
                 self.lat_e2e_ms_ema = self._ema(self.lat_e2e_ms_ema, e2e_ms, self._ema_alpha)
                 self._maybe_publish_perf({"last_asr_lat_ms": lat_asr_ms, "last_e2e_ms": e2e_ms})
-
+                text = (item.get("text") or "").strip()
+                if text:
+                    self.get_logger().info(
+                        f"[ASR FINAL] '{text}'  "
+                    )
                 
             text = (item.get("text") or "").strip()
             az = float(item.get("azimuth_deg", 0.0))
@@ -1576,27 +1624,29 @@ class STTFasterWhisperNode(Node):
                     "text": text,
                 }
 
-                # Attach speaker verification info if recent enough
-                spk = getattr(self, "_last_spk", None)
+                # Attach speaker verification info for THIS utterance stamp
+                stamp = item.get("stamp", {}) or {}
+                key = (int(stamp.get("sec", 0)), int(stamp.get("nanosec", 0)))
+
+                spk = self._spk_by_stamp.get(key)
+
+                # fallback: if missing, you can still try latest
+                if spk is None:
+                    spk = getattr(self, "_last_spk", None)
+
                 if spk is not None:
-                    self.get_logger().info(
-                        f"Hello"
-                    )
-                    now_ns = self.get_clock().now().nanoseconds
-                    age_ms = (now_ns - int(spk.get("ts_ns", 0))) / 1e6
-                    if age_ms <= getattr(self, "stt_text_verify_ttl_ms", 100000):
-                        payload_text.update({
-                            "speaker_id":      spk.get("id", "unknown"),
-                            "speaker_score":   float(spk.get("score", 0.0)),
-                            "speaker_match":   bool(spk.get("match", False)),
-                            "speaker_threshold": float(spk.get("threshold", self.spk_threshold)),
-                            "speaker_age_ms":  age_ms,
-                        })
+                    payload_text.update({
+                        "speaker_id":        spk.get("id", "unknown"),
+                        "speaker_score":     float(spk.get("score", 0.0)),
+                        "speaker_match":     bool(spk.get("match", False)),
+                        "speaker_threshold": float(spk.get("threshold", self.spk_threshold)),
+                    })
 
                 # Publish JSON instead of raw text
                 self.pub_text.publish(
                     String(data=json.dumps(payload_text, ensure_ascii=False))
                 )
+                #self._spk_by_stamp.pop(key, None)
 
 
             

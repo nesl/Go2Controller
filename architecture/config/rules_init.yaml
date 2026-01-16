@@ -121,14 +121,14 @@ rules:
     expr: "kind == 'skill_started'"
 
   - id: trigger_idle
-    enabled: false
+    enabled: true
     one_shot: true
     type: composite
     expr: >
       exists('skill_done_any', 86400000) and
       not exists('skill_done_any', 30000)
       and not exists('skill_started_any', 30000)
-      and not exists('trigger_speech_final', 30000)
+      and not exists('speech_final_any', 30000)
       
 
   # in rules_init.yaml or dynamic rules

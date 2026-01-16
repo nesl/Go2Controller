@@ -130,7 +130,10 @@ class MediationState:
     turns: List[MediationTurn] = field(default_factory=list)
     turns_used: int = 0
     baseline_provenance: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    human_ids: List[str] = field(default_factory=list)
 
+
+    
 class PlanMediator:
     """
     Core mediator object. Stateless across sessions; state is in MediationState.
@@ -140,6 +143,8 @@ class PlanMediator:
         if config.llm_call is None:
             raise ValueError("MediationLLMConfig.llm_call must be provided")
         self.config = config
+
+
 
     # ---- Public API -----------------------------------------------------
 
@@ -242,8 +247,14 @@ class PlanMediator:
 
         # Apply plan deltas if provided
         candidate_delta = planner_action.get("candidate_plan_delta")
+        candidate_delta = planner_action.get("candidate_plan_delta")
         if candidate_delta:
-            state.candidate_plan = self._apply_candidate_delta(state.candidate_plan, candidate_delta)
+            state.candidate_plan = self._apply_candidate_delta(
+                state=state,
+                current=state.candidate_plan,
+                delta=candidate_delta,
+            )
+
 
         # Update status + turn count
         state.turns_used += 1
@@ -295,6 +306,7 @@ class PlanMediator:
                     if include_proposer and proposed_by:
                         a_with_meta = dict(a)
                         a_with_meta["original_proposer"] = proposed_by
+
                         human_list.append(a_with_meta)
                     else:
                         human_list.append(a)
@@ -326,8 +338,8 @@ class PlanMediator:
             "human_proposed_changes": human_proposed_changes,
             "optimizer_suggestions_for_changes": optimizer_suggestions_for_changes,
         }
-        
         proposer = state.social.proposer_id
+
 
         # --- NEW: detect conflicts ONLY w.r.t. human-agreed actions ---
         conflicts = self._detect_human_conflicts(
@@ -729,19 +741,17 @@ class PlanMediator:
         return summary
 
 
-    def _apply_candidate_delta(self, current: Plan, delta: Dict[str, Any]) -> Plan:
-        """
-        Apply a delta from the LLM to the candidate plan.
-
-        For now: if delta[aid] is present, it REPLACES the entire list
-        for that agent. This is simple and predictable. You can extend
-        it later with operations like 'append', 'remove', etc.
-        """
+    def _apply_candidate_delta(self, state: MediationState, current: Plan, delta: Dict[str, Any]) -> Plan:
         new_plan: Plan = dict(current) if current is not None else {}
 
-        for aid, actions in (delta or {}).items():
+        for agent_key, actions in (delta or {}).items():
+            aid = (agent_key or "").strip()
+            if aid not in ("robot", "human_a", "human_b"):
+                continue
+
             if not isinstance(actions, list):
                 continue
+
             new_actions = []
             for step in actions:
                 if not isinstance(step, dict):
@@ -758,9 +768,11 @@ class PlanMediator:
                 except Exception:
                     continue
                 new_actions.append((box_id_int, prop, kind))
+
             new_plan[aid] = new_actions
 
         return new_plan
+
 
     @staticmethod
     def _to_json_str(obj: Any) -> str:

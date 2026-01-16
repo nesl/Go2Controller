@@ -71,6 +71,13 @@ _INT_TOKEN_RE = re.compile(r'(?<![\w.])(-?\d+)(?![\w.])')
 _DECIMAL_RE   = re.compile(r'(?<![\w])(-?\d*\.\d+)(?![\w])')
 _CNODE_RE     = re.compile(r'\bCNode(\d+)\b', re.IGNORECASE)
 
+_LETTER_TOKEN_RE = re.compile(r'(?<![A-Za-z0-9])([XY])(?![A-Za-z0-9])')
+_LETTER_MAP = {
+    "X": "ex",
+    "Y": "why",
+}
+
+
 def _num_to_words(n: int) -> str:
     if abs(n) > 999:
         return str(n)
@@ -127,6 +134,11 @@ def _normalize_tts_text(text: str) -> str:
         return f"node {_num_to_words(nid)}"
 
     out = _CNODE_RE.sub(repl_cnode, text)
+
+    def repl_letter(m: re.Match) -> str:
+        return _LETTER_MAP.get(m.group(1), m.group(1))
+
+    out = _LETTER_TOKEN_RE.sub(repl_letter, out)
 
     def repl_decimal(m: re.Match) -> str:
         s = m.group(0)

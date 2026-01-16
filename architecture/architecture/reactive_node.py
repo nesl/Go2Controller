@@ -221,12 +221,12 @@ class InteractionLoopNode(Node):
         self.declare_parameter("llm_enabled", True)
         self.declare_parameter("model", "gpt-5-mini")
         self.declare_parameter("groq_model_prefix", "gpt-oss")
-        self.declare_parameter("trigger_prefix", "trigger_")
+        self.declare_parameter("trigger_prefix", "XXXXXXXXXXXX")
         self.declare_parameter(
             "trigger_map_json",
             json.dumps({
                 "trigger_speech_final": "human_command",
-                "trigger_idle": "idle",
+                #"trigger_idle": "idle",
             }),
         )
 

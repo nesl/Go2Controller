@@ -27,7 +27,7 @@ from tf2_ros import Buffer, TransformListener
 from go2_interfaces.msg import WebRtcReq
 import requests
 from nav2_msgs.srv import GetCostmap
-
+import threading
 
 from dataclasses import dataclass, field
 import time
@@ -85,11 +85,17 @@ class SkillsAgent(Node):
         self.declare_parameter("turn_speed_rad_s", 0.6)  # was 0.25
         self.declare_parameter("fwd_speed_m_s", 0.25)
         
+        self.declare_parameter("announce_box_ops", True)
+
         
         # Box server (for calling /sense directly from skills)
         self.declare_parameter("box_server_url", "http://172.17.40.64:8080")
-        self.declare_parameter("box_req_timeout", 5.0)
+        self.declare_parameter("box_req_timeout", 200.0)
         self.declare_parameter("agent_id", "robot")  # logical agent id for /sense
+
+        self.declare_parameter("box_cancel_timeout", 2.0)
+
+        self.box_cancel_timeout = float(self.get_parameter("box_cancel_timeout").value)
 
         self.box_server_url = self.get_parameter("box_server_url").get_parameter_value().string_value
         self.box_req_timeout = float(self.get_parameter("box_req_timeout").value)
@@ -583,7 +589,7 @@ class SkillsAgent(Node):
                 self.get_logger().info(
                     f"[SkillsAgent] High-level skill '{event.get('skill')}' finished; announcing."
                 )
-                self.say("Execution ended.")
+                #self.say("Execution ended.")
         except Exception as e:
             self.get_logger().warn(f"Failed to emit final TTS on skill_finished: {e}")
 
@@ -700,6 +706,32 @@ class SkillsAgent(Node):
         return total
 
 
+    def _call_soon(self, fn):
+        """
+        Schedule fn() to run on the ROS thread ASAP using a one-shot timer.
+        Keeps a strong ref so it won't be GC'd before firing.
+        """
+        tbox = {"t": None}
+
+        def _run_once():
+            t = tbox["t"]
+            try:
+                if t:
+                    t.cancel()
+            except Exception:
+                pass
+            self._live_timers.discard(t)
+
+            try:
+                fn()
+            except Exception as e:
+                self.get_logger().warn(f"_call_soon callback error: {e}")
+
+        t = self.create_timer(0.001, _run_once)  # 1ms one-shot
+        tbox["t"] = t
+        self._live_timers.add(t)
+        return t
+
 
     def _tick_engine(self):
         try:
@@ -742,6 +774,46 @@ class SkillsAgent(Node):
         self.get_logger().info(f"[tts_immediate] saying: {text!r}")
         # This uses the existing normalization + publish to /tts
         self.say(text)
+
+
+    def _announce_box_op(self, op: str, phase: str, box_id: int, prop: str, *,
+                         detected: Optional[bool] = None,
+                         success: Optional[bool] = None,
+                         status: Optional[str] = None):
+        """
+        op: "sensing" | "disposal"
+        phase: "start" | "finish" | "cancel"
+        """
+        if not bool(self.get_parameter("announce_box_ops").value):
+            return
+
+        # Keep it short; numbers get normalized by _normalize_tts_text in say()
+        if phase == "start":
+            self.say(f"Starting {op} for box {box_id}, property {prop}.")
+            return
+
+        if phase == "cancel":
+            self.say(f"Canceled {op} for box {box_id}, property {prop}.")
+            return
+
+        # finish
+        if op == "sensing":
+            if detected is True:
+                self.say(f"Finished sensing box {box_id}, property {prop}. Detected.")
+            elif detected is False:
+                self.say(f"Finished sensing box {box_id}, property {prop}. Not detected.")
+            else:
+                self.say(f"Finished sensing box {box_id}, property {prop}.")
+            return
+
+        if op == "disposal":
+            if success is True:
+                self.say(f"Finished disposal for box {box_id}, property {prop}. Success.")
+            elif success is False:
+                self.say(f"Finished disposal for box {box_id}, property {prop}. Failed.")
+            else:
+                self.say(f"Finished disposal for box {box_id}, property {prop}.")
+            return
 
 
     # Topic: /skills/execute
@@ -1332,74 +1404,95 @@ class SkillsAgent(Node):
                 "error": None,
             }
 
+            done = {"v": False}
+
+            def _finish():
+                if done["v"] or h.done():
+                    return
+                done["v"] = True
+
+                self._announce_box_op(
+                    "sensing",
+                    "finish",
+                    box_id,
+                    prop,
+                    detected=result.get("detected"),
+                    status=result.get("status"),
+                )
+
+                ctx.setdefault("box", {})
+                ctx["box"].update({
+                    "node_id": node_id,
+                    "box_id": box_id,
+                    "property": prop,
+                    "sense_result": result,
+                })
+
+                self.get_logger().info(
+                    f"[box.sense] box_id={box_id}, prop={prop}, "
+                    f"status={result.get('status')}, detected={result.get('detected')}, "
+                    f"prob={result.get('probability')}"
+                )
+
+                h.mark_done()
+
+
             # --- define cancel hook before the blocking call ---
             def _cancel():
                 """
                 Best-effort cancellation via /sense/cancel.
-
-                If the server still has a running sense op for this triple,
-                it will mark it cancelled and wake up the sleep.
                 """
+                if done["v"] or h.done():
+                    return
+
                 try:
-                    cancel_payload = dict(payload)  # same keys
+                    cancel_payload = dict(payload)
                     self.get_logger().info(f"[box.sense] POST {cancel_url} {cancel_payload} (cancel)")
-                    resp_c = requests.post(cancel_url, json=cancel_payload, timeout=self.box_req_timeout)
+                    resp_c = requests.post(cancel_url, json=cancel_payload, timeout=self.box_cancel_timeout)
                     self.get_logger().info(
                         f"[box.sense] cancel response code={resp_c.status_code} "
                         f"body={resp_c.text[:160]!r}"
                     )
+                    result["status"] = "cancelled"
                 except Exception as e:
                     self.get_logger().warn(f"[box.sense] /sense/cancel failed: {e}")
                 finally:
-                    h.mark_done()
+                    self._announce_box_op("sensing", "cancel", box_id, prop, status="cancel")
+                    self._call_soon(_finish)
 
             h._cancel = _cancel
 
-            # --- blocking call to /sense ---
-            try:
-                resp = requests.post(url, json=payload, timeout=self.box_req_timeout)
-                if resp.status_code != 200:
-                    msg = f"non-200 status {resp.status_code}"
-                    self.get_logger().warn(f"[box.sense] /sense {payload} -> {msg}")
+            self._announce_box_op("sensing", "start", box_id, prop, status="starting")
+
+            def _worker():
+                try:
+                    resp = requests.post(url, json=payload, timeout=self.box_req_timeout)
+                    if resp.status_code != 200:
+                        msg = f"non-200 status {resp.status_code}"
+                        self.get_logger().warn(f"[box.sense] /sense {payload} -> {msg}")
+                        result["error"] = msg
+                    else:
+                        data = resp.json()
+                        result.update(
+                            status=data.get("status"),
+                            detected=data.get("detected"),
+                            probability=data.get("probability"),
+                            deadline=data.get("deadline"),
+                            x=data.get("x"),
+                            y=data.get("y"),
+                            requested_at=data.get("requested_at"),
+                            completed_at=data.get("completed_at"),
+                        )
+                except Exception as e:
+                    msg = f"/sense failed: {e}"
+                    self.get_logger().warn(f"[box.sense] {msg}")
                     result["error"] = msg
-                else:
-                    data = resp.json()
-                    # Expected fields from SenseResponse:
-                    #   agent_id, box_id, property, status,
-                    #   detected, probability, deadline, x, y,
-                    #   requested_at, completed_at
-                    result.update(
-                        status=data.get("status"),
-                        detected=data.get("detected"),
-                        probability=data.get("probability"),
-                        deadline=data.get("deadline"),
-                        x=data.get("x"),
-                        y=data.get("y"),
-                        requested_at=data.get("requested_at"),
-                        completed_at=data.get("completed_at"),
-                    )
-            except Exception as e:
-                msg = f"/sense failed: {e}"
-                self.get_logger().warn(f"[box.sense] {msg}")
-                result["error"] = msg
 
-            # Expose result via ctx
-            ctx.setdefault("box", {})
-            ctx["box"].update({
-                "node_id": node_id,
-                "box_id": box_id,
-                "property": prop,
-                "sense_result": result,
-            })
+                self._call_soon(_finish)
 
-            self.get_logger().info(
-                f"[box.sense] box_id={box_id}, prop={prop}, "
-                f"status={result['status']}, detected={result['detected']}, "
-                f"prob={result['probability']}"
-            )
-
-            h.mark_done()
+            threading.Thread(target=_worker, daemon=True).start()
             return h
+
 
 
         def dispose_box(node_id: str, property: str = "X", ctx: dict = None):
@@ -1469,71 +1562,93 @@ class SkillsAgent(Node):
                 "error": None,
             }
 
+            done = {"v": False}
+
+            def _finish():
+                if done["v"] or h.done():
+                    return
+                done["v"] = True
+
+                self._announce_box_op(
+                    "disposal",
+                    "finish",
+                    box_id,
+                    prop,
+                    success=result.get("success"),
+                    status=result.get("status"),
+                )
+
+                ctx.setdefault("box", {})
+                ctx["box"].update({
+                    "node_id": node_id,
+                    "box_id": box_id,
+                    "property": prop,
+                    "dispose_result": result,
+                })
+
+                self.get_logger().info(
+                    f"[box.dispose] box_id={box_id}, prop={prop}, "
+                    f"status={result.get('status')}, success={result.get('success')}"
+                )
+
+                h.mark_done()
+
+
             # --- define cancel hook *before* the blocking request ---
             def _cancel():
                 """
                 Best-effort cancellation via /dispose/cancel.
-
-                If the server still has a running disposal for this triple,
-                it will mark it cancelled and wake up the sleep.
                 """
+                if done["v"] or h.done():
+                    return
+
                 try:
-                    cancel_payload = dict(payload)  # same keys: agent_id, box_id, property
+                    cancel_payload = dict(payload)
                     self.get_logger().info(f"[box.dispose] POST {cancel_url} {cancel_payload} (cancel)")
-                    resp_c = requests.post(cancel_url, json=cancel_payload, timeout=self.box_req_timeout)
-                    # We don't strictly care about the status here; this is best-effort.
+                    resp_c = requests.post(cancel_url, json=cancel_payload, timeout=self.box_cancel_timeout)
                     self.get_logger().info(
                         f"[box.dispose] cancel response code={resp_c.status_code} body={resp_c.text[:160]!r}"
                     )
+                    result["status"] = "cancelled"
                 except Exception as e:
                     self.get_logger().warn(f"[box.dispose] /dispose/cancel failed: {e}")
                 finally:
-                    h.mark_done()
+                    self._announce_box_op("disposal", "cancel", box_id, prop)
+                    self._call_soon(_finish)
+
 
             h._cancel = _cancel
 
-            # --- blocking call to /dispose ---
-            try:
-                resp = requests.post(url, json=payload, timeout=self.box_req_timeout)
-                if resp.status_code != 200:
-                    msg = f"non-200 status {resp.status_code}"
-                    self.get_logger().warn(f"[box.dispose] /dispose {payload} -> {msg}")
+            self._announce_box_op("disposal", "start", box_id, prop)
+
+            def _worker():
+                try:
+                    resp = requests.post(url, json=payload, timeout=self.box_req_timeout)
+                    if resp.status_code != 200:
+                        msg = f"non-200 status {resp.status_code}"
+                        self.get_logger().warn(f"[box.dispose] /dispose {payload} -> {msg}")
+                        result["error"] = msg
+                    else:
+                        data = resp.json()
+                        result.update(
+                            status=data.get("status"),
+                            success=data.get("success"),
+                            deadline=data.get("deadline"),
+                            x=data.get("x"),
+                            y=data.get("y"),
+                            requested_at=data.get("requested_at"),
+                            completed_at=data.get("completed_at"),
+                        )
+                except Exception as e:
+                    msg = f"/dispose failed: {e}"
+                    self.get_logger().warn(f"[box.dispose] {msg}")
                     result["error"] = msg
-                else:
-                    data = resp.json()
-                    # Expected fields from DisposeResponse:
-                    #   agent_id, box_id, property, status,
-                    #   success, deadline, x, y, requested_at, completed_at
-                    result.update(
-                        status=data.get("status"),
-                        success=data.get("success"),
-                        deadline=data.get("deadline"),
-                        x=data.get("x"),
-                        y=data.get("y"),
-                        requested_at=data.get("requested_at"),
-                        completed_at=data.get("completed_at"),
-                    )
-            except Exception as e:
-                msg = f"/dispose failed: {e}"
-                self.get_logger().warn(f"[box.dispose] {msg}")
-                result["error"] = msg
 
-            # Make result visible via ctx
-            ctx.setdefault("box", {})
-            ctx["box"].update({
-                "node_id": node_id,
-                "box_id": box_id,
-                "property": prop,
-                "dispose_result": result,
-            })
+                self._call_soon(_finish)
 
-            self.get_logger().info(
-                f"[box.dispose] box_id={box_id}, prop={prop}, "
-                f"status={result['status']}, success={result['success']}"
-            )
-
-            h.mark_done()
+            threading.Thread(target=_worker, daemon=True).start()
             return h
+
 
 
     

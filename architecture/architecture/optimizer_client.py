@@ -691,9 +691,9 @@ def summarize_plan_parse_issues(issues: List[PlanParseIssue]) -> str:
 
         problems = []
         for iss in agent_issues:
-            problems.append(f"step {iss.step_index + 1}: {iss.problem}")
+            problems.append(f"{iss.problem}")
         problems_text = "; ".join(problems)
-        parts.append(f"For {who}, I couldn't use some steps ({problems_text})")
+        parts.append(f"For {who}, I couldn't use some steps: {problems_text}")
 
     return "I couldn't fully understand your plan. " + " ".join(parts)
 

@@ -164,6 +164,11 @@ class BrokerNode(Node, BrokerMediationMixin):
              "box_env_state"
         ]))
 
+
+        self.declare_parameter("human_a_name", "Sam")
+        self.declare_parameter("human_b_name", "Jacob")
+
+
         # Optional: mock LLM for offline dev (pass JSON {"sql": "...", "params": {...}, "purpose": "..."} in param)
         self.declare_parameter('llm_mock_json', '')
         
@@ -171,6 +176,17 @@ class BrokerNode(Node, BrokerMediationMixin):
 
         self.model = self.get_parameter("model").get_parameter_value().string_value
 
+        
+        human_a_name = self.get_parameter("human_a_name").get_parameter_value().string_value
+        human_b_name = self.get_parameter("human_b_name").get_parameter_value().string_value
+
+        self.agent_id_to_human_name = {
+            "robot": "robot",
+            "human_a": human_a_name,
+            "human_b": human_b_name,
+        }
+        self.human_name_to_agent_id = {v: k for k, v in self.agent_id_to_human_name.items()}
+        
         
         self.optimizer_enabled = bool(self.get_parameter("optimizer_enabled").value)
         self.optimizer_base_url = (
@@ -199,7 +215,6 @@ class BrokerNode(Node, BrokerMediationMixin):
         self.optimizer_speed_human_b = float(
             self.get_parameter("optimizer_speed_human_b_mps").value
         )
-
 
 
         # Last plan and “fingerprint” of box server state
@@ -259,11 +274,16 @@ class BrokerNode(Node, BrokerMediationMixin):
         self._event_summary_running: bool = False           # background worker in flight?
         self._event_summary_lock = threading.Lock()
 
-        
+        self.human_agent_ids = ["human_a", "human_b"]
 
         # simple EMA of broker LLM latency (ms)
         self._llm_lat_ema_ms: Optional[float] = None
         self._llm_lat_alpha: float = 0.3
+
+
+        # --- NEW: nested current action tracking (robot skill stack) ---
+        self._action_stack: List[dict] = []   # stack of {"skill", "ts", "step_idx", "inner_ctx", "kind"}
+        self._action_stack_lock = threading.Lock()
 
 
         # In BrokerNode.__init__:
@@ -327,7 +347,7 @@ class BrokerNode(Node, BrokerMediationMixin):
         self._lock = threading.Lock()
 
         # context capsule (owned by broker)
-        self._profiles = {"H1": None, "H2": None}  # if you publish HDT, wire subs below
+        self._profiles = {hid: None for hid in self.human_agent_ids}  # if you publish HDT, wire subs below
         self._event_trace = deque(maxlen=40)       # compact recent events
         self._current_trigger = None               # {"type": "...", "hints": {...}}
         self._ws = {}                               # ws_id -> {"hashes": set(), "iters": int}
@@ -340,7 +360,8 @@ class BrokerNode(Node, BrokerMediationMixin):
         self._last_published_summary_fp = None
 
         # In BrokerMediationMixin.__init__ or some init method:
-        self._profile_msg_counts = {}          # human_id -> int
+        self._profile_msg_counts = {hid: 0 for hid in self.human_agent_ids}
+
         self.profile_reflection_every = 5     # e.g. every 10 utterances per human
 
 
@@ -395,6 +416,50 @@ class BrokerNode(Node, BrokerMediationMixin):
             f"enable_server={self.enable_server}"
         )
 
+
+    def _swap_str(self, s: str, mapping: dict) -> str:
+        if not isinstance(s, str) or not mapping:
+            return s
+        out = s
+        for a in sorted(mapping.keys(), key=len, reverse=True):
+            out = re.sub(rf"\b{re.escape(a)}\b", mapping[a], out)
+        return out
+
+
+    def _swap_json(self, obj: Any, mapping: dict) -> Any:
+        """
+        Recursively replace BOTH dict keys and values.
+        This is ONLY used at the LLM boundary.
+        """
+        if isinstance(obj, dict):
+            return {
+                self._swap_str(k, mapping): self._swap_json(v, mapping)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [self._swap_json(x, mapping) for x in obj]
+        if isinstance(obj, str):
+            return self._swap_str(obj, mapping)
+        return obj
+
+
+    def _translate_messages(self, messages: list, mapping: dict) -> list:
+        """
+        Translate message.content (JSON or raw text).
+        """
+        out = []
+        for m in messages:
+            mm = dict(m)
+            c = mm.get("content")
+            if isinstance(c, str):
+                try:
+                    parsed = json.loads(c)
+                    parsed2 = self._swap_json(parsed, mapping)
+                    mm["content"] = json.dumps(parsed2, ensure_ascii=False)
+                except Exception:
+                    mm["content"] = self._swap_str(c, mapping)
+            out.append(mm)
+        return out
 
 
 
@@ -657,6 +722,13 @@ class BrokerNode(Node, BrokerMediationMixin):
         ts   = float(o.get("ts") or time.time())
         zone = o.get("zone")  # NEW: top-level zone from EventLayer
         
+        # --- NEW: track nested current action using skill events ---
+        try:
+            self._update_action_stack_from_skill_event(rule, data, ts)
+        except Exception as e:
+            self.get_logger().debug(f"[action-stack] update failed: {e}")
+
+        
         # --- NEW: log human utterances from speech_final_any events ---
         self._log_human_utterance_from_basic_event(rule, data, ts)
         
@@ -696,10 +768,19 @@ class BrokerNode(Node, BrokerMediationMixin):
                     req_text = v.get("text")
                     if isinstance(req_text, str):
                         trace_entry["data"]["request_text"] = req_text
+                        
 
                 # 2. Keep small scalar fields
                 elif isinstance(v, (str, int, float, bool)):
                     trace_entry["data"][k] = v
+
+    
+        if trace_entry and "data" in trace_entry and "request_text" in trace_entry["data"]:
+            info_utterance = "[on_basic_event] human utterance "
+            if "speaker_id" in trace_entry["data"]:
+                info_utterance += f'spoken by {trace_entry["data"]["speaker_id"]} '
+            info_utterance += f'-> {trace_entry["data"]["request_text"]}'
+            self.get_logger().info(info_utterance)
 
         self._event_trace.append(trace_entry)
         
@@ -849,7 +930,10 @@ class BrokerNode(Node, BrokerMediationMixin):
         if not text:
             return
 
-        speaker_id = data.get("speaker_id") or "unknown"
+        speaker_id_raw = data.get("speaker_id") or "unknown"
+        speaker_id = (speaker_id_raw or "unknown").strip()
+
+
         ts = float(data.get("ts") or default_ts or time.time())
 
         # 1) Log in global chat history (mixin)
@@ -996,10 +1080,14 @@ class BrokerNode(Node, BrokerMediationMixin):
         if not node_id:
             return
         rssi      = int(data.get("rssi"))
-        sensed_by = (data.get("sensed_by") or data.get("phone_id") or "robot").strip()
         frame_id  = (data.get("frame_id") or "").strip()
         ts_epoch  = float(data.get("ts") or envelope.get("ts") or time.time())
-        agent_id  = sensed_by if sensed_by in ('robot','human_a','human_b') else 'robot'
+        sensed_by_raw = (data.get("sensed_by") or data.get("phone_id") or "robot").strip()
+        sensed_by = (sensed_by_raw or "robot").strip()
+
+
+        agent_id = sensed_by if sensed_by in ("robot", "human_a", "human_b") else "robot"
+
 
         self._ensure_node(node_id)
         self._ensure_node_state(node_id)
@@ -1047,6 +1135,92 @@ class BrokerNode(Node, BrokerMediationMixin):
         in the broker DB. Adjust the format if you use a different naming scheme.
         """
         return f"CNode{box_id}"
+
+
+    def _update_action_stack_from_skill_event(self, rule: str, data: dict, ts: float):
+        """
+        Maintain a nested stack of active skills using skill_started_any / skill_done_any events.
+
+        Handles nesting:
+          start(A) -> start(B) -> done(B) -> done(A)
+        Also handles out-of-order / mismatched done by searching from top down.
+        """
+        if rule not in ("skill_started_any", "skill_done_any"):
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        kind = (data.get("kind") or "").strip()
+        skill = (data.get("skill") or "").strip()
+        step_idx = data.get("step_idx")
+        inner_ctx = data.get("inner_ctx") if isinstance(data.get("inner_ctx"), dict) else {}
+
+        if not skill:
+            return
+
+        entry = {
+            "skill": skill,
+            "kind": kind,
+            "ts": float(data.get("ts") or ts),
+            "step_idx": int(step_idx) if isinstance(step_idx, (int, float)) else None,
+            "inner_ctx": inner_ctx,
+        }
+
+        with self._action_stack_lock:
+            if rule == "skill_started_any" or kind == "skill_started":
+                # push
+                self._action_stack.append(entry)
+                return
+
+            # done/finished: pop the most recent matching skill
+            if rule == "skill_done_any" or kind in ("skill_finished", "skill_done"):
+                # search from top down for matching skill
+                for i in range(len(self._action_stack) - 1, -1, -1):
+                    if self._action_stack[i].get("skill") == skill:
+                        # remove that frame and anything above it (those above are "dangling" nesting)
+                        del self._action_stack[i:]
+                        return
+
+                # if no match, do nothing (could be restarted node / missed starts)
+                return
+
+
+    def _current_action_brief(self) -> Optional[dict]:
+        """
+        Return a compact description of the currently active action (top of stack),
+        plus a short stack view for debugging/prompts.
+        """
+        with self._action_stack_lock:
+            if not self._action_stack:
+                return None
+
+            top = self._action_stack[-1]
+            stack_view = []
+            for e in self._action_stack[-5:]:  # cap depth in prompt
+                stack_view.append({
+                    "skill": e.get("skill"),
+                    "step_idx": e.get("step_idx"),
+                    "ts": e.get("ts"),
+                })
+
+        # Extract a compact "what/where" view from inner_ctx
+        inner = top.get("inner_ctx") if isinstance(top.get("inner_ctx"), dict) else {}
+        prop = inner.get("property")
+        node_id = inner.get("target_node_id") or inner.get("node_id")
+
+        nav = inner.get("nav") if isinstance(inner.get("nav"), dict) else {}
+        final_goal = nav.get("final_goal") if isinstance(nav.get("final_goal"), dict) else None
+
+        brief = {
+            "skill": top.get("skill"),
+            "step_idx": top.get("step_idx"),
+            "property": prop,
+            "target_node_id": node_id,
+            "final_goal": final_goal,     # may be None
+            "stack": stack_view,
+        }
+        return brief
 
 
 
@@ -1681,6 +1855,7 @@ class BrokerNode(Node, BrokerMediationMixin):
                             "deadline": b.get("deadline"),
                             "disposed_X": bool(b.get("disposed_X", False)),
                             "disposed_Y": bool(b.get("disposed_Y", False)),
+                            "sense_summary": self._summarize_sense_results(b),
                         }
                     )
                 except Exception:
@@ -1730,12 +1905,16 @@ class BrokerNode(Node, BrokerMediationMixin):
 
         recent_chat = self._get_recent_chat_turns(limit=8)
 
+        current_action = self._current_action_brief()
+
+
         # 5) Build payload for the LLM.
         context_payload = {
             "ts": ts,
             "speaker_id": speaker_id,
             "utterance": utterance,
             "recent_conversation": recent_chat,
+            "current_action": current_action,
             "world_state": {
                 "boxes": simple_boxes,
             },
@@ -1754,16 +1933,21 @@ class BrokerNode(Node, BrokerMediationMixin):
                 "- You see world_state and plan_view = {agreed_plan, optimizer_suggestions}.\n"
                 "- agreed_plan: actions that humans (or you earlier) proposed and everyone has agreed on.\n"
                 "- optimizer_suggestions: extra actions currently suggested by the optimizer, not yet agreed.\n"
-                "- In THIS MODULE you only explain; you cannot change the plan or promise changes.\n"
-                "- When humans ask what you/others will do, describe the agreed_plan; you may mention\n"
-                "  optimizer_suggestions as additional options.\n"
-                "- If they ask you to change the plan, acknowledge the request, restate agreed_plan, and say that\n"
-                "  changes must go through the planning/mediation step.\n"
+                "- In THIS MODULE you only explain and advise; you cannot change the plan or promise changes.\n"
+                "- When humans ask what you/others will do, describe the agreed_plan; you may mention "
+                "optimizer_suggestions as additional options.\n"
+                "- If humans ask for a recommendation (e.g., 'should we dispose box 1?'), give a tentative, "
+                "evidence-based suggestion using world_state, clearly separating advice from agreed_plan.\n"
+                "- If they ask you to change the plan, acknowledge the request, restate agreed_plan, and say that "
+                "changes must go through the planning/mediation step.\n"
                 "- Never claim you will add/drop/change actions that are not in agreed_plan.\n"
-                "- Keep answers 1–2 short sentences. No emojis.\n"
+                "- Keep answers 1–2 short sentences. No emojis. Use hedged language ('I think', 'probably').\n"
                 "- If the utterance is clearly not for you, set should_reply=false and use an empty robot_utterance.\n"
+                "- You may also receive current_action describing what you are doing RIGHT NOW.\n"
+                "- If asked what you are doing, answer using current_action first (if present).\n"
             ),
         }
+
 
 
         user_msg = {
@@ -1800,6 +1984,33 @@ class BrokerNode(Node, BrokerMediationMixin):
                 self._robot_say(robot_utt)
             except Exception as e:
                 self.get_logger().warn(f"[chat] failed to publish TTS reply: {e}")
+
+
+    def _summarize_sense_results(self, b: dict) -> dict:
+        out = {"X": None, "Y": None}
+        for prop in ("X", "Y"):
+            latest = None
+            for sr in (b.get("sense_results") or []):
+                if sr.get("property") != prop:
+                    continue
+                if sr.get("status") != "completed":
+                    continue
+                # pick newest by completed_at if present, else last seen
+                if latest is None:
+                    latest = sr
+                else:
+                    a = latest.get("completed_at")
+                    c = sr.get("completed_at")
+                    if c is not None and (a is None or float(c) > float(a)):
+                        latest = sr
+            if latest:
+                out[prop] = {
+                    "agent_id": latest.get("agent_id"),
+                    "detected": latest.get("detected"),
+                    "probability": latest.get("probability"),
+
+                }
+        return out
 
 
     # ------------------------------ LLM SQL layer ------------------------------
@@ -1947,17 +2158,29 @@ class BrokerNode(Node, BrokerMediationMixin):
         used_schema = schema or LLM_SQL_SCHEMA
         used_model = self.model #model or self.model
 
+        # --- LLM NAME TRANSLATION (canonical → display) ---
+        fwd = dict(self.agent_id_to_human_name or {})      # human_a → Jacob
+        rev = dict(self.human_name_to_agent_id or {})      # Jacob → human_a
+
+        messages_for_llm = self._translate_messages(messages, fwd)
+
+        self.get_logger().info(
+            "\n=== LLM PROMPT ===\n" + json.dumps(messages_for_llm, indent=2)
+        )
+
+
+
         for attempt in range(retries + 1):
             t0 = time.time()
             ok_api = False
-            self.get_logger().info("\n=== LLM PROMPT ===\n" + json.dumps(messages, indent=2))
+
 
             try:
                 if "gpt-oss" in used_model:
                     client = Groq()
                     resp = client.chat.completions.create(
                         model="openai/" + used_model,
-                        messages=messages,
+                        messages=messages_for_llm,
                         response_format={
                             "type": "json_schema",
                             "json_schema": {
@@ -1971,7 +2194,7 @@ class BrokerNode(Node, BrokerMediationMixin):
                     client = OpenAI()
                     resp = client.chat.completions.create(
                         model=used_model,
-                        messages=messages,
+                        messages=messages_for_llm,
                         response_format={
                             "type": "json_schema",
                             "json_schema": {
@@ -1985,17 +2208,19 @@ class BrokerNode(Node, BrokerMediationMixin):
                 ok_api = True
 
                 content = resp.choices[0].message.content
-                obj = json.loads(content)
-                
+                obj_display = json.loads(content)
+
+                # --- LLM NAME TRANSLATION BACK (display → canonical) ---
+                obj = self._swap_json(obj_display, rev)
+
                 self.get_logger().info(
-                    f"\n=== LLM RAW RESPONSE ({schema_name}) ===\n{content}\nLatency: {str(dt_ms)}\n"
+                    f"\n=== LLM RAW RESPONSE ({schema_name}) ===\n{content}\nLatency: {dt_ms}\n"
                 )
-                
+
                 validate(instance=obj, schema=used_schema)
-
-    
-
                 return obj
+
+
 
             except (json.JSONDecodeError, ValidationError) as e:
                 # schema/json error
@@ -2006,6 +2231,8 @@ class BrokerNode(Node, BrokerMediationMixin):
                     "content": "Return ONLY valid JSON per the given schema. No prose.",
                 }]
                 continue
+
+
 
             except Exception as e:
                 dt_ms = int((time.time() - t0) * 1000)
@@ -2113,39 +2340,43 @@ class BrokerNode(Node, BrokerMediationMixin):
         threading.Thread(
             target=self._run_optimizer_thread,
             args=(boxes_state, current_time),
+            kwargs={"publish": False, "publish_reason": "periodic_tick"},
             daemon=True,
         ).start()
 
-    def _run_optimizer_thread(self, boxes_state: list, current_time: float):
+
+    def _run_optimizer_thread(
+        self,
+        boxes_state: list,
+        current_time: float,
+        *,
+        publish: bool = False,
+        publish_reason: str = "",
+    ):
         """
         Background worker that:
           1) syncs box-server world into broker DB
           2) builds optimizer inputs
-          3) runs Gurobi and publishes a plan
+          3) runs Gurobi and (optionally) publishes a plan
         """
         try:
-            # 1) sync DB with latest box server state
             self._sync_box_state_from_server(boxes_state)
 
-            # 2) build optimizer inputs
             agents = self._build_agents_for_optimizer()
             boxes, box_positions = self._build_boxes_for_optimizer(boxes_state)
+
             self._last_boxes_state = boxes_state
             self._last_boxes_for_optimizer = boxes
             self._last_box_positions = box_positions
-            
+
             if not agents or not boxes:
-                self.get_logger().info(
-                    "[optimizer] no agents or boxes available; skipping"
-                )
+                self.get_logger().info("[optimizer] no agents or boxes available; skipping")
                 return
 
             horizon = self.optimizer_horizon_sec
             agent_positions = self._snapshot_agent_positions()
-
             travel_time_fn = self._make_travel_time_fn(agent_positions, box_positions)
 
-            # 3) run Gurobi
             plan = plan_assignments_gurobi(
                 agents=agents,
                 boxes=boxes,
@@ -2155,12 +2386,19 @@ class BrokerNode(Node, BrokerMediationMixin):
             )
 
             self._last_plan = plan
-            self._publish_optimizer_plan(plan, current_time, box_positions)
+
+            # ✅ Publish ONLY if this run came from a trigger callback
+            if publish:
+                self._publish_optimizer_plan(plan, current_time, box_positions)
+                self.get_logger().info(f"[optimizer] published plan (reason={publish_reason})")
+            else:
+                self.get_logger().debug("[optimizer] computed plan (not published; periodic tick)")
 
         except Exception as e:
             self.get_logger().warn(f"[optimizer] optimization failed: {e}")
         finally:
             self._optimizer_running = False
+
 
 
     def _trigger_optimizer_once(self, reason: str, ts: float):
@@ -2211,8 +2449,10 @@ class BrokerNode(Node, BrokerMediationMixin):
         threading.Thread(
             target=self._run_optimizer_thread,
             args=(boxes_state, current_time),
+            kwargs={"publish": True, "publish_reason": reason},
             daemon=True,
         ).start()
+
 
 
     def _build_agents_for_optimizer(self) -> List[AgentState]:

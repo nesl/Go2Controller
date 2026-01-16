@@ -19,6 +19,8 @@
 #   - self._chat_json()
 #   - self.event_summary_model
 #
+#TODO consider what happens if in the middle of an action??
+
 from __future__ import annotations
 
 import json
@@ -158,6 +160,52 @@ class BrokerMediationMixin:
             # Never let history logging crash the node
             pass
 
+    def _get_human_turns_with_prev_context(
+        self,
+        human_id: str,
+        limit: int = 50,
+        ctx_prev: int = 1,
+    ) -> List[dict]:
+        """
+        Returns a chronologically-ordered list of chat turns drawn from the global history,
+        where every turn spoken by `human_id` is included, PLUS up to `ctx_prev` turns
+        immediately before it (any role) as context.
+
+        Uniqueness is enforced by index in the filtered window (not by text),
+        so duplicates aren't accidentally dropped if the same text appears twice.
+        """
+        hist = list(getattr(self, "_chat_history", []))
+        if limit is not None and limit > 0:
+            hist = hist[-limit:]
+
+        if not hist or not isinstance(human_id, str):
+            return []
+
+        include_idx = set()
+
+        for i, t in enumerate(hist):
+            if t.get("role") != human_id:
+                continue
+
+            # include this human turn
+            include_idx.add(i)
+
+            # include up to ctx_prev previous turns for context
+            if ctx_prev and ctx_prev > 0:
+                start = max(0, i - int(ctx_prev))
+                for j in range(start, i):
+                    include_idx.add(j)
+
+        # return in original chronological order
+        out = []
+        for i in sorted(include_idx):
+            try:
+                out.append(hist[i])
+            except Exception:
+                pass
+        return out
+
+
     def _get_recent_chat_turns(self, limit: int = 8) -> List[dict]:
         hist = list(getattr(self, "_chat_history", []))
         if limit is not None and limit > 0:
@@ -172,10 +220,21 @@ class BrokerMediationMixin:
         based on GLOBAL chat history (not only mediation sessions).
         """
         # Recent conversation focused on this human
-        recent_turns = [
-            t for t in self._get_recent_chat_turns(limit=50)
-            if t.get("role") == human_id
-        ]
+        recent_turns = self._get_human_turns_with_prev_context(
+            human_id=human_id,
+            limit=50,
+            ctx_prev=1,
+        )
+
+        recent_turns_display = []
+        for t in recent_turns:
+            try:
+                tt = dict(t)
+                tt["role"] = (tt.get("role") or "unknown")  # keep canonical ids
+                recent_turns_display.append(tt)
+            except Exception:
+                continue
+
         if len(recent_turns) < 2:
             # Not enough signal to reflect
             return
@@ -187,7 +246,7 @@ class BrokerMediationMixin:
             "mode": "periodic",
             "human_id": human_id,
             "timestamp": ts,
-            "recent_utterances": recent_turns,
+            "recent_utterances": recent_turns_display,
             "current_profile": cur_prof,
         }
 
@@ -290,19 +349,39 @@ class BrokerMediationMixin:
         self._profile_msg_counts[speaker_id] = 0
 
 
+    def _to_display_text(self, s: str) -> str:
+        """
+        Convert canonical ids appearing in human-facing strings to display names.
+        E.g., "human_a" -> "Sam", "human_b" -> "Jacob", "robot" -> "Bob".
+        """
+        try:
+            mapping = getattr(self, "agent_id_to_human_name", None) or {}
+            if not isinstance(s, str) or not s.strip() or not mapping:
+                return s
+            return self._swap_str(s, mapping)  # uses your existing word-boundary swapper
+        except Exception:
+            return s
+
 
     def _robot_say(self, text: str):
         """
         Send one-shot TTS utterance to SkillsAgent.
+        Applies display-name filter so humans never hear canonical ids.
         """
+        text = (text or "").strip()
         if not text:
             return
+
+        # Human-facing output: canonical -> display
+        say_text = self._to_display_text(text)
+
         try:
-            self.pub_tts_immediate.publish(StringMsg(data=text))
+            self.pub_tts_immediate.publish(StringMsg(data=say_text))
         except Exception as e:
             self.get_logger().warn(f"[mediation][tts] failed to publish utterance: {e}")
-            
+
         # Log robot utterance in global history
+        # IMPORTANT: keep CANONICAL text internally so LLM-boundary translation stays consistent.
         try:
             self._append_chat_turn("robot", text, time.time())
         except Exception:
@@ -372,6 +451,231 @@ class BrokerMediationMixin:
 
     # ---------- Candidate sanity: impossible / already-fulfilled actions ----------
 
+    # ---------- Feasibility filtering (drop-only, not whole-plan reject) ----------
+
+    def _action_key(self, aid: str, box_id: int, prop: str, kind: str) -> Tuple[str, int, str, str]:
+        return (str(aid), int(box_id), str(prop), str(kind))
+
+    def _index_provenance(self, prov: Optional[dict]) -> Dict[Tuple[str, int, str, str], dict]:
+        """
+        Build a lookup: (aid, box_id, prop, kind) -> provenance entry.
+        Expected provenance entry keys: origin, proposed_by, etc.
+        """
+        idx: Dict[Tuple[str, int, str, str], dict] = {}
+        if not isinstance(prov, dict):
+            return idx
+        for aid, entries in prov.items():
+            for e in (entries or []):
+                try:
+                    k = self._action_key(aid, int(e["box_id"]), e["property"], e["kind"])
+                    idx[k] = dict(e)
+                except Exception:
+                    continue
+        return idx
+
+    def _check_action_feasible(
+        self,
+        aid: str,
+        box_id: int,
+        prop: str,
+        kind: str,
+        box_by_id: dict,
+        current_time: float,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Returns (ok, reason_if_not_ok)
+        """
+        b = box_by_id.get(int(box_id))
+        if b is None:
+            return (False, "unknown box")
+
+        # Deadline passed blocks both sense and dispose
+        if b.deadline is not None and float(current_time) >= float(b.deadline):
+            return (False, "deadline already passed")
+
+        if kind == "dispose":
+            if prop == "X" and bool(getattr(b, "disposed_X", False)):
+                return (False, "already disposed for X")
+            if prop == "Y" and bool(getattr(b, "disposed_Y", False)):
+                return (False, "already disposed for Y")
+
+        if kind == "sense":
+            already = (getattr(b, "already_sensed", None) or {}).get(aid, {}).get(prop, False)
+            if already:
+                return (False, "already sensed by this agent")
+
+        return (True, None)
+
+    def _filter_plan_for_feasibility(
+        self,
+        plan: Plan,
+        boxes,
+        current_time: float,
+        provenance: Optional[dict] = None,
+        prefix_plan: Optional[Plan] = None,
+        default_proposer: str = "unknown",
+    ) -> Tuple[Plan, List[dict]]:
+        """
+        Drop ONLY infeasible actions from plan.
+
+        Returns:
+          - filtered_plan (same structure as Plan)
+          - dropped: list of dicts describing dropped actions:
+              {
+                "aid": ..., "box_id": ..., "property": ..., "kind": ...,
+                "reason": "...",
+                "origin": "human|robot|optimizer|unknown",
+                "proposed_by": "human_a|human_b|unknown|None"
+              }
+        """
+        filtered: Plan = {}
+        dropped: List[dict] = []
+
+        if not plan:
+            return {}, []
+
+        box_by_id = {b.box_id: b for b in (boxes or [])}
+
+        prov_idx = self._index_provenance(provenance)
+        prefix_set = set()
+        if isinstance(prefix_plan, dict):
+            for aid, actions in (prefix_plan or {}).items():
+                for (box_id, prop, kind) in (actions or []):
+                    prefix_set.add(self._action_key(aid, int(box_id), prop, kind))
+
+        for aid, actions in (plan or {}).items():
+            kept = []
+            for (box_id, prop, kind) in (actions or []):
+                ok, reason = self._check_action_feasible(
+                    aid=str(aid),
+                    box_id=int(box_id),
+                    prop=str(prop),
+                    kind=str(kind),
+                    box_by_id=box_by_id,
+                    current_time=current_time,
+                )
+                if ok:
+                    kept.append((int(box_id), str(prop), str(kind)))
+                    continue
+
+                k = self._action_key(aid, int(box_id), prop, kind)
+                prov = prov_idx.get(k, {})
+                origin = (prov.get("origin") or "unknown")
+                proposed_by = prov.get("proposed_by")
+
+                # If provenance missing, infer "human" if it was explicitly in prefix_plan
+                if origin == "unknown" and k in prefix_set:
+                    origin = "human"
+                    proposed_by = default_proposer
+
+                dropped.append(
+                    {
+                        "aid": str(aid),
+                        "box_id": int(box_id),
+                        "property": str(prop),
+                        "kind": str(kind),
+                        "reason": reason or "not feasible",
+                        "origin": origin,
+                        "proposed_by": proposed_by,
+                    }
+                )
+
+            filtered[str(aid)] = kept
+
+        # Normalize: remove empty agent lists? keep them for schema consistency if you prefer
+        return filtered, dropped
+
+    def _summarize_dropped_actions_for_humans(self, dropped: List[dict]) -> Optional[str]:
+        if not dropped:
+            return None
+
+        human_drops = [d for d in dropped if (d.get("origin") in ("human", "robot"))]
+        if human_drops:
+            d = human_drops[0]
+            who = d.get("proposed_by") or "a human"
+            who = self._to_display_human(str(who))  # <-- NEW (humans only)
+            return (
+                f"I couldn't include {who}'s request to {d['kind']} box {d['box_id']} ({d['property']}) "
+                f"because {d['reason']}."
+            )
+
+        d = dropped[0]
+        return (
+            f"I dropped an infeasible action ({d['aid']} {d['kind']} box {d['box_id']} {d['property']}) "
+            f"because {d['reason']}."
+        )
+
+
+    def _compose_committed_plan_utterance(
+        self,
+        committed_plan: Plan,
+        dropped: List[dict],
+        fallback: str = "Okay.",
+    ) -> str:
+        """
+        Keep this short; consistent with your “1–2 sentences” norm.
+        """
+        # If we dropped something, explain drop + confirm remaining robot action if any
+        drop_note = self._summarize_dropped_actions_for_humans(dropped)
+        robot_actions = committed_plan.get("robot") or []
+
+        if drop_note and robot_actions:
+            (box_id, prop, kind) = robot_actions[0]
+            return f"{drop_note} I will {kind} box {box_id} ({prop}) now."
+
+        if drop_note and not robot_actions:
+            return drop_note
+
+        # No drops: say what robot will do (first action)
+        if robot_actions:
+            (box_id, prop, kind) = robot_actions[0]
+            return f"I will {kind} box {box_id} ({prop}) now."
+
+        return fallback
+
+    def _build_committed_provenance(
+        self,
+        committed_plan: Plan,
+        session: MediationState,
+    ) -> dict:
+        """
+        Provenance rules:
+          - default origin=optimizer
+          - upgrade to origin=human for actions in session.prefix_plan
+        """
+        prov = self._build_optimizer_provenance(committed_plan)
+
+        prefix = getattr(session, "prefix_plan", None) or {}
+        prefix_set = set()
+        for aid, actions in (prefix or {}).items():
+            for (box_id, prop, kind) in (actions or []):
+                prefix_set.add(self._action_key(aid, int(box_id), prop, kind))
+
+        proposer = (getattr(session, "social", None) and session.social.proposer_id) or "unknown"
+
+        for aid, actions in (committed_plan or {}).items():
+            updated = []
+            for (box_id, prop, kind) in (actions or []):
+                origin = "optimizer"
+                proposed_by = None
+                k = self._action_key(aid, int(box_id), prop, kind)
+                if k in prefix_set:
+                    origin = "human"
+                    proposed_by = proposer
+                updated.append(
+                    {
+                        "box_id": int(box_id),
+                        "property": prop,
+                        "kind": kind,
+                        "origin": origin,
+                        "proposed_by": proposed_by,
+                    }
+                )
+            prov[aid] = updated
+
+        return prov
+
+
     def _summarize_impossible_actions(
         self,
         plan: Plan,
@@ -421,7 +725,7 @@ class BrokerMediationMixin:
                 if reasons:
                     reason_str = " and ".join(reasons)
                     lines.append(
-                        f"- {aid} {kind} box {box_id} ({prop}) → {reason_str}"
+                        f"- {aid} {kind} box {box_id} ({prop}) -> {reason_str}"
                     )
 
         if not lines:
@@ -718,20 +1022,22 @@ class BrokerMediationMixin:
         recent_utterances: List[MediationTurn] = []
         for i, t in enumerate(recent_chat):
             try:
-                role = t.get("role") or "unknown"
+                # IMPORTANT: keep canonical agent ids here: human_a / human_b / robot
+                role = (t.get("role") or "unknown")
                 text = (t.get("text") or "").strip()
                 if not text:
                     continue
                 ts_chat = float(t.get("ts") or ts)
                 recent_utterances.append(
                     MediationTurn(
-                        role=role,
+                        role=role,              # <-- DO NOT map to display name here
                         text=text,
                         meta={"ts": ts_chat},
                     )
                 )
             except Exception:
                 continue
+
 
         interaction = MediationInteractionContext(
             event_summary=self._event_summary_text,
@@ -765,6 +1071,8 @@ class BrokerMediationMixin:
             )
 
 
+        human_ids = list(self.human_agent_ids)  # ["human_a","human_b"]
+
 
         state = MediationState(
             session_id=session_id,
@@ -775,8 +1083,11 @@ class BrokerMediationMixin:
             interaction=interaction,
             turns=initial_turns,
             prefix_plan=prefix_plan,
+            human_ids=human_ids,
             baseline_provenance=getattr(self, "_last_plan_provenance", None),
+
         )
+
 
         self._mediation_sessions[session_id] = state
         self._active_mediation_id = session_id
@@ -842,143 +1153,134 @@ class BrokerMediationMixin:
         ts: float,
     ):
         """
-        Called when a mediation session reaches a terminal status ('accept' or 'reject').
+        Terminal mediation handler with PARTIAL feasibility filtering:
 
-        - Applies the planner_action (adopt / keep baseline), but NEVER adopts
-          a candidate plan that has impossible actions (expired deadlines, already
-          fulfilled actions, etc.).
-        - Publishes the resulting plan exactly once.
-        - Triggers a reflection pass to update human profiles.
-        - Clears the active mediation flag so future plans can start.
+        - If LLM chooses adopt_candidate/merge_plans, we filter out infeasible actions
+          (deadline passed, already disposed, already sensed) instead of rejecting everything.
+        - If the dropped action was human-origin, we explicitly say so.
+        - Robot utterance is forced to match the committed plan (post-filter).
         """
         try:
+            raw_decision = self._normalize_mediation_decision(raw_decision or {})
             pa = (raw_decision or {}).get("planner_action") or {}
-            kind = pa.get("kind")
+            kind = (pa.get("kind") or "keep_baseline").strip()
 
-            # --- SAFETY GUARD: block adoption of impossible candidate plans ---
-            # Rebuild latest boxes snapshot and check candidate for impossible actions.
+            baseline_plan = session.baseline_plan or {}
             candidate_plan = session.candidate_plan or {}
-            keep_baseline_reason = None
+            prefix_plan = getattr(session, "prefix_plan", None) or {}
 
-            if kind in ("adopt_candidate", "merge_plans") and candidate_plan:
-                try:
-                    boxes = getattr(self, "_last_boxes_for_optimizer", None)
-                    if boxes is None:
-                        boxes, _ = self._build_boxes_for_optimizer(
-                            getattr(self, "_last_boxes_state", []) or []
-                        )
+            # Pull boxes snapshot for feasibility checks
+            boxes = getattr(self, "_last_boxes_for_optimizer", None)
+            if boxes is None:
+                boxes, _ = self._build_boxes_for_optimizer(getattr(self, "_last_boxes_state", []) or [])
 
-                    current_time = getattr(self, "_last_server_time", None) or time.time()
-                    impossible_note = self._summarize_impossible_actions(
-                        plan=candidate_plan,
+            current_time = getattr(self, "_last_server_time", None) or time.time()
+            box_positions = getattr(self, "_last_box_positions", {}) or {}
+
+            # Baseline provenance (what we had before this session)
+            baseline_prov = getattr(session, "baseline_provenance", None) or getattr(self, "_last_plan_provenance", None)
+
+            # Decide the intended plan BEFORE filtering
+            intended_plan: Plan
+            if kind in ("adopt_candidate", "merge_plans"):
+                intended_plan = candidate_plan
+            else:
+                intended_plan = baseline_plan
+
+            # Feasibility filtering:
+            # - If we’re keeping baseline, we can still filter baseline (optional), but usually baseline should already be feasible.
+            # - If adopting/merging candidate, filter candidate and keep remaining feasible actions.
+            proposer = (getattr(session, "social", None) and session.social.proposer_id) or "unknown"
+
+            filtered_plan, dropped = self._filter_plan_for_feasibility(
+                plan=intended_plan,
+                boxes=boxes,
+                current_time=current_time,
+                provenance=baseline_prov,      # helps attribute drops if action existed previously
+                prefix_plan=prefix_plan,       # helps attribute drops for newly proposed actions
+                default_proposer=proposer,
+            )
+
+            # If LLM wanted candidate/merge but filtering removed everything new and candidate becomes empty,
+            # fall back to baseline (also filtered lightly).
+            if kind in ("adopt_candidate", "merge_plans"):
+                # If filtered_plan is empty across all agents, it's not useful.
+                any_actions = any((filtered_plan.get(a) or []) for a in ("robot", "human_a", "human_b"))
+                if not any_actions:
+                    self.get_logger().warn(
+                        f"[mediation] candidate became empty after feasibility filtering; keeping baseline."
+                    )
+                    kind = "keep_baseline"
+                    filtered_plan, dropped = self._filter_plan_for_feasibility(
+                        plan=baseline_plan,
                         boxes=boxes,
                         current_time=current_time,
+                        provenance=baseline_prov,
+                        prefix_plan={},  # baseline isn't “newly proposed” here
+                        default_proposer="unknown",
                     )
-                    if impossible_note:
-                        keep_baseline_reason = impossible_note
-                except Exception as e:
-                    # If something goes wrong computing impossibility, be conservative:
+
+            committed_plan = filtered_plan or {}
+
+            # Commit + provenance
+            self._last_plan = committed_plan
+            try:
+                self._last_plan_provenance = self._build_committed_provenance(committed_plan, session)
+            except Exception as e:
+                self.get_logger().warn(f"[mediation] failed to build committed provenance: {e}")
+                self._last_plan_provenance = self._build_optimizer_provenance(committed_plan)
+
+            # Publish committed plan once
+            if committed_plan:
+                self._publish_optimizer_plan(committed_plan, current_time, box_positions)
+
+            # If we dropped something important, log it clearly (with attribution)
+            if dropped:
+                human_drops = [d for d in dropped if d.get("origin") in ("human", "robot")]
+                if human_drops:
+                    d = human_drops[0]
+                    who = d.get("proposed_by") or d.get("origin")
                     self.get_logger().warn(
-                        f"[mediation] failed to re-check candidate feasibility: {e}; "
-                        "keeping baseline plan."
+                        f"[mediation] dropped human-origin action: {who} requested "
+                        f"{d['aid']} {d['kind']} box {d['box_id']} ({d['property']}), reason={d['reason']}"
                     )
-                    keep_baseline_reason = "candidate feasibility check failed"
+                else:
+                    self.get_logger().warn(f"[mediation] dropped infeasible actions: {dropped}")
 
-            # If we detected impossible actions, force keep_baseline
-            if keep_baseline_reason is not None:
-                self.get_logger().warn(
-                    f"[mediation] LLM requested {kind} but candidate plan has "
-                    f"impossible actions; keeping baseline. Details:\n{keep_baseline_reason}"
-                )
-                kind = "keep_baseline"
+            # Speak: force consistency with committed plan (do NOT trust raw mediator utterance after filtering)
+            final_utt = self._compose_committed_plan_utterance(
+                committed_plan=committed_plan,
+                dropped=dropped,
+                fallback=(raw_decision.get("robot_utterance") or "Okay."),
+            )
+            if final_utt:
+                self._robot_say(final_utt)
 
-            # Decide which plan to keep (after safety override)
-            new_plan = session.baseline_plan
-            if kind in ("adopt_candidate", "merge_plans"):
-                new_plan = candidate_plan
+            self.get_logger().info(
+                f"[mediation] finalized session {session_id} with planner_action={kind} "
+                f"(dropped={len(dropped)})"
+            )
 
-            # Publish plan (if any) once mediation is over
-            if new_plan:
-                box_positions = getattr(self, "_last_box_positions", {}) or {}
-                current_time = getattr(self, "_last_server_time", None) or time.time()
-                self._last_plan = new_plan
-
-                try:
-                    # Start with everything as optimizer-origin
-                    prov = self._build_optimizer_provenance(new_plan)
-
-                    # If we have a prefix_plan, upgrade origins to "human"
-                    # for actions explicitly requested in this session.
-                    prefix = getattr(session, "prefix_plan", None) or {}
-                    prefix_set = set()
-                    for aid, actions in (prefix or {}).items():
-                        for (box_id, prop, kind) in (actions or []):
-                            prefix_set.add((aid, int(box_id), prop, kind))
-                            
-                    proposer = session.social.proposer_id or "unknown"
-
-                    for aid, actions in (new_plan or {}).items():
-                        updated = []
-                        for (box_id, prop, kind) in (actions or []):
-                            origin = "optimizer"
-                            proposed_by = None
-                            
-                            if (aid, int(box_id), prop, kind) in prefix_set:
-                                origin = "human"
-                                proposed_by = proposer
-                                
-                            updated.append(
-                                {
-                                    "box_id": int(box_id),
-                                    "property": prop,
-                                    "kind": kind,
-                                    "origin": origin,
-                                    "proposed_by": proposed_by,
-                                }
-                            )
-                        prov[aid] = updated
-
-                    self._last_plan_provenance = prov
-                except Exception as e:
-                    self.get_logger().warn(f"[mediation] failed to build provenance: {e}")
-                    self._last_plan_provenance = self._build_optimizer_provenance(new_plan)
-
-                self._publish_optimizer_plan(new_plan, current_time, box_positions)
-
-                self.get_logger().info(
-                    f"[mediation] finalized session {session_id} with planner_action={kind}"
-                )
-            else:
-                self.get_logger().info(
-                    f"[mediation] session {session_id} finalized with no plan change (kind={kind})"
-                )
-
-            # Reflection: update human profiles based on the whole dialogue.
-            # Run this asynchronously so plan publishing is not blocked.
+            # Kick off reflection asynchronously
             try:
                 self._kickoff_async_reflection(session)
             except Exception as e:
                 self.get_logger().warn(f"[mediation] failed to start async reflection: {e}")
 
-
         except Exception as e:
             self.get_logger().warn(f"[mediation] finalize session failed: {e}")
         finally:
-            # Conversation is over → allow new speech-plan proposals again
             self._active_mediation_id = None
+            self._mediation_pending_deadline_ts = None
 
-            # Tell EventLayer that mediation is no longer pending
             final_status = session.status or "idle"
             if final_status not in ("accept", "reject", "cancelled"):
                 final_status = "idle"
-
-            self._mediation_pending_deadline_ts = None
 
             try:
                 self._publish_mediation_status(session_id, final_status)
             except Exception as e:
                 self.get_logger().warn(f"[mediation] failed to publish final status: {e}")
-            # keep self._mediation_sessions[session_id] for logging/analysis
 
 
     def _build_optimizer_provenance(self, plan: Plan) -> dict:
@@ -1099,14 +1401,26 @@ class BrokerMediationMixin:
         Post-hoc reflection: infer human preference updates from the mediation dialogue.
         """
         # 1) Build a compact transcript
-        transcript = [
-            {
-                "role": t.role,
-                "text": t.text,
-                "meta": t.meta,
-            }
-            for t in session.turns
-        ]
+        transcript = []
+        include_idx = set()
+
+        turns = list(session.turns or [])
+        for i, t in enumerate(turns):
+            role = getattr(t, "role", None)
+            if isinstance(role, str) and role.startswith("human_"):
+                include_idx.add(i)
+                if i - 1 >= 0:
+                    include_idx.add(i - 1)
+
+        for i in sorted(include_idx):
+            tt = turns[i]
+            transcript.append(
+                {
+                    "role": tt.role,  # keep canonical ids
+                    "text": tt.text,
+                    "meta": tt.meta,
+                }
+            )
 
         # 2) Optional: get current profiles from HDT / DB
         current_profiles = self._load_current_human_profiles()  # {"human_a": {...}, ...}
@@ -1461,6 +1775,9 @@ class BrokerMediationMixin:
             )
             self._auto_resolve_pending_session(sid, sess, reason="turn_timeout", now_ts=now_ts)
             return
+
+
+   
 
     def _normalize_mediation_decision(self, raw: dict) -> dict:
         if not isinstance(raw, dict):
