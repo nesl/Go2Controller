@@ -87,11 +87,26 @@ class SkillsAgent(Node):
         
         self.declare_parameter("announce_box_ops", True)
 
+
+        # --- Simulation movement ---
+        self.declare_parameter("sim_move_enable", True)   # movement simulation on/off (only used if sim_mode)
+        self.declare_parameter("sim_lin_speed_mps", 0.35) # how fast we "move" in sim
+        self.declare_parameter("sim_ang_speed_rps", 0.8)  # how fast we "turn" in sim
+        self.declare_parameter("sim_move_min_s", 0.15)    # minimum movement duration
+        self.declare_parameter("sim_move_jitter_s", 0.05) # optional jitter
+
         
         # Box server (for calling /sense directly from skills)
         self.declare_parameter("box_server_url", "http://172.17.40.64:8080")
         self.declare_parameter("box_req_timeout", 200.0)
         self.declare_parameter("agent_id", "robot")  # logical agent id for /sense
+
+        # --- Simulated speech mode (TTS -> STT loopback) ---
+        self.declare_parameter("sim_mode", False)
+        self.declare_parameter("sim_tts_publish_topic", "/audio/stt_text")
+        self.declare_parameter("sim_tts_speaker_id", "robot")   # IMPORTANT: mark as robot
+        self.declare_parameter("sim_tts_delay_s", 0.0)          # optional latency
+
 
         self.declare_parameter("box_cancel_timeout", 2.0)
 
@@ -100,6 +115,11 @@ class SkillsAgent(Node):
         self.box_server_url = self.get_parameter("box_server_url").get_parameter_value().string_value
         self.box_req_timeout = float(self.get_parameter("box_req_timeout").value)
         self.agent_id = self.get_parameter("agent_id").get_parameter_value().string_value or "robot"
+
+        
+        # internal simulated pose (used only in sim mode)
+        self._sim_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+        self._sim_pose_lock = threading.Lock()
 
         
         self.turn_speed = float(self.get_parameter("turn_speed_rad_s").value)
@@ -134,6 +154,11 @@ class SkillsAgent(Node):
         self._coverage_pending = {}   # id -> {"handle": StepHandle, "ctx": dict}
         self._coverage_next_id = 1
 
+        self._sim_tts_pub = self.create_publisher(
+            StringMsg,
+            self.get_parameter("sim_tts_publish_topic").value,
+            10
+        )
 
         # LLM speech_check req/resp
         self.llm_speech_req_pub = self.create_publisher(StringMsg, "/llm/speech_check_req", 10)
@@ -244,12 +269,85 @@ class SkillsAgent(Node):
         # call engine.tick() ~10–20 Hz, lightweight
         self.create_timer(0.05, self._tick_engine)
 
+    def _sim_is_on(self) -> bool:
+        return bool(self.get_parameter("sim_mode").value) and bool(self.get_parameter("sim_move_enable").value)
+
+
     def _send_nav_goal_handle(self, frame: str, x: float, y: float, yaw: float,
                               h: StepHandle, ctx: dict) -> StepHandle:
         """
         Send a Nav2 NavigateToPose goal and complete StepHandle when done.
         Uses h._cancel if caller sets it, but also installs a nav cancel hook.
         """
+        if self._sim_is_on():
+            # duration based on distance and yaw delta
+            with self._sim_pose_lock:
+                x0 = float(self._sim_pose["x"])
+                y0 = float(self._sim_pose["y"])
+                yaw0 = float(self._sim_pose["yaw"])
+
+            dx = float(x) - x0
+            dy = float(y) - y0
+            dist = math.hypot(dx, dy)
+
+            # yaw delta (shortest)
+            yaw1 = float(yaw)
+            dyaw = (yaw1 - yaw0 + math.pi) % (2.0 * math.pi) - math.pi
+
+            lin = max(0.05, float(self.get_parameter("sim_lin_speed_mps").value))
+            ang = max(0.05, float(self.get_parameter("sim_ang_speed_rps").value))
+            min_s = max(0.0, float(self.get_parameter("sim_move_min_s").value))
+            jitter = max(0.0, float(self.get_parameter("sim_move_jitter_s").value))
+
+            total = max(min_s, dist / lin + abs(dyaw) / ang)
+            if jitter > 0.0:
+                total += (random.random() * 2.0 - 1.0) * jitter
+                total = max(min_s, total)
+
+            canceled = {"v": False}
+            prev_cancel = getattr(h, "_cancel", None)
+
+            def _cancel():
+                canceled["v"] = True
+                try:
+                    if callable(prev_cancel):
+                        prev_cancel()
+                finally:
+                    if not h.done():
+                        h.outcome = "canceled"
+                        h.mark_done()
+
+            h._cancel = _cancel
+
+            tbox = {"t": None}
+            def _finish():
+                t = tbox["t"]
+                try:
+                    if t: t.cancel()
+                except Exception:
+                    pass
+                self._live_timers.discard(t)
+
+                if canceled["v"] or h.done():
+                    return
+
+                with self._sim_pose_lock:
+                    self._sim_pose["x"] = float(x)
+                    self._sim_pose["y"] = float(y)
+                    self._sim_pose["yaw"] = float(yaw)
+
+                ctx.setdefault("nav", {})
+                ctx["nav"]["status"] = int(GoalStatus.STATUS_SUCCEEDED)
+                ctx["nav"]["sim"] = {"dist_m": dist, "dyaw_rad": dyaw, "duration_s": total}
+                h.outcome = "ok"
+                h.mark_done()
+
+            t = self.create_timer(max(0.01, total), _finish)
+            tbox["t"] = t
+            self._live_timers.add(t)
+            return h
+
+        
         goal = NavigateToPose.Goal()
         ps = PoseStamped()
         ps.header.frame_id = str(frame or "map")
@@ -1024,12 +1122,60 @@ class SkillsAgent(Node):
 
 
     def say(self, text: str):
-        # Normalize to string
         raw = str(text)
-        # Automatically convert numeric tokens to words
         spoken = _normalize_tts_text(raw)
+
+        # read param live so you can toggle at runtime
+        sim = bool(self.get_parameter("sim_mode").value)
+
+        if sim:
+            self._publish_simulated_stt(spoken)
+            return
+
         self.get_logger().info(f"[TTS] {spoken}")
         self.tts_pub.publish(StringMsg(data=spoken))
+
+
+    def _publish_simulated_stt(self, text: str):
+        if not text.strip():
+            return
+
+        speaker_id = str(self.get_parameter("sim_tts_speaker_id").value or "robot")
+        delay_s = float(self.get_parameter("sim_tts_delay_s").value)
+
+        payload = {
+            "text": text,
+            "speaker_id": speaker_id,
+            "ts": float(self.get_clock().now().nanoseconds * 1e-9),
+            "simulated": True,
+            "source": "skills_agent",
+        }
+
+        def _do_pub():
+            try:
+                self._sim_tts_pub.publish(StringMsg(data=json.dumps(payload)))
+                self.get_logger().info(f"[SIM_TTS->STT] {payload['text']!r} (speaker_id={speaker_id})")
+            except Exception as e:
+                self.get_logger().warn(f"[SIM_TTS->STT] publish failed: {e}")
+
+        if delay_s > 0.0:
+            # one-shot timer; keep strong ref to avoid GC
+            tbox = {"t": None}
+            def _fire_once():
+                t = tbox["t"]
+                try:
+                    if t: t.cancel()
+                except Exception:
+                    pass
+                self._live_timers.discard(t)
+                _do_pub()
+
+            t = self.create_timer(delay_s, _fire_once)
+            tbox["t"] = t
+            self._live_timers.add(t)
+        else:
+            _do_pub()
+
 
 
     def _lp(self, prev: float, new: float) -> float:
@@ -1669,6 +1815,27 @@ class SkillsAgent(Node):
                 h.mark_done()
                 return h
 
+            if bool(self.get_parameter("sim_mode").value):
+                # assume always detected
+                now_ms = int(self.get_clock().now().nanoseconds * 1e-6)
+                norm_target = target_node_id if target_node_id.lower().startswith("cnode") else f"CNode{target_node_id}"
+
+                ctx.setdefault("box", {})
+                ctx["box"].update({
+                    "node_id": norm_target,
+                    "box_id": _box_id_from_node_id(norm_target),
+                    "seen_nearby_ms": now_ms,
+                    "last_bt_payload": {
+                        "object_id": norm_target,
+                        "rssi": -40,
+                        "simulated": True,
+                    },
+                })
+
+                h.mark_done()
+                return h
+
+
             start_ms = int(self.get_clock().now().nanoseconds * 1e-6)
             timeout_ms = max(0.5, float(timeout_s)) * 1000.0
             period = 0.1  # 10 Hz
@@ -1858,6 +2025,10 @@ class SkillsAgent(Node):
             radius_m    = float(self.get_parameter("nav_snap_radius_m").value)
             thr         = int(self.get_parameter("nav_snap_cost_threshold").value)
             cm_timeout  = float(self.get_parameter("nav_snap_costmap_timeout_s").value)
+
+            if self._sim_is_on():
+                snap_enable = False
+
 
             nav_info = {"requested": {"frame": frame, "x": x, "y": y, "yaw": yaw}}
             ctx["nav"] = nav_info
@@ -2073,6 +2244,70 @@ class SkillsAgent(Node):
           - forward : accumulate sum(dxy)      from rule 'odom_dist_delta'
         Falls back on timeouts to avoid runaway if events are missing.
         """
+        
+        if self._sim_is_on():
+            h = StepHandle()
+            az = float(az_deg)
+            dist = float(dist_m)
+
+            lin = max(0.05, float(self.get_parameter("sim_lin_speed_mps").value))
+            ang = max(0.05, float(self.get_parameter("sim_ang_speed_rps").value))
+            min_s = max(0.0, float(self.get_parameter("sim_move_min_s").value))
+            jitter = max(0.0, float(self.get_parameter("sim_move_jitter_s").value))
+
+            t_turn = abs(math.radians(az)) / ang if abs(az) > 0.5 else 0.0
+            t_fwd  = abs(dist) / lin if abs(dist) > 1e-3 else 0.0
+            total = max(min_s, t_turn + t_fwd)
+
+            if jitter > 0.0:
+                total += (random.random() * 2.0 - 1.0) * jitter
+                total = max(min_s, total)
+
+            canceled = {"v": False}
+
+            def _cancel():
+                canceled["v"] = True
+                if not h.done():
+                    h.outcome = "canceled"
+                    h.mark_done()
+
+            h._cancel = _cancel
+
+            tbox = {"t": None}
+            def _finish():
+                t = tbox["t"]
+                try:
+                    if t: t.cancel()
+                except Exception:
+                    pass
+                self._live_timers.discard(t)
+
+                if canceled["v"] or h.done():
+                    return
+
+                # update simulated pose
+                with self._sim_pose_lock:
+                    yaw0 = float(self._sim_pose["yaw"])
+                    yaw1 = yaw0 + math.radians(az)
+                    # wrap
+                    yaw1 = (yaw1 + math.pi) % (2.0 * math.pi) - math.pi
+                    self._sim_pose["yaw"] = yaw1
+
+                    # move forward in the new heading
+                    dx = dist * math.cos(yaw1)
+                    dy = dist * math.sin(yaw1)
+                    self._sim_pose["x"] += dx
+                    self._sim_pose["y"] += dy
+
+                h.outcome = "ok"
+                h.mark_done()
+
+            t = self.create_timer(max(0.01, total), _finish)
+            tbox["t"] = t
+            self._live_timers.add(t)
+            return h
+
+        
         h = StepHandle()
         turn_speed = self.turn_speed
         fwd_speed  = self.fwd_speed

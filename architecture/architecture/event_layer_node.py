@@ -109,6 +109,7 @@ class EventLayerNode(Node):
         self.declare_parameter('rescan_period_s', 2.0)
         self.declare_parameter('enabled', True)
         self.declare_parameter('rules_init_path', '')
+        
 
         # NEW: treat rules with this prefix as planner one-shot triggers
         self.declare_parameter('planner_trigger_prefix', 'trigger_')
@@ -1404,6 +1405,9 @@ class EventLayerNode(Node):
         except Exception:
             # fallback: plain string
             text = (msg.data or "").strip()
+
+        if speaker_id == "robot":
+            return   # 🚫 ignore robot speech entirely
 
         ctx = {
             "text": text,

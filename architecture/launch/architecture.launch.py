@@ -52,6 +52,7 @@ def generate_launch_description():
             parameters=[{
                 'skills_base_path': os.path.join(pkg_share, 'config', 'skills.yaml'),
                 'skills_composite_path': SKILLS_COMPOSITE_PATH,
+                'sim_mode': True,
             }]
         ),
         #Node(
@@ -83,6 +84,7 @@ def generate_launch_description():
                 'model': 'gpt-5-mini',
                 'skills_base_path': os.path.join(pkg_share, 'config', 'skills.yaml'),
                 'skills_composite_path': SKILLS_COMPOSITE_PATH,
+                
             }]
         ),
         #Node(

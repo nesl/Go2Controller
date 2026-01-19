@@ -9,7 +9,13 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Literal, Tuple
 
+from collections import deque
+import uuid
+
+
 import requests
+
+import random
 
 import rclpy
 from rclpy.node import Node
@@ -83,12 +89,6 @@ class ScriptedHelpThenDisposePolicy(BasePolicy):
 
     def decide(self, agent: "SimHumanAgent", boxes: List[BoxSummary], now_sim: float) -> PolicyAction:
     
-        # 0) handle incoming help requests (breaks ask-loop dynamics)
-        req_action = agent._pop_help_request_action(boxes, now_sim)
-        if req_action is not None:
-            return req_action
-
-    
         goal = agent.goal_property
 
         # Build candidate list with scores
@@ -138,6 +138,18 @@ class ScriptedHelpThenDisposePolicy(BasePolicy):
             )
 
         st = agent._box_state(box.box_id, goal)
+        
+
+        # ✅ NEW: if helper already conclusively rejected/ignored this exact request, don't re-ask
+        if st.get("asked_help_outcome") in ("reject", "ignore"):
+            return PolicyAction(
+                kind="sense_self",
+                box_id=box.box_id,
+                prop=goal,
+                text=f"I'll sense box {box.box_id} for {goal} myself.",
+                reason=f"helper_outcome={st.get('asked_help_outcome')}, so sense_self",
+            )
+        
         asked_at = st.get("asked_help_at_sim", None)
 
         if asked_at is None:
@@ -162,11 +174,18 @@ class ScriptedHelpThenDisposePolicy(BasePolicy):
             )
 
         waited = now_sim - float(asked_at)
-        if waited < agent.help_wait_sec:
+
+        # Only block duplicating THIS exact (box, goal) if we're actively waiting on it.
+        # Otherwise, keep planning (maybe another box).
+        if agent._waiting_help_block_same_task(box.box_id, goal, now_sim):
             return PolicyAction(
                 kind="idle",
-                reason=f"waiting_for_help box={box.box_id} waited={waited:.1f}s < help_wait={agent.help_wait_sec:.1f}s",
+                reason=(
+                    f"waiting_for_help_same_task box={box.box_id} waited={waited:.1f}s "
+                    f"< help_wait={agent.help_wait_sec:.1f}s"
+                ),
             )
+
 
         if st.get("self_sensed", False):
             agent._mark_abandoned(box.box_id, goal, why="self_sensed_still_uncertain")
@@ -195,6 +214,28 @@ class LLMPolicy(BasePolicy):
     def __init__(self, fallback: BasePolicy):
         self.fallback = fallback
         self._client = None
+
+    def _should_ask_help_first(self, agent: "SimHumanAgent") -> bool:
+        """
+        Decide if asking help is worth it vs sensing self first, based on sensor skill and trust.
+        Heuristic: ask if best helper has clearly higher expected info quality than self.
+        """
+        goal = agent.goal_property
+        self_skill = float(agent.sensor_params.get(agent.agent_id, {}).get(goal, {}).get("skill", 0.5))
+
+        best = -1.0
+        for pid in agent.participants.keys():
+            if pid == agent.agent_id:
+                continue
+            trust = float(agent.trust_map.get(pid, 0.5))
+            helper_skill = float(agent.sensor_params.get(pid, {}).get(goal, {}).get("skill", 0.5))
+            score = 0.65 * trust + 0.35 * helper_skill
+            best = max(best, score)
+
+        # If we ourselves are strong, sense first.
+        # If a helper is meaningfully better, ask first.
+        return (best - self_skill) >= 0.08
+
 
     def _get_client(self, agent: "SimHumanAgent"):
         if agent.llm_provider != "openai":
@@ -231,6 +272,15 @@ class LLMPolicy(BasePolicy):
             if sr.get("status") == "completed" and sr.get("property") == goal and sr.get("agent_id"):
                 sensed_by.append(str(sr.get("agent_id")))
 
+        you_sensed_goal = any(
+            sr.get("status") == "completed"
+            and sr.get("property") == goal
+            and str(sr.get("agent_id")) == agent.agent_id
+            for sr in b.sense_results
+        )
+
+
+
         return {
             "box_id": b.box_id,
             "pos": [round(b.x, 2), round(b.y, 2)],
@@ -239,6 +289,7 @@ class LLMPolicy(BasePolicy):
             "disposed_goal": bool(b.disposed_X if goal == "X" else b.disposed_Y),
             "p_present_goal": round(float(p_present), 3),
             "goal_sensed_by": list(dict.fromkeys(sensed_by)),
+            "you_already_sensed_goal": bool(you_sensed_goal),
         }
 
     def _system_prompt(self, agent: "SimHumanAgent") -> str:
@@ -258,6 +309,8 @@ class LLMPolicy(BasePolicy):
                 "sensor_skill_goal": round(skill, 2),
             })
 
+        ask_first = self._should_ask_help_first(agent)
+
         # nudge behavior with risk_aversion
         eff_dispose_th = min(0.95, max(0.55, agent.dispose_threshold + 0.15 * (agent.risk_aversion - 0.5)))
 
@@ -265,17 +318,32 @@ class LLMPolicy(BasePolicy):
             f"You are {agent.agent_id} ({agent._display_name(agent.agent_id)}), a simulated human.\n"
             f"Your personal objective: maximize disposals of property {agent.goal_property} before deadlines.\n\n"
             "You act in discrete steps. Each step you choose exactly ONE action.\n"
-            "If you are uncertain a box has your goal property, prefer asking a helper to sense it first.\n"
+
+             "If uncertain, choose between (a) ask helper first or (b) sense yourself first.\n"
+             "Use sensor skill: if your own sensor_skill_goal is close to or better than the best helper, sense yourself first.\n"
+             "Ask for help first only when a helper’s combined (trust + sensor_skill_goal) is meaningfully better than yours.\n"
+
+
             "You may ask either a robot or another human for sensing help.\n\n"
             "Helpers available (use trust and sensor_skill_goal to decide whom to ask):\n"
             "IMPORTANT: target_speaker MUST be an ID from helpers (e.g., \"human_a\"), NOT a name (e.g., \"Sam\").\n"
             "If there is an inbox request you can’t help with, choose kind=say and explain briefly.\n"
+            "- If you asked for help on a box recently (asked_help_at_sim exists and < help_wait_sec), do NOT ask again; choose idle or sense_self.\n"
+            "- If your last_message_outcome indicates your last help request was rejected for the same box, do NOT repeat; sense_self instead.\n"
+
+            f"\nHeuristic: ask_help_first_recommended={ask_first}\n"
+
 
             f"{json.dumps(helpers)}\n\n"
             "Hard constraints:\n"
             "- Dispose only when confident a box has your goal property.\n"
             "- If uncertain, ask for sensing help before sensing yourself.\n"
             "- Choose exactly ONE action each step.\n\n"
+            "- You may sense a given (box_id, prop) at most ONCE yourself. If you already sensed it, do NOT choose sense_self again.\n"
+
+            "- If kind is \"ask_help\" or \"say\", you MUST provide a non-empty \"text\".\n"
+            "- For ask_help, the text must explicitly mention box_id and prop.\n"
+
             "Output FORMAT (strict): output ONLY valid JSON matching this schema:\n"
             "{\n"
             '  "kind": "idle|ask_help|sense_self|dispose|say",\n'
@@ -290,16 +358,12 @@ class LLMPolicy(BasePolicy):
             f"- Give up if p_present_goal <= {agent.giveup_threshold:.2f}\n"
         )
 
+
     def _format_inbox(self, agent: "SimHumanAgent") -> List[Dict[str, Any]]:
-        out = []
-        for r in agent.inbox_requests[-5:]:
-            out.append({
-                "from": r.get("from"),
-                "from_name": agent._display_name(str(r.get("from"))),
-                "box_id": r.get("box_id"),
-                "prop": r.get("prop"),
-            })
-        return out
+        tail = list(agent.inbox)[-5:]
+        return [{"from": e.get("speaker_id"), "text": e.get("text")} for e in tail]
+
+
 
 
     def _user_prompt(self, agent: "SimHumanAgent", boxes: List[BoxSummary], now_sim: float) -> str:
@@ -310,6 +374,15 @@ class LLMPolicy(BasePolicy):
 
 
         recent = [{"speaker_id": m.get("speaker_id"), "text": m.get("text")} for m in agent.last_msgs[-6:]]
+
+        last_dec = {
+            "last_message_decision": agent.plan_state.get("last_message_decision"),
+            "last_message_from": agent.plan_state.get("last_message_from"),
+            "last_message_text": agent.plan_state.get("last_message_text"),
+            "last_message_time": agent.plan_state.get("last_message_time"),
+            "last_message_reason": agent.plan_state.get("last_message_reason"),
+        }
+
 
         obs = {
             "time": round(now_sim, 2),
@@ -335,8 +408,27 @@ class LLMPolicy(BasePolicy):
             "help_history": agent.help_history,
             "ignore_history": agent.ignore_history,
             "help_cooldown_sec": agent.help_cooldown_sec,
+            "last_message_outcome": last_dec,
+
 
         }
+        
+        tail_inbox = list(agent.inbox)[-5:]
+        obs["inbox"] = [{"speaker_id": e.get("speaker_id"), "text": e.get("text")} for e in tail_inbox]
+
+        
+        obs["commitments"] = agent.plan_state.get("commitments", [])[-10:]
+
+        obs["plan_state"] = {
+            "phase": agent.plan_state.get("phase"),
+            "waiting_help_box_id": agent.plan_state.get("waiting_help_box_id"),
+            "waiting_help_prop": agent.plan_state.get("waiting_help_prop"),
+            "waiting_on": agent.plan_state.get("waiting_on"),
+            "waiting_started_sim": agent.plan_state.get("waiting_started_sim"),
+            "commitments": agent.plan_state.get("commitments", [])[-10:],
+        }
+
+
         return json.dumps(obs)
 
     def _parse_action(self, agent: "SimHumanAgent", txt: str) -> Optional[PolicyAction]:
@@ -348,8 +440,11 @@ class LLMPolicy(BasePolicy):
             return None
 
         kind = data.get("kind")
-        if kind not in ("idle", "ask_help", "sense_self", "dispose", "say"):
+        if kind not in ("idle", "ask_help", "sense_self", "dispose", "say", "goto_only"):
             return None
+
+
+
 
         box_id = data.get("box_id", None)
         if box_id is not None:
@@ -357,6 +452,9 @@ class LLMPolicy(BasePolicy):
                 box_id = int(box_id)
             except Exception:
                 return None
+
+        if kind == "goto_only" and box_id is None:
+            return None
 
         prop = data.get("prop", None)
         if prop is not None and prop not in ("X", "Y"):
@@ -402,13 +500,274 @@ class LLMPolicy(BasePolicy):
             reason=reason,
         )
 
+    def decide_on_message(self, agent: "SimHumanAgent", boxes: List[BoxSummary], now_sim: float, msg_evt: Dict[str, Any]) -> Optional[PolicyAction]:
+        if agent.llm_provider != "openai":
+            return None
+        client = self._get_client(agent)
+        if client is None:
+            return None
+
+        # System prompt: negotiation + consistency + anti-loop
+        sys_msg = self._system_prompt_message_router(agent)
+
+        # User prompt includes: world, plan_state, trust, the message
+        obs = json.loads(self._user_prompt(agent, boxes, now_sim))
+        obs["mode"] = "handle_message"
+        obs["incoming_message"] = {"speaker_id": msg_evt["speaker_id"], "text": msg_evt["text"]}
+        obs["plan_state"] = agent.plan_state
+        obs["memory"] = agent._memory_brief()
+
+        user_msg = json.dumps(obs)
+
+        agent._dbg_llm("SYSTEM_MSG_ROUTER", sys_msg)
+        agent._dbg_llm("USER_MSG_ROUTER", user_msg)
+
+        # ✅ stochastic desync to avoid both agents choosing same action at same sim-time
+        if agent.llm_jitter_enable:
+            lo = max(0.0, float(agent.llm_jitter_min_sec))
+            hi = max(lo, float(agent.llm_jitter_max_sec))
+            dt = random.uniform(lo, hi)
+            agent._log("LLM", f"jitter_sleep {dt:.2f}s before ACT call")
+            time.sleep(dt)
+
+
+        try:
+            resp = client.responses.create(
+                model=agent.llm_model,
+                input=[
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=agent.llm_temperature,
+                max_output_tokens=agent.llm_max_tokens,
+                timeout=agent.llm_timeout_sec,
+            )
+            raw = resp.output_text
+        except Exception as e:
+            agent.get_logger().warn(f"[LLM] message-router call failed: {e}")
+            return None
+
+        agent._log("LLM", f"raw_router={raw!r}")
+
+        parsed = self._parse_router_output(agent, raw)
+        if parsed is None:
+            return None
+
+        act = parsed.get("action")  # ✅ define before using
+
+        # record last decision (fine to keep)
+        agent.plan_state["last_message_decision"] = parsed.get("message_decision")
+        agent.plan_state["last_message_reason"] = parsed.get("reason", "")
+        agent.plan_state["last_message_from"] = msg_evt.get("speaker_id")
+        agent.plan_state["last_message_text"] = msg_evt.get("text")
+        agent.plan_state["last_message_time"] = now_sim
+
+        decision = parsed.get("message_decision")
+        requester = str(msg_evt.get("speaker_id", ""))
+
+        # ✅ If we were waiting for help from someone, and THIS message is from that person,
+        # treat the router decision as the "response outcome" and update waiting_help.
+        if agent.plan_state.get("phase") == "waiting_help" and requester == str(agent.plan_state.get("waiting_on")):
+            # record in per-box memory so scripted/LLM can avoid re-asking / decide next
+            w_box = agent.plan_state.get("waiting_help_box_id")
+            w_prop = agent.plan_state.get("waiting_help_prop")
+            if w_box is not None and w_prop in ("X", "Y"):
+                st = agent._box_state(int(w_box), str(w_prop))  # type: ignore[arg-type]
+                st["asked_help_outcome"] = decision
+                st["asked_help_responded_at_sim"] = float(now_sim)
+
+            if decision != "negotiate":
+                # accept/reject/defer/ignore => we have an answer; exit waiting_help immediately
+                agent._clear_waiting_help(why=f"got_response decision={decision} from={requester}")
+            else:
+                # negotiate => negotiation still unresolved; keep waiting_help alive
+                # (optionally reset the timer so you get a fresh window)
+                agent.plan_state["waiting_started_sim"] = float(now_sim)
+                agent._log("MEM", f"keep waiting_help (negotiate) from={requester}")
+
+
+        if decision in ("accept", "defer", "negotiate") and isinstance(act, dict):
+            box_id = act.get("box_id", None)
+            prop = act.get("prop", None)
+            requested_kind = act.get("kind", None)
+
+            # basic defer: wait a little before helping if LLM chose defer
+            due_after = now_sim + 8.0 if decision == "defer" else now_sim
+
+            agent._add_or_update_commitment(
+                requester=requester,
+                box_id=box_id,
+                prop=prop,
+                decision=decision,
+                now_sim=now_sim,
+                requested_kind=requested_kind,
+                due_after=due_after,
+                notes=str(parsed.get("reply_text") or ""),
+            )
+
+            # Fetch the commitment we just created/updated
+            if box_id is not None and prop is not None:
+                c = agent._find_active_commitment(
+                    requester=requester,
+                    box_id=int(box_id),
+                    prop=str(prop).upper(),
+                )
+                if c is not None:
+                    # Priority: lower = sooner (default 10)
+                    try:
+                        c["priority"] = int(parsed.get("priority", 10))
+                    except Exception:
+                        c["priority"] = 10
+
+                    # Urgent override: can preempt current action if True
+                    c["urgent_override"] = bool(parsed.get("urgent_override", False))
+
+                    # By default, do NOT interrupt current physical action
+                    # (urgent_override=True bypasses this)
+                    c["blocked_on_busy"] = not c["urgent_override"]
+
+
+        # If reject/ignore and action refers to a previously-active commitment, cancel it
+        if decision in ("reject", "ignore") and isinstance(act, dict):
+            box_id = act.get("box_id", None)
+            prop = act.get("prop", None)
+            if box_id is not None and prop is not None:
+                existing = agent._find_active_commitment(requester=requester, box_id=int(box_id), prop=str(prop).upper())
+                if existing:
+                    agent._complete_commitment(existing, status="cancelled")
+
+
+
+        # If reply_text exists, publish it as "say" (without blocking action)
+        if parsed.get("reply_text"):
+            agent._publish_utterance(str(parsed["reply_text"]))
+
+
+        if act:
+            return self._parse_action(agent, json.dumps(act))
+
+        return PolicyAction(kind="idle", reason="handled_message_no_action")
+
+    def _system_prompt_message_router(self, agent: "SimHumanAgent") -> str:
+        return (
+            f"You are the decision-making policy for {agent.agent_id} ({agent._display_name(agent.agent_id)}).\n"
+            f"Goal: dispose boxes with property {agent.goal_property} before deadlines.\n"
+            "You receive ONE incoming message and must decide how to respond.\n\n"
+            "You must choose ONE message decision:\n"
+            "- accept: you agree and will do it now or schedule it\n"
+            "- reject: you refuse clearly\n"
+            "- negotiate: counteroffer (different box, different timing, or reciprocal help)\n"
+            "- defer: you acknowledge but postpone\n"
+            "- ignore: no response\n\n"
+            "Anti-loop constraints:\n"
+            "- Do NOT repeatedly ask for help on the same box if you are already waiting.\n"
+            "- If the incoming message is a help request, decide accept/reject/negotiate/defer based on your current plan_state.\n"
+            "If the incoming message asks you to sense/dispose a box, you MUST include box_id and prop in the action.\n"
+            "- Prefer ACCEPT if cost is low and trust is moderate/high.\n"
+            "- Prefer REJECT or DEFER if it jeopardizes your imminent disposal opportunity.\n"
+            "- NEGOTIATE if you can help later or want reciprocal help.\n\n"
+            "- If the agent is waiting_help, do NOT recommend duplicating the SAME (waiting_help_box_id, waiting_help_prop) yourself.\n"
+            "- If you respond accept/reject/defer/ignore to a waiting-help interaction, that resolves it; only negotiate keeps it unresolved.\n"
+
+            "Output ONLY strict JSON of the form:\n"
+
+
+            "{\n"
+            '  "mode": "handle_message",\n'
+            '  "message_decision": "accept|reject|negotiate|defer|ignore",\n'
+            '  "reply_text": string|null,\n'
+            '  "urgent_override": boolean,\n'
+            '  "priority": number,\n'
+            '  "action": {\n'
+            '    "kind": "idle|ask_help|sense_self|dispose|say|goto_only",\n'
+            '    "box_id": number|null,\n'
+            '    "prop": "X|Y|null",\n'
+            '    "target_speaker": string|null,\n'
+            '    "text": string|null,\n'
+            '    "reason": string\n'
+            "  }|null,\n"
+            '  "reason": string\n'
+            "}\n"
+        )
+
+
+    def _parse_router_output(self, agent: "SimHumanAgent", txt: str) -> Optional[Dict[str, Any]]:
+        try:
+            data = json.loads(txt)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        if data.get("mode") != "handle_message":
+            return None
+        if data.get("message_decision") not in ("accept", "reject", "negotiate", "defer", "ignore"):
+            return None
+        # reply_text optional
+        rt = data.get("reply_text", None)
+        if rt is not None and not isinstance(rt, str):
+            data["reply_text"] = None
+        # action optional (validated later)
+        if "action" in data and data["action"] is not None and not isinstance(data["action"], dict):
+            data["action"] = None
+            
+
+        uo = data.get("urgent_override", False)
+        data["urgent_override"] = bool(uo)
+
+        pr = data.get("priority", 10)
+        try:
+            data["priority"] = int(pr)
+        except Exception:
+            data["priority"] = 10
+
+            
+        return data
+
+
     def decide(self, agent: "SimHumanAgent", boxes: List[BoxSummary], now_sim: float) -> PolicyAction:
     
-        # handle incoming help requests first (social reflex)
-        req_action = agent._pop_help_request_action(boxes, now_sim)
-        if req_action is not None:
-            return req_action
+        # ✅ commitments override: if we promised to help someone, do that first
+        c = agent._next_executable_commitment(now_sim)
+        if c is not None:
+            box_id = int(c["box_id"])
+            prop = str(c["prop"]).upper()
+            requester = str(c["from"])
+            kind = str(c.get("requested_kind", "sense_self"))
 
+            # If box already has a completed sense for that prop, we can "finish" the commitment with a say
+            b = next((bb for bb in boxes if bb.box_id == box_id), None)
+            if b is None:
+                agent._complete_commitment(c, status="cancelled")
+            else:
+                already_sensed = any(sr.get("status") == "completed" and sr.get("property") == prop for sr in b.sense_results)
+                if already_sensed and kind in ("sense_self", "goto_only"):
+                    agent._complete_commitment(c, status="done")
+                    return PolicyAction(
+                        kind="say",
+                        text=f"{agent._display_name(requester)}, box {box_id} already has a recent sense for {prop}.",
+                        target_speaker=requester,
+                        reason="commitment_fulfilled_already_sensed",
+                    )
+
+                # Execute the commitment action now
+                # Most common: sense_self to help them
+                act = PolicyAction(
+                    kind="sense_self" if kind not in ("dispose", "goto_only", "say") else kind,  # safe mapping
+                    box_id=box_id if kind != "say" else None,
+                    prop=prop if kind != "say" else None,  # for say, no prop required
+                    target_speaker=requester,
+                    text=f"Okay {agent._display_name(requester)}, I’ll sense box {box_id} for {prop}." if kind != "say" else f"Okay {agent._display_name(requester)}.",
+                    reason=f"execute_commitment decision={c.get('decision')}",
+                )
+
+                # Mark as done *optimistically* for now; or mark done after actual sensing.
+                # Better: mark done after the sense succeeds. Easiest is: mark here, and if sense fails it’s fine.
+                # keep it active; we'll mark done in _execute after successful sense/dispose
+                agent.plan_state["active_commitment_id"] = c.get("id")
+                return act
+
+         
+ 
     
         if agent.llm_provider == "none":
             return self.fallback.decide(agent, boxes, now_sim)
@@ -419,6 +778,10 @@ class LLMPolicy(BasePolicy):
 
         sys_msg = self._system_prompt(agent)
         user_msg = self._user_prompt(agent, boxes, now_sim)
+
+        agent._dbg_llm("SYSTEM_MSG_ACT", sys_msg)
+        agent._dbg_llm("USER_MSG_ACT", user_msg)
+
 
         agent._log("LLM", f"call model={agent.llm_model} temp={agent.llm_temperature} max_tokens={agent.llm_max_tokens}")
 
@@ -446,10 +809,28 @@ class LLMPolicy(BasePolicy):
             agent.get_logger().warn("[LLM] invalid JSON action; falling back to scripted policy")
             return self.fallback.decide(agent, boxes, now_sim)
 
+        if action.kind == "sense_self" and action.box_id is not None and action.prop is not None:
+            st = agent._box_state(action.box_id, action.prop)
+            if st.get("self_sensed", False):
+                agent.get_logger().warn("[LLM] sense_self requested but already self_sensed; overriding to idle")
+                return PolicyAction(kind="idle", reason="guardrail_repeat_sense_self")
+
+
         # Guardrail: never allow disposing non-goal property
         if action.kind == "dispose" and action.prop != agent.goal_property:
             agent.get_logger().warn("[LLM] attempted dispose of non-goal property; overriding to idle")
             return PolicyAction(kind="idle", reason="guardrail_non_goal_dispose")
+
+        # Guardrail: while waiting_help is active, don't duplicate the same task yourself
+        if (
+            action.kind == "sense_self"
+            and action.box_id is not None
+            and action.prop is not None
+            and agent._waiting_help_block_same_task(int(action.box_id), action.prop, now_sim)
+        ):
+            agent.get_logger().warn("[LLM] sense_self matches active waiting_help; overriding to idle")
+            return PolicyAction(kind="idle", reason="guardrail_waiting_help_same_task")
+
 
         # Guardrail: if disposing but confidence low -> convert to help request
         if action.kind == "dispose" and action.box_id is not None:
@@ -522,6 +903,19 @@ class SimHumanAgent(Node):
 
         # logging
         self.declare_parameter("log_actions", True)
+        
+        self.declare_parameter("llm_jitter_enable", True)
+        self.declare_parameter("llm_jitter_min_sec", 1.0)
+        self.declare_parameter("llm_jitter_max_sec", 2.0)
+
+        self.declare_parameter("waiting_mode", "strict")  # strict | soft
+        self.waiting_mode = str(self.get_parameter("waiting_mode").value).lower()
+
+
+        self.llm_jitter_enable = bool(self.get_parameter("llm_jitter_enable").value)
+        self.llm_jitter_min_sec = float(self.get_parameter("llm_jitter_min_sec").value)
+        self.llm_jitter_max_sec = float(self.get_parameter("llm_jitter_max_sec").value)
+
 
         self.agent_id: str = str(self.get_parameter("agent_id").value)
         self.goal_property: Property = str(self.get_parameter("goal_property").value)  # type: ignore
@@ -563,6 +957,39 @@ class SimHumanAgent(Node):
         self.last_msgs: List[Dict[str, Any]] = []
         self._mem: Dict[Tuple[int, str], Dict[str, Any]] = {}
 
+        # ✅ Use deque so router can consume safely and efficiently
+        self.inbox = deque()  # type: ignore[var-annotated]
+        self.declare_parameter("max_inbox_per_tick", 2)
+        self.max_inbox_per_tick = int(self.get_parameter("max_inbox_per_tick").value)
+
+        # ✅ router cadence (separate from action loop)
+        self.declare_parameter("router_period_sec", 0.2)
+        self.router_period_sec = float(self.get_parameter("router_period_sec").value)
+
+        # ✅ busy flag (true while doing travel/sense/dispose)
+        self._busy_lock = threading.Lock()
+        self._busy = False
+
+        # router threading
+        self._router_lock = threading.Lock()
+        self._router_thread: Optional[threading.Thread] = None
+
+
+
+        self.plan_state: Dict[str, Any] = {
+            "focus_box_id": None,
+            "focus_prop": self.goal_property,
+            "phase": "explore",
+            "last_commitment": "",
+            # ✅ new
+            "commitments": [],   # list[dict]
+            "next_intent": None, # optional: (box_id, prop, kind) if you want
+            "active_commitment_id": None,
+
+        }
+
+
+
         # threading
         self._action_lock = threading.Lock()
         self._action_thread: Optional[threading.Thread] = None
@@ -596,6 +1023,10 @@ class SimHumanAgent(Node):
 
         self.create_timer(self.decision_period, self._tick)
 
+        # ✅ message router runs independently; stays responsive while server calls block
+        self.create_timer(self.router_period_sec, self._router_tick)
+
+
         self.get_logger().info(
             f"SimHumanAgent up agent_id={self.agent_id} goal={self.goal_property} "
             f"server={self.base_url} topic={self.stt_topic} policy={self.policy_type} "
@@ -603,6 +1034,154 @@ class SimHumanAgent(Node):
             f"help_wait={self.help_wait_sec}s speed={self.speed_mps} timeout={self.timeout}s "
             f"llm_provider={self.llm_provider} llm_model={self.llm_model}"
         )
+
+    def _clear_waiting_help(self, why: str = "") -> None:
+        if self.plan_state.get("phase") == "waiting_help":
+            self._log("MEM", f"clear waiting_help {why}".strip())
+        self.plan_state["phase"] = "explore"
+        self.plan_state["waiting_help_box_id"] = None
+        self.plan_state["waiting_help_prop"] = None
+        self.plan_state["waiting_on"] = None
+        self.plan_state["waiting_started_sim"] = None
+
+    def _waiting_help_matches(self, box_id: int, prop: Property) -> bool:
+        return (
+            self.plan_state.get("phase") == "waiting_help"
+            and self.plan_state.get("waiting_help_box_id") == int(box_id)
+            and str(self.plan_state.get("waiting_help_prop")) == str(prop)
+        )
+
+    def _waiting_help_block_same_task(self, box_id: int, prop: Property, now_sim: float) -> bool:
+        """True only if we're actively waiting AND it's for THIS exact (box_id, prop)."""
+        return self._waiting_help_matches(box_id, prop) and self._waiting_help_active(now_sim)
+
+
+    def _dbg_llm(self, tag: str, txt: str, max_chars: int = 4000) -> None:
+        # keep logs readable
+        s = txt if len(txt) <= max_chars else (txt[:max_chars] + f"...[trunc {len(txt)-max_chars} chars]")
+        self._log("LLM_PROMPT", f"{tag}={s}")
+
+
+    def _commitments(self) -> List[Dict[str, Any]]:
+        self.plan_state.setdefault("commitments", [])
+        return self.plan_state["commitments"]
+
+    def _find_active_commitment(self, *, requester: str, box_id: int, prop: str) -> Optional[Dict[str, Any]]:
+        for c in reversed(self._commitments()):
+            if c.get("status") != "active":
+                continue
+            if c.get("from") == requester and int(c.get("box_id")) == int(box_id) and str(c.get("prop")) == str(prop):
+                return c
+        return None
+
+    def _add_or_update_commitment(
+        self,
+        *,
+        requester: str,
+        box_id: Optional[int],
+        prop: Optional[str],
+        decision: str,
+        now_sim: float,
+        requested_kind: Optional[str] = None,
+        due_after: Optional[float] = None,
+        notes: str = "",
+    ) -> None:
+        if box_id is None or prop is None:
+            return
+
+        prop = str(prop).upper()
+        if prop not in ("X", "Y"):
+            return
+
+        existing = self._find_active_commitment(requester=requester, box_id=int(box_id), prop=prop)
+        if existing is None:
+            cid = f"{requester}:{int(box_id)}:{prop}:{now_sim:.2f}"
+            existing = {
+                "id": cid,
+                "from": requester,
+                "box_id": int(box_id),
+                "prop": prop,
+                "requested_kind": requested_kind or "sense_self",
+                "decision": decision,
+                "status": "active",
+                "created_at": float(now_sim),
+                "due_after": float(due_after) if due_after is not None else float(now_sim),
+                "expires_at": float(now_sim) + 60.0,
+                "notes": notes,
+
+                # ✅ scheduling knobs
+                "priority": 10,            # lower = sooner
+                "urgent_override": False,  # if True, can preempt while busy
+                "blocked_on_busy": True,   # default: do after current action
+            }
+
+            self._commitments().append(existing)
+            # cap list size
+            self.plan_state["commitments"] = self.plan_state["commitments"][-30:]
+        else:
+            existing["decision"] = decision
+            if requested_kind:
+                existing["requested_kind"] = requested_kind
+            if due_after is not None:
+                existing["due_after"] = float(due_after)
+            if notes:
+                existing["notes"] = notes
+            existing["expires_at"] = float(now_sim) + 60.0
+
+    def _expire_old_commitments(self, now_sim: float) -> None:
+        for c in self._commitments():
+            if c.get("status") != "active":
+                continue
+            exp = c.get("expires_at", None)
+            if isinstance(exp, (int, float)) and float(now_sim) > float(exp):
+                c["status"] = "expired"
+
+    def _next_executable_commitment(self, now_sim: float) -> Optional[Dict[str, Any]]:
+        self._expire_old_commitments(now_sim)
+
+        candidates = []
+        busy = self._is_busy()
+
+        for c in self._commitments():
+            if c.get("status") != "active":
+                continue
+            if c.get("decision") not in ("accept", "defer", "negotiate"):
+                continue
+            if float(now_sim) < float(c.get("due_after", now_sim)):
+                continue
+
+            # ✅ if we're busy, only allow urgent_override commitments
+            if busy and c.get("blocked_on_busy", True) and not bool(c.get("urgent_override", False)):
+                continue
+
+            candidates.append(c)
+
+        if not candidates:
+            return None
+
+        # ✅ priority first, then oldest
+        candidates.sort(key=lambda c: (int(c.get("priority", 10)), float(c.get("created_at", 0.0))))
+        return candidates[0]
+
+
+    def _complete_commitment(self, c: Dict[str, Any], status: str = "done") -> None:
+        c["status"] = status
+
+
+    def _memory_brief(self, limit: int = 30) -> List[Dict[str, Any]]:
+        out = []
+        for (box_id, prop), st in list(self._mem.items())[-limit:]:
+            out.append({
+                "box_id": box_id,
+                "prop": prop,
+                "status": st.get("status"),
+                "asked_help_at_sim": st.get("asked_help_at_sim"),
+                "asked_help_to": st.get("asked_help_to"),
+                "ask_count": st.get("ask_count", 0),
+                "self_sensed": st.get("self_sensed", False),
+            })
+        return out
+
 
     def _should_help_request(self, req: Dict[str, Any], now_sim: float, boxes: List[BoxSummary]) -> bool:
         """
@@ -721,8 +1300,12 @@ class SimHumanAgent(Node):
     # Logging
     # ---------------------------
     def _log(self, tag: str, msg: str) -> None:
-        if self.log_actions:
-            self.get_logger().info(f"[{tag}] {msg}")
+        if not self.log_actions:
+            return
+        if tag in {"START", "HTTP"}:
+            return
+        self.get_logger().info(f"[{tag}] {msg}")
+
 
     # ---------------------------
     # Participant registry + profiles
@@ -821,46 +1404,32 @@ class SimHumanAgent(Node):
                 skill = self._sensor_skill_from_params(present, absent)
                 self.sensor_params[pid][prop] = {"present": present, "absent": absent, "skill": skill}
 
-        # Base trust: derived from helper's sensor skill for our goal property
+        # Parse trust overrides ONCE
+        trust_overrides_raw = str(self.get_parameter("trust_overrides_json").value)
+        try:
+            trust_overrides = json.loads(trust_overrides_raw)
+            if not isinstance(trust_overrides, dict):
+                trust_overrides = {}
+        except Exception:
+            trust_overrides = {}
+
         for pid in self.participants.keys():
             if pid == self.agent_id:
                 continue
             sp = self.sensor_params.get(pid, {}).get(self.goal_property)
             base = float(sp["skill"]) if sp else 0.5
-            # mild robot bias
             if self.participants.get(pid, {}).get("type") == "robot":
                 base = min(1.0, base + 0.1)
+
+            # apply override if provided
+            if pid in trust_overrides:
+                try:
+                    base = float(trust_overrides[pid])
+                except Exception:
+                    pass
+
             self.trust_map[pid] = base
 
-            # Parse trust overrides once
-            trust_overrides_raw = str(self.get_parameter("trust_overrides_json").value)
-            try:
-                trust_overrides = json.loads(trust_overrides_raw)
-                if not isinstance(trust_overrides, dict):
-                    trust_overrides = {}
-            except Exception:
-                trust_overrides = {}
-
-            # Base trust: derived from helper's sensor skill for our goal property
-            for pid in self.participants.keys():
-                if pid == self.agent_id:
-                    continue
-
-                sp = self.sensor_params.get(pid, {}).get(self.goal_property)
-                base = float(sp["skill"]) if sp else 0.5
-
-                # mild robot bias
-                if self.participants.get(pid, {}).get("type") == "robot":
-                    base = min(1.0, base + 0.1)
-
-                # apply override if provided
-                if pid in trust_overrides:
-                    try:
-                        base = float(trust_overrides[pid])
-                    except Exception:
-                        pass
-
-                self.trust_map[pid] = max(0.0, min(1.0, base))
 
 
 
@@ -883,6 +1452,15 @@ class SimHumanAgent(Node):
                 best_id = pid
         return best_id
 
+    def _set_busy(self, v: bool) -> None:
+        with self._busy_lock:
+            self._busy = bool(v)
+
+    def _is_busy(self) -> bool:
+        with self._busy_lock:
+            return bool(self._busy)
+
+
     # ---------------------------
     # ROS bus I/O
     # ---------------------------
@@ -891,42 +1469,47 @@ class SimHumanAgent(Node):
             payload = json.loads(msg.data)
             if not isinstance(payload, dict):
                 return
-            speaker = str(payload.get("speaker_id"))
-            text = str(payload.get("text", ""))
+                
+            target = payload.get("target_speaker", None)
+            if target is not None and str(target) not in (self.agent_id, "all"):
+                return
+
+            speaker = str(payload.get("speaker_id", "")).strip()
+            text = payload.get("text")
+            if not speaker or not isinstance(text, str):
+                return
         except Exception:
             return
 
         if speaker == self.agent_id:
             return
 
-        self.last_msgs.append({"speaker_id": speaker, "text": text, "t_wall": time.time()})
+        event = {
+            "speaker_id": speaker,
+            "text": text,
+            "t_wall": time.time(),
+        }
+        self.last_msgs.append(event)
         self.last_msgs = self.last_msgs[-100:]
+
+        # ✅ Inbox: all messages go here, LLM decides what to do
+        self.inbox.append(event)
+        while len(self.inbox) > 50:
+            self.inbox.popleft()
+
+
         self._log("HEAR", f"from={speaker} text={text!r}")
 
-        # --- detect explicit sensing requests ---
-        # Examples:
-        #  "Sam, can you sense box 2 for Y? I’m unsure."
-        #  "can you sense box 6 for X"
-        m = re.search(r"\bsense\s+box\s+(\d+)\s+for\s+([XY])\b", text, re.IGNORECASE)
-        if m:
-            box_id = int(m.group(1))
-            prop = m.group(2).upper()
-            # store request (we'll decide whether to comply)
-            self.inbox_requests.append({
-                "from": speaker,
-                "box_id": box_id,
-                "prop": prop,
-                "t_wall": time.time(),
-            })
-            self.inbox_requests = self.inbox_requests[-30:]
-            self._log("INBOX", f"request from={speaker} box={box_id} prop={prop}")
 
-
-    def _publish_utterance(self, text: str) -> None:
+    def _publish_utterance(self, text: str, target_speaker: Optional[str] = None) -> None:
         out = StringMsg()
-        out.data = json.dumps({"text": text, "speaker_id": self.agent_id})
+        payload = {"text": text, "speaker_id": self.agent_id}
+        if target_speaker:
+            payload["target_speaker"] = target_speaker
+        out.data = json.dumps(payload)
         self.pub_stt.publish(out)
         self._log("SAY", text)
+
 
     # ---------------------------
     # Server HTTP helpers
@@ -1050,6 +1633,16 @@ class SimHumanAgent(Node):
         p_present = prob if detected is True else (1.0 - prob)
         return max(0.0, min(1.0, p_present))
 
+    def _waiting_help_active(self, now_sim: float) -> bool:
+        if self.plan_state.get("phase") != "waiting_help":
+            return False
+        started = self.plan_state.get("waiting_started_sim", None)
+        if not isinstance(started, (int, float)):
+            return False
+        waited = float(now_sim) - float(started)
+        return waited < float(self.help_wait_sec)
+
+
     # ---------------------------
     # Movement / execution
     # ---------------------------
@@ -1064,25 +1657,74 @@ class SimHumanAgent(Node):
     def _execute(self, action: PolicyAction, box_lookup: Dict[int, BoxSummary], now_sim: float) -> None:
         self._log("ACT", f"execute kind={action.kind} box={action.box_id} prop={action.prop} reason={action.reason}")
 
+
+        if self.plan_state.get("phase") == "waiting_help" and self.waiting_mode == "soft":
+            w_box = self.plan_state.get("waiting_help_box_id")
+            w_prop = self.plan_state.get("waiting_help_prop")
+            if (
+                w_box is not None and w_prop is not None
+                and action.box_id is not None and action.prop is not None
+                and int(action.box_id) == int(w_box)
+                and str(action.prop).upper() == str(w_prop).upper()
+                and action.kind in ("ask_help", "sense_self", "dispose", "goto_only")
+            ):
+                self._log("MEM", f"blocked by waiting_help soft same-task kind={action.kind} box={action.box_id} prop={action.prop}")
+                return
+
+
+        # update focus for real physical actions (not ask_help; we update that inside ask_help handler)
+        if action.kind in ("sense_self", "dispose", "goto_only") and action.box_id is not None and action.prop is not None:
+            self.plan_state["focus_box_id"] = int(action.box_id)
+            self.plan_state["focus_prop"] = str(action.prop)
+            self.plan_state["phase"] = (
+                "sense" if action.kind == "sense_self"
+                else "dispose" if action.kind == "dispose"
+                else "goto"
+            )
+
+        if action.text:
+            self.plan_state["last_commitment"] = action.text
+
+
         if action.kind == "idle":
             return
 
-        if action.text:
-            self._publish_utterance(action.text)
+        if action.kind == "say":
+            if action.text:
+                self._publish_utterance(action.text, target_speaker=action.target_speaker)
+            return
 
-        if action.kind in ("say", "ask_help"):
-            if action.kind == "ask_help" and action.box_id is not None and action.prop is not None:
+        if action.kind == "ask_help":
+            if action.box_id is not None and action.prop is not None:
                 st = self._box_state(action.box_id, action.prop)
                 last_asked = st.get("asked_help_at_sim", None)
-                if last_asked is None or (now_sim - float(last_asked)) >= self.help_wait_sec:
-                    st["asked_help_at_sim"] = float(now_sim)
-                    st["asked_help_to"] = action.target_speaker or self.help_target_speaker
-                    self._log("MEM", f"asked_help box={action.box_id} prop={action.prop} to={st['asked_help_to']} at_sim={now_sim:.2f}")
-                else:
-                    # suppress re-asking
-                    self._log("MEM", f"suppress ask_help repeat box={action.box_id} prop={action.prop} waited={now_sim-float(last_asked):.1f}s")
 
+                # If we asked recently, suppress BOTH memory update AND speech output
+                if last_asked is not None and (now_sim - float(last_asked)) < self.help_wait_sec:
+                    self._log("MEM", f"suppress ask_help repeat box={action.box_id} prop={action.prop} waited={now_sim-float(last_asked):.1f}s")
+                    return
+
+                # record and speak
+                st["asked_help_at_sim"] = float(now_sim)
+                st["asked_help_to"] = action.target_speaker or self.help_target_speaker
+                self._log("MEM", f"asked_help box={action.box_id} prop={action.prop} to={st['asked_help_to']} at_sim={now_sim:.2f}")
+
+                # ✅ set explicit waiting phase metadata (Fix 2)
+                self.plan_state["phase"] = "waiting_help"
+                self.plan_state["waiting_help_box_id"] = int(action.box_id)
+                self.plan_state["waiting_help_prop"] = str(action.prop)
+                self.plan_state["waiting_on"] = str(st["asked_help_to"])
+                self.plan_state["waiting_started_sim"] = float(now_sim)
+
+            if not action.text or not action.text.strip():
+                who = action.target_speaker or self.help_target_speaker or "someone"
+                action.text = f"{self._display_name(who)}, can you sense box {action.box_id} for {action.prop}? I'm unsure."
+
+
+            if action.text:
+                self._publish_utterance(action.text, target_speaker=action.target_speaker)
             return
+
 
         if action.box_id is None or action.box_id not in box_lookup:
             self._log("WARN", f"missing box in lookup for action: {action}")
@@ -1091,24 +1733,82 @@ class SimHumanAgent(Node):
         box = box_lookup[action.box_id]
 
         if action.kind == "goto_only":
-            self._travel_to(box)
+            self._set_busy(True)
+            try:
+                self._travel_to(box)
+            finally:
+                self._set_busy(False)
             return
+
 
         if action.kind == "sense_self":
             assert action.prop is not None
-            self._travel_to(box)
-            js = self._sense(box.box_id, action.prop)
             st = self._box_state(box.box_id, action.prop)
-            st["self_sensed"] = True
-            st["last_self_sense_status"] = js.get("status")
+
+            already_by_anyone = any(
+                sr.get("status") == "completed" and sr.get("property") == action.prop
+                for sr in box.sense_results
+            )
+            if already_by_anyone:
+                self._log("MEM", f"skip self_sense box={box.box_id} prop={action.prop} (already sensed by someone)")
+                st["self_sensed"] = True
+                # if we were doing this as a commitment, fulfill it
+                self._complete_active_commitment_if_any(status="done")
+                return
+
+            if st.get("self_sensed", False):
+                self._log("MEM", f"skip repeat self_sense box={box.box_id} prop={action.prop} (already self_sensed)")
+                self._complete_active_commitment_if_any(status="done")
+                return
+
+            already_by_me = any(
+                sr.get("status") == "completed"
+                and sr.get("property") == action.prop
+                and str(sr.get("agent_id")) == self.agent_id
+                for sr in box.sense_results
+            )
+            if already_by_me:
+                st["self_sensed"] = True
+                self._log("MEM", f"skip self_sense box={box.box_id} prop={action.prop} (server already has my completed sense)")
+                self._complete_active_commitment_if_any(status="done")
+                return
+
+            self._set_busy(True)
+            try:
+                self._travel_to(box)
+                js = self._sense(box.box_id, action.prop)
+                st["self_sensed"] = True
+                st["last_self_sense_status"] = js.get("status")
+                # ✅ mark commitment done after success
+                self._complete_active_commitment_if_any(status="done")
+            finally:
+                self._set_busy(False)
             return
+
 
         if action.kind == "dispose":
             assert action.prop is not None
-            self._travel_to(box)
-            js = self._dispose(box.box_id, action.prop)
-            self._mark_done(box.box_id, action.prop, why=f"dispose_attempt success={js.get('success')}")
+            self._set_busy(True)
+            try:
+                self._travel_to(box)
+                js = self._dispose(box.box_id, action.prop)
+                self._complete_active_commitment_if_any(status="done")
+                self._mark_done(box.box_id, action.prop, why=f"dispose_attempt success={js.get('success')}")
+            finally:
+                self._set_busy(False)
             return
+
+
+    def _complete_active_commitment_if_any(self, status: str = "done") -> None:
+        cid = self.plan_state.get("active_commitment_id")
+        if not cid:
+            return
+        for cc in self.plan_state.get("commitments", []):
+            if cc.get("id") == cid and cc.get("status") == "active":
+                self._complete_commitment(cc, status=status)
+                break
+        self.plan_state["active_commitment_id"] = None
+
 
     # ---------------------------
     # Thread runner and tick
@@ -1123,8 +1823,22 @@ class SimHumanAgent(Node):
         boxes = self._boxes_state()
         box_lookup = {b.box_id: b for b in boxes}
 
+        # expire waiting if time passed
+        if self.plan_state.get("phase") == "waiting_help":
+            started = self.plan_state.get("waiting_started_sim", None)
+            if isinstance(started, (int, float)) and (now_sim - float(started)) >= float(self.help_wait_sec):
+                self._clear_waiting_help(why=f"expired after {now_sim-float(started):.1f}s")
+
+        # waiting behavior
+        if self.plan_state.get("phase") == "waiting_help" and self.waiting_mode == "strict":
+            return
+
+
+
+        # then normal planning action
         action = self.policy.decide(self, boxes, now_sim)
         self._execute(action, box_lookup, now_sim)
+
 
     def _tick(self) -> None:
         if self._stop:
@@ -1147,6 +1861,54 @@ class SimHumanAgent(Node):
         finally:
             with self._action_lock:
                 self._action_thread = None
+
+
+    def _router_tick(self) -> None:
+        if self._stop:
+            return
+        # Don't spawn if already running
+        with self._router_lock:
+            if self._router_thread is not None and self._router_thread.is_alive():
+                return
+            if not self.inbox:
+                return
+            th = threading.Thread(target=self._router_thread_main, daemon=True)
+            self._router_thread = th
+            th.start()
+
+    def _router_thread_main(self) -> None:
+        """
+        ✅ This thread MUST stay responsive and MUST NOT do travel/sense/dispose.
+        It only:
+          - runs LLM decide_on_message for up to N inbox items
+          - publishes reply_text
+          - adds/updates commitments
+        """
+        try:
+            # Lightweight snapshot of time + boxes for router context
+            t = self._time()
+            now_sim = float(t["server_time"])
+            boxes = self._boxes_state()
+
+            handled = 0
+            while handled < self.max_inbox_per_tick:
+                try:
+                    evt = self.inbox.popleft()
+                except Exception:
+                    break
+
+                if self.policy_type == "llm":
+                    # IMPORTANT: decide_on_message should schedule commitments and publish replies.
+                    # It may return a PolicyAction; we IGNORE physical actions here.
+                    _ = self.llm_policy.decide_on_message(self, boxes, now_sim, evt)
+
+                handled += 1
+
+        except Exception as e:
+            self.get_logger().warn(f"[FAIL] router cycle failed: {e}")
+        finally:
+            with self._router_lock:
+                self._router_thread = None
 
 
 def main():
