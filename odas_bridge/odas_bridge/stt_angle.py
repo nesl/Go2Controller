@@ -29,7 +29,9 @@ import math
 
 import os
 import soundfile as sf
-from resemblyzer import VoiceEncoder, preprocess_wav
+import torchaudio
+from speechbrain.pretrained import EncoderClassifier
+
 from std_srvs.srv import Trigger
 
 
@@ -106,8 +108,12 @@ def _build_torch_whisper_gate(model_id: str, device_str: str, language: str, tra
     return processor, model, forced_ids, device
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    a = a.astype(np.float32); b = b.astype(np.float32)
-    return float(np.dot(a, b) / ((np.linalg.norm(a) + 1e-12) * (np.linalg.norm(b) + 1e-12)))
+    a = a.astype(np.float32).reshape(-1)
+    b = b.astype(np.float32).reshape(-1)
+    a = a / (np.linalg.norm(a) + 1e-12)
+    b = b / (np.linalg.norm(b) + 1e-12)
+    return float(np.dot(a, b))
+
 
 
 class HFWhisperWorker(threading.Thread):
@@ -368,6 +374,7 @@ class TorchWhisperGateWorker(threading.Thread):
                     "max_no_speech": max_no_speech,
                     "segments": seg_cnt,
                     "lat_ms": float(lat_ms),
+                    "audio_i16": item.get("audio_i16"),
                 })
 
             except Exception as e:
@@ -431,9 +438,60 @@ class STTFasterWhisperNode(Node):
         self.declare_parameter("prefer_vector_for_marker", True)
         
         
+        # --- ECAPA-TDNN (SpeechBrain) ---
+        self.declare_parameter("spk_model_source", "speechbrain/spkrec-ecapa-voxceleb")
+        self.declare_parameter("spk_device", "cuda")  # "cpu" or "cuda"
+        self.declare_parameter("spk_savedir", "/tmp/speechbrain_ecapa")  # where SpeechBrain caches model files
+
+        self.declare_parameter("tts_busy_timeout_sec", 3.0)
+        self.tts_busy_timeout_sec = float(self.get_parameter("tts_busy_timeout_sec").value)
+        self._tts_busy_last_change_wall = time.time()
+
+
+        # Hard suppression barrier around TTS to avoid self-transcription
+        self._suppress_until_wall = 0.0
+        self.declare_parameter("tts_release_cooldown_sec", 0.0)  # small tail to cover room echo
+        self.tts_release_cooldown_sec = float(self.get_parameter("tts_release_cooldown_sec").value)
+
+
+        self.spk_model_source = str(self.get_parameter("spk_model_source").value)
+        self.spk_device = str(self.get_parameter("spk_device").value).strip().lower()
+        self.spk_savedir = str(self.get_parameter("spk_savedir").value)
+        os.makedirs(self.spk_savedir, exist_ok=True)
+
+        
         # --- Runtime toggles ---
         self.declare_parameter("enable_stt", True)   # final ASR (HF pipeline)
         self.declare_parameter("enable_gate", True)  # gate/endpointing (Torch Whisper)
+
+        self.declare_parameter("spk_gate_sticky_min_score", 0.30)
+        self.spk_gate_sticky_min_score = float(self.get_parameter("spk_gate_sticky_min_score").value)
+
+        self._spk_gate_last_id = None
+        self._spk_gate_last_score = -1.0
+        self._spk_gate_bad_streak = 0  # counts consecutive "bad" windows
+
+
+        # --- "Processing" heartbeat (publish ONLY while deciphering speech) ---
+        self.declare_parameter("processing_topic", "/audio/stt_processing")
+        self.declare_parameter("processing_period_sec", 5.0)
+        self.processing_topic = str(self.get_parameter("processing_topic").value)
+        self.processing_period_sec = float(self.get_parameter("processing_period_sec").value)
+
+        self.pub_processing = self.create_publisher(Bool, self.processing_topic, 10)
+
+        # Processing state:
+        # - _processing_until_wall: a short "grace window" after speech/gate activity
+        # - _asr_inflight: count of finalized utterances currently being transcribed by HF worker
+        # - _last_processing_pub_wall: rate limit publisher to every N seconds
+        self._processing_until_wall = 0.0
+        self._asr_inflight = 0
+        self._asr_inflight_lock = threading.Lock()
+        self._last_processing_pub_wall = 0.0
+
+        # Check often; we still rate-limit to processing_period_sec
+        self.create_timer(1.0, self._processing_tick)
+
 
         self.enable_stt  = bool(self.get_parameter("enable_stt").value)
         self.enable_gate = bool(self.get_parameter("enable_gate").value)
@@ -457,6 +515,13 @@ class STTFasterWhisperNode(Node):
         self._last_perf_publish = time.time()
         self._perf_publish_period = 2.0  # seconds
 
+        # --- Gate speaker sequencing (buffer frames until speaker changes) ---
+        self._gate_spk_seq = 0              # increments on each speaker segment
+        self._gate_spk_active_id = None     # speaker id for current segment
+        self._gate_spk_frame_idx = 0        # frame index within current segment
+        self._gate_spk_buf = []             # buffered partial_payload dicts (not yet published)
+
+
        
         self.wg_window_ms = int(self.get_parameter("wg_window_ms").value)
         self.wg_hop_ms = int(self.get_parameter("wg_hop_ms").value)
@@ -467,18 +532,32 @@ class STTFasterWhisperNode(Node):
         self.wg_max_no_speech = float(self.get_parameter("wg_max_no_speech").value)
 
         # --- Speaker ID / enrollment ---
-        self.declare_parameter("spk_profiles_dir", "/tmp/spk_profiles")
+        self.declare_parameter("spk_profiles_dir", "/tmp/spk_profiles_ecapa")
         self.declare_parameter("spk_threshold", 0.85)   # tune later
-        self.declare_parameter("spk_save_wav", True)
+        self.declare_parameter("spk_save_wav", False)
 
         self.profiles_dir = str(self.get_parameter("spk_profiles_dir").value)
         os.makedirs(self.profiles_dir, exist_ok=True)
 
+        # --- Speaker profiles cache (in-memory) ---
+        self._profiles_cache = {}          # sid -> np.ndarray emb
+        self._profiles_cache_dim = None    # embedding dim of cached profiles
+        self._profiles_cache_ts = 0.0      # wall time of last refresh
+        self._profiles_cache_period_sec = 1.0  # refresh at most once per second
+
+
         self.spk_threshold = float(self.get_parameter("spk_threshold").value)
         self.spk_save_wav = bool(self.get_parameter("spk_save_wav").value)
 
-        # Embedding model (Resemblyzer)
-        self.spk_encoder = VoiceEncoder()
+        # Embedding model (SpeechBrain ECAPA-TDNN)
+        run_opts = {"device": ("cuda" if (self.spk_device == "cuda" and torch.cuda.is_available()) else "cpu")}
+        self.spk_classifier = EncoderClassifier.from_hparams(
+            source=self.spk_model_source,
+            savedir=self.spk_savedir,
+            run_opts=run_opts,
+        )
+        self.get_logger().info(f"[spk] Loaded ECAPA model={self.spk_model_source} device={run_opts['device']}")
+
 
         # State machine: idle | enroll(person) | verify(person)
         self._spk_mode = "verify"
@@ -503,6 +582,14 @@ class STTFasterWhisperNode(Node):
         self._last_spk = None  # {"id":..., "score":..., "match":..., "ts_ns":..., "threshold":...}
 
         self._spk_by_stamp = {}  # (sec, nanosec) -> spk dict
+
+        # Continuous utterance boundaries (avoid stitching artifacts)
+        self.declare_parameter("utt_preroll_ms", 400)
+        self.utt_preroll_ms = int(self.get_parameter("utt_preroll_ms").value)
+
+        self._utt_start_ns = None
+        self._utt_end_ns = None
+
 
         # Load params
         self.fs = int(self.get_parameter("fs_hz").value)
@@ -679,6 +766,158 @@ class STTFasterWhisperNode(Node):
           
         )
 
+    def _drop_pending_gate_outputs(self):
+        # Drop any already-computed gate results so they cannot start/continue utterances
+        dropped = 0
+        while True:
+            try:
+                _ = self._win_out.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+
+        # Also clear any buffered partial frames awaiting flush
+        self._gate_spk_buf.clear()
+        self._gate_spk_active_id = None
+        self._gate_spk_frame_idx = 0
+
+        if dropped:
+            self.get_logger().info(f"[gate] dropped {dropped} pending window results due to TTS busy")
+
+
+    def _flush_gate_frames(self):
+        """
+        Publish buffered gate frames using current active speaker id + seq.
+        No-op if nothing buffered or no active speaker.
+        """
+        if not self._gate_spk_buf:
+            return
+        if self._gate_spk_active_id is None:
+            # If you prefer, you can drop these instead of publishing unknown.
+            # For now: publish as unknown.
+            spk_id = "unknown"
+        else:
+            spk_id = self._gate_spk_active_id
+
+        for frame in self._gate_spk_buf:
+            frame["speaker_id"] = spk_id
+            frame["speaker_seq"] = int(self._gate_spk_seq)
+            frame["speaker_frame_idx"] = int(frame.get("speaker_frame_idx", 0))
+            self.pub_partial.publish(String(data=json.dumps(frame, ensure_ascii=False)))
+
+        self._gate_spk_buf.clear()
+
+
+    def _audio_i16_to_sb_tensor(self, audio_i16: np.ndarray) -> torch.Tensor:
+        """
+        Convert mono int16 numpy -> torch float tensor shaped [1, T] in [-1,1].
+        SpeechBrain's EncoderClassifier.encode_batch expects [batch, time] or [batch, time, channels]
+        depending on model; [1, T] works for spkrec-ecapa-voxceleb.
+        """
+        x = audio_i16.astype(np.float32) / 32768.0
+        t = torch.from_numpy(x).unsqueeze(0)  # [1, T]
+        return t
+
+    def _spk_embed_ecapa(self, audio_i16: np.ndarray) -> np.ndarray:
+        """
+        Returns L2-normalized embedding as float32 1D vector.
+        """
+        wav = self._audio_i16_to_sb_tensor(audio_i16)
+
+        device = next(self.spk_classifier.parameters()).device
+        wav = wav.to(device)
+
+        with torch.inference_mode():
+            emb = self.spk_classifier.encode_batch(wav)  # often [1, 1, D] or [1, D]
+
+        emb = emb.detach().cpu()
+
+        # squeeze to [D]
+        while emb.ndim > 1:
+            emb = emb.squeeze(0)
+        emb = emb.numpy().astype(np.float32)
+
+        # L2 normalize
+        n = np.linalg.norm(emb) + 1e-12
+        emb = emb / n
+        return emb
+
+
+    def _refresh_profiles_cache(self, force: bool = False):
+        now = time.time()
+        if (not force) and (now - self._profiles_cache_ts) < self._profiles_cache_period_sec:
+            return
+
+        profiles = {}
+        cache_dim = None
+
+        try:
+            for fname in os.listdir(self.profiles_dir):
+                if not fname.endswith(".npz"):
+                    continue
+                sid = os.path.splitext(fname)[0]
+                path = os.path.join(self.profiles_dir, fname)
+                try:
+                    data = np.load(path)
+                    emb = data["emb"].astype(np.float32).reshape(-1)
+                    d = int(emb.shape[0])
+                    emb = emb / (np.linalg.norm(emb) + 1e-12)
+
+                    # Keep only one consistent dimension in cache (avoid old 256-d leftovers, etc.)
+                    if cache_dim is None:
+                        cache_dim = d
+                    if d != cache_dim:
+                        continue
+
+                    profiles[sid] = emb
+                except Exception as e:
+                    self.get_logger().warn(f"[spk] cache load failed {path}: {e}")
+        except Exception as e:
+            self.get_logger().warn(f"[spk] cache list failed {self.profiles_dir}: {e}")
+
+        self._profiles_cache = profiles
+        self._profiles_cache_dim = cache_dim
+        self._profiles_cache_ts = now
+
+
+    def _identify_embedding(self, emb: np.ndarray):
+        """
+        Identify best matching enrolled speaker for a given embedding using in-memory cache.
+        Returns (best_id, best_score, n_profiles).
+        """
+        self._refresh_profiles_cache(force=False)
+
+        if not self._profiles_cache:
+            return None, -1.0, 0
+
+        emb = emb.astype(np.float32).reshape(-1)
+        cur_dim = int(emb.shape[0])
+
+        # If cache dim doesn't match current embedding dim, force refresh once
+        if self._profiles_cache_dim is not None and self._profiles_cache_dim != cur_dim:
+            self._refresh_profiles_cache(force=True)
+            if not self._profiles_cache or self._profiles_cache_dim != cur_dim:
+                return None, -1.0, 0
+
+        best_id = None
+        best_score = -1.0
+
+        for sid, ref in self._profiles_cache.items():
+            s = _cosine(emb, ref)
+            if s > best_score:
+                best_score = s
+                best_id = sid
+
+        return best_id, float(best_score), int(len(self._profiles_cache))
+
+
+    def _spk_embed_ecapa_i16(self, audio_i16: np.ndarray) -> np.ndarray:
+        """
+        Convenience wrapper: accepts int16 mono and returns normalized ECAPA embedding.
+        """
+        return self._spk_embed_ecapa(audio_i16)
+
+
     def _srv_enroll(self, req, resp):
         # person id comes from a parameter for simplicity
         pid = str(self.get_parameter("speaker_id").value) if self.has_parameter("speaker_id") else "person"
@@ -688,6 +927,9 @@ class STTFasterWhisperNode(Node):
         self._utt_start_time_ns = None
         self._utt_samples = []
         self._last_speech_time_ns = None
+        self._utt_start_ns = None
+        self._utt_end_ns = None
+
 
         # clear ring buffer and any partial frame residue
         try:
@@ -950,6 +1192,44 @@ class STTFasterWhisperNode(Node):
         self.perf_pub.publish(String(data=json.dumps(payload)))
 
 
+    def _mark_processing(self, hold_sec: float = 6.0):
+        """
+        Mark that we are actively processing speech.
+        hold_sec extends a grace window so the heartbeat continues briefly
+        even if gate windows are intermittent.
+        """
+        now = time.time()
+        self._processing_until_wall = max(self._processing_until_wall, now + float(hold_sec))
+
+    def _processing_tick(self):
+        """
+        Publish Bool(True) at most every processing_period_sec *only*
+        while we consider ourselves processing (gate activity, utterance active,
+        or ASR inflight). Publish nothing otherwise.
+        """
+        now = time.time()
+
+        # Determine "active processing"
+        with self._asr_inflight_lock:
+            inflight = int(self._asr_inflight)
+
+        active = (
+            (now < self._processing_until_wall) or
+            bool(self._utt_active) or
+            (inflight > 0)
+        )
+
+        if not active:
+            return
+
+        if (now - self._last_processing_pub_wall) < self.processing_period_sec:
+            return
+
+        self._last_processing_pub_wall = now
+        self.pub_processing.publish(Bool(data=True))
+
+
+
     def _vad_voiced_ratio(self, audio_f32: np.ndarray, sr: int) -> float:
         """Return fraction of frames flagged as speech by WebRTC VAD."""
         try:
@@ -1014,22 +1294,63 @@ class STTFasterWhisperNode(Node):
 
 
     def _busy_cb(self, msg: Bool):
-        self.get_logger().info(
-            f"STT node: busy={msg.data}"
-          
-        )
+        self.get_logger().info(f"STT node: busy={msg.data}")
         was = self._tts_busy
         self._tts_busy = bool(msg.data)
+        self._tts_busy_last_change_wall = time.time()
+
         if self._tts_busy and not was:
-            # Robot just started speaking → wipe in-progress state so nothing leaks through
+            # --- entering TTS: seal any human utterance and drop pending gate outputs ---
+            try:
+                if self._utt_active:
+                    # finalize at last known speech boundary (safer than "now")
+                    t_end = int(self._last_speech_time_ns or self.audio_time.nanoseconds)
+                    self._finalize_utterance(t_end)
+            except Exception:
+                pass
+
+            # Drop queued gate results that could start a new utterance later
+            self._drop_pending_gate_outputs()
+
+            # Reset utterance tracking
             self._utt_active = False
             self._utt_start_time_ns = None
             self._utt_samples = []
             self._last_speech_time_ns = None
             self.doa_hist_speech = []
-            self._mono_ring.clear()
-            # also pause RViz updates
+            self._utt_start_ns = None
+            self._utt_end_ns = None
             self._dir_vec = None
+
+            try:
+                self._mono_ring.clear()
+            except Exception:
+                pass
+            self._partial_bytes = bytearray()
+
+            # Reset window schedule so we don't immediately analyze stale audio
+            self._next_window_at_ns = self.get_clock().now().nanoseconds + int(self.wg_hop_ms * 1e6)
+
+            # Hard barrier: do not start listening while TTS is active
+            self._suppress_until_wall = float("inf")
+
+        elif (not self._tts_busy) and was:
+            # --- leaving TTS: keep a short cooldown to avoid tail/echo being transcribed ---
+            self._suppress_until_wall = time.time() + self.tts_release_cooldown_sec
+            # Also drop any stale gate outputs computed before/around the transition
+            self._drop_pending_gate_outputs()
+
+            # Purge again to avoid tail/echo that was buffered right at the transition
+            try:
+                self._mono_ring.clear()
+            except Exception:
+                pass
+            self._partial_bytes = bytearray()
+
+            # Reset schedule so first post-cooldown window starts clean
+            self._next_window_at_ns = self.get_clock().now().nanoseconds + int(self.wg_hop_ms * 1e6)
+
+
 
 
     # ---------------- RViz Marker helpers ----------------
@@ -1083,43 +1404,75 @@ class STTFasterWhisperNode(Node):
     def _finalize_utterance(self, t_end_ns: int):
         if not self._utt_active:
             return
-        # build int16 audio
-        if not self._utt_samples:
-            # nothing
+
+        # Prefer boundaries tracked by the gate
+        start_ns = int(self._utt_start_ns or self._utt_start_time_ns or t_end_ns)
+        end_ns   = int(self._utt_end_ns or t_end_ns)
+
+        # Apply pre-roll to reduce clipped leading consonants
+        preroll_ns = int(self.utt_preroll_ms * 1e6)
+        start_ns = max(0, start_ns - preroll_ns)
+
+        dur_ns = max(0, end_ns - start_ns)
+        n_samp = int((dur_ns * 1e-9) * self.fs)
+
+        # Clamp to what we actually have in the ring
+        ring_len = len(self._mono_ring)
+        if ring_len <= 0:
             self._utt_active = False
             return
-        audio_i16 = np.concatenate(self._utt_samples).astype(np.int16)
-        # compute mid timestamp for DoA association
+        if n_samp <= 0:
+            n_samp = min(ring_len, int(0.3 * self.fs))  # small fallback
+        n_samp = min(n_samp, ring_len)
+
+        # Extract contiguous tail slice (no stitching, no duplication)
+        mono_np = np.array(self._mono_ring, dtype=np.int16)
+        audio_i16 = mono_np[-n_samp:].copy()
+
+        # compute mid timestamp for DoA association (optional: keep yours)
         dur_sec = len(audio_i16) / float(self.fs)
         t_mid_sec = (t_end_ns * 1e-9) - 0.5 * dur_sec
         az_for_utt = self._az_at(t_mid_sec)
-        # stamp = t_end
-        stamp_msg = self._make_time_msg_from_ns(t_end_ns)
-        
-        
-        angles_only = [dh[1] for dh in self.doa_hist]
-        counter_doa = Counter(angles_only)
-        latest_angle = counter_doa.most_common(5)
-        
-        az = math.radians(latest_angle[0][0])                   # NEW
 
-        
+        stamp_msg = self._make_time_msg_from_ns(t_end_ns)
+
         # ---- speaker verify/enroll FIRST so drain_outputs can annotate ----
         self._speaker_process_final(audio_i16, stamp_msg)
 
         if self.enable_stt:
-            self.worker.submit(audio_i16, stamp_msg, latest_angle[0][0])
+            # keep your existing "latest angle" behavior
+            angles_only = [dh[1] for dh in self.doa_hist]
+            counter_doa = Counter(angles_only)
+            latest_angle = counter_doa.most_common(5)
+            az_deg = latest_angle[0][0] if latest_angle else az_for_utt
+
+            # Final ASR is about to run -> heartbeat + inflight tracking
+            self._mark_processing(hold_sec=10.0)
+            with self._asr_inflight_lock:
+                self._asr_inflight += 1
+
+            
+            self.worker.submit(audio_i16, stamp_msg, float(az_deg))
         else:
             self.get_logger().info("STT disabled: dropping finalized utterance audio")
 
-        # reset
+        # Flush buffered gate frames under current speaker
+        self._flush_gate_frames()
+        self._gate_spk_active_id = None
+        self._gate_spk_frame_idx = 0
+
+        # reset utterance state
         self._utt_active = False
         self._utt_start_time_ns = None
-        self._utt_samples = []
+        self._utt_samples = []  # can remain but no longer used for audio
         self.doa_hist_speech = []
         self._last_speech_time_ns = None
+        self._utt_start_ns = None
+        self._utt_end_ns = None
+
         self.utterances_finalized += 1
         self._maybe_publish_perf()
+
 
 
     def _load_all_profiles(self):
@@ -1138,8 +1491,10 @@ class STTFasterWhisperNode(Node):
                 path = os.path.join(self.profiles_dir, fname)
                 try:
                     data = np.load(path)
-                    emb = data["emb"].astype(np.float32)
+                    emb = data["emb"].astype(np.float32).reshape(-1)
+                    emb = emb / (np.linalg.norm(emb) + 1e-12)
                     profiles[sid] = emb
+
                 except Exception as e:
                     self.get_logger().warn(f"[spk] Failed to load profile {path}: {e}")
         except Exception as e:
@@ -1161,16 +1516,17 @@ class STTFasterWhisperNode(Node):
 
         # Compute embedding (Resemblyzer wants float wav at 16k; preprocess_wav can read file)
         # If we saved wav, we can just read it via preprocess_wav; otherwise convert directly.
-        if self.spk_save_wav:
-            wav = preprocess_wav(wav_path)
-        else:
-            wav = (audio_i16.astype(np.float32) / 32768.0)
-        emb = self.spk_encoder.embed_utterance(wav)
+        # Compute embedding (SpeechBrain ECAPA-TDNN)
+        # NOTE: embedding is computed from the same audio_i16 you saved (if enabled).
+        emb = self._spk_embed_ecapa(audio_i16)
+
 
         prof_path = os.path.join(self.profiles_dir, f"{pid}.npz")
 
         if self._spk_mode == "enroll":
             np.savez(prof_path, emb=emb.astype(np.float32), fs=self.fs, created_ns=ts_ns)
+            
+            self._refresh_profiles_cache(force=True)
             
             # cache latest speaker status (for annotating text)
             self._last_spk = {
@@ -1273,9 +1629,25 @@ class STTFasterWhisperNode(Node):
             self._spk_mode = "idle"
             self._spk_target = None
 
+    def _listening_suppressed(self) -> bool:
+        # While TTS is active OR while we are in the release cooldown tail
+        return bool(self._tts_busy) or (time.time() < float(self._suppress_until_wall))
 
 
     def _wg_tick(self):
+    
+    
+        # Hard suppression barrier (TTS active or cooldown tail)
+        if time.time() < self._suppress_until_wall:
+            self._next_window_at_ns = self.get_clock().now().nanoseconds + int(self.wg_hop_ms * 1e6)
+            return
+
+    
+        if self._tts_busy:
+            # Keep schedule moving so we don't backlog windows
+            self._next_window_at_ns = self.get_clock().now().nanoseconds + int(self.wg_hop_ms * 1e6)
+            return
+
     
         if not self.enable_gate:
             # still advance next window schedule so we don't backlog
@@ -1291,12 +1663,22 @@ class STTFasterWhisperNode(Node):
             if len(self._mono_ring) >= win_s:
                 # take newest window
                 mono_np = np.frombuffer(np.array(self._mono_ring, dtype=np.int16)[-win_s:].tobytes(), dtype='<i2')
-                # time mapping: window ends at self.audio_time (end of received audio)
+
                 t_end_ns = self.audio_time.nanoseconds
+                
+                
+                # time mapping: window ends at self.audio_time (end of received audio)
+ 
                 t_start_ns = t_end_ns - int((win_s / float(self.fs)) * 1e9)
                 # submit float32 for gate
                 audio_f32 = mono_np.astype(np.float32) / 32768.0
-                self.wg.submit({"t_start_ns": t_start_ns, "t_end_ns": t_end_ns, "audio_f32": audio_f32})
+                self.wg.submit({
+                    "t_start_ns": t_start_ns,
+                    "t_end_ns": t_end_ns,
+                    "audio_f32": audio_f32,
+                    "audio_i16": mono_np,
+                })
+
             # schedule next window
             self._next_window_at_ns = now_ns + int(self.wg_hop_ms * 1e6)
 
@@ -1331,9 +1713,62 @@ class STTFasterWhisperNode(Node):
 
             if is_speech:
 
+                # We are actively deciphering speech -> enable heartbeat
+                self._mark_processing(hold_sec=6.0)
+
+
                 # NEW: summarize angle "so far" and publish a partial item
                 mode_deg, mean_deg, top_list = self._doa_summary()
                 ts_sec = t_end_ns * 1e-9  # or time.time(), but this lines up with window end
+                mono_np = res.get("audio_i16", None)
+                if mono_np is None:
+                    # fallback (should rarely happen)
+                    win_samps = int(self.wg_window_ms * self.fs / 1000)
+                    mono_np = np.frombuffer(np.array(self._mono_ring, dtype=np.int16)[-win_samps:].tobytes(), dtype='<i2')
+
+                
+                # Compute speaker ID ONLY for speech windows
+                try:
+                    emb_win = self._spk_embed_ecapa(mono_np.astype(np.int16))
+                    sid, score, nprof = self._identify_embedding(emb_win)
+
+                    good = (nprof > 0 and sid is not None and score >= self.spk_gate_sticky_min_score)
+
+                    if good:
+                        cur_spk_id = sid
+                        self._spk_gate_last_id = sid
+                        self._spk_gate_last_score = float(score)
+                        self._spk_gate_bad_streak = 0
+                    else:
+                        self._spk_gate_bad_streak += 1
+                        if self._spk_gate_last_id is not None and self._spk_gate_bad_streak == 1:
+                            cur_spk_id = self._spk_gate_last_id
+                        else:
+                            cur_spk_id = None
+                            self._spk_gate_last_id = None
+                            self._spk_gate_last_score = -1.0
+                            self._spk_gate_bad_streak = 0  # IMPORTANT
+                except Exception as e:
+                    cur_spk_id = None
+                    self.get_logger().warn(f"[spk@gate] error: {e}")
+
+                # Speaker segmenting: flush buffered frames on speaker change
+                if self._gate_spk_active_id is None:
+                    self._gate_spk_active_id = cur_spk_id
+
+                elif (cur_spk_id is not None) and (self._gate_spk_active_id != cur_spk_id):
+
+
+                    # start new segment
+                    self._gate_spk_seq += 1
+                    self._gate_spk_active_id = cur_spk_id
+                    self._gate_spk_frame_idx = 0
+
+                    #OPTIONAL: if you want speaker switch to split ASR utterances too:
+                    if self._utt_active:
+                        self._finalize_utterance(t_end_ns)
+                    # flush past frames with previous speaker id
+                    self._flush_gate_frames()
 
                 partial_payload = {
                     "kind": "partial_gate",
@@ -1358,9 +1793,14 @@ class STTFasterWhisperNode(Node):
                     },
                 }
 
-                self.pub_partial.publish(
-                    String(data=json.dumps(partial_payload, ensure_ascii=False))
-                )
+                #self.pub_partial.publish(
+                #    String(data=json.dumps(partial_payload, ensure_ascii=False))
+                #)
+                # We'll set speaker_id on flush; keep a per-segment frame index now.
+                partial_payload["speaker_frame_idx"] = int(self._gate_spk_frame_idx)
+                self._gate_spk_frame_idx += 1
+
+                self._gate_spk_buf.append(partial_payload)
 
             
                 # start or continue utterance
@@ -1386,23 +1826,26 @@ class STTFasterWhisperNode(Node):
                 
                 # append raw samples for exact final transcription
                 # (pull corresponding raw int16 slice)
-                win_samps = int(self.wg_window_ms * self.fs / 1000)
+ 
                 hop_s = int(self.wg_hop_ms * self.fs / 1000)
                 # slice again (safe & simple)
-                mono_np = np.frombuffer(np.array(self._mono_ring, dtype=np.int16)[-win_samps:].tobytes(), dtype='<i2')
                 
+                
+                # Start / continue utterance using continuous boundaries (no stitching)
                 if not self._utt_active:
                     self._utt_active = True
                     self._utt_start_time_ns = t_start_ns
-                    self._utt_samples = []
+                    self._utt_start_ns = t_start_ns
+                    self._utt_end_ns = t_end_ns
                     self.doa_hist_speech = []
-                    self._utt_samples.append(mono_np.copy())
                 else:
-                    # Subsequent chunks: only append the NEW part (the hop)
-                    hop_np = mono_np[-hop_s:] if hop_s < len(mono_np) else mono_np
-                    self._utt_samples.append(hop_np.copy())
-                    
+                    # keep earliest start, advance end
+                    if self._utt_start_ns is None or t_start_ns < self._utt_start_ns:
+                        self._utt_start_ns = t_start_ns
+                    self._utt_end_ns = t_end_ns
+
                 self._last_speech_time_ns = t_end_ns
+
 
 
                 self.doa_hist_speech.extend(self.doa_hist)
@@ -1515,8 +1958,10 @@ class STTFasterWhisperNode(Node):
         Parse PCM16LE interleaved bytes with TC channels and extract one lane (self.pick_lane).
         Feed mono bytes to VAD; submit utterances to worker with latest DoA.
         """
-        
-        if self._tts_busy:
+      
+        if self._listening_suppressed():
+            # Keep memory bounded: discard incoming bytes and any partial residue
+            self._partial_bytes = bytearray()
             return
 
         
@@ -1602,6 +2047,13 @@ class STTFasterWhisperNode(Node):
 
             kind = item.get("kind", "final_asr")
             if kind == "final_asr":
+            
+                # One ASR job completed
+                with self._asr_inflight_lock:
+                    if self._asr_inflight > 0:
+                        self._asr_inflight -= 1
+
+            
                 lat_asr_ms = float(item.get("lat_ms", 0.0))
                 self.lat_asr_ms_ema = self._ema(self.lat_asr_ms_ema, lat_asr_ms, self._ema_alpha)
                 self.lat_e2e_ms_ema = self._ema(self.lat_e2e_ms_ema, e2e_ms, self._ema_alpha)

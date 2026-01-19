@@ -1,0 +1,73 @@
+sim_human_a:
+  ros__parameters:
+    agent_id: "human_a"
+    goal_property: "X"
+    server_base_url: "http://172.17.40.64:8080"
+    stt_topic: "/audio/stt_text"
+
+    policy_type: "llm"
+    llm_provider: "openai"
+    llm_model: "gpt-4.1-mini"
+    llm_temperature: 0.2
+    llm_max_tokens: 250
+    llm_top_k_boxes: 6
+    llm_timeout_sec: 30.0
+
+    # ✅ ROS2-safe: JSON strings (NOT nested YAML dict lists)
+    humans_json: >
+      [{"id":"human_a","name":"Sam"},{"id":"human_b","name":"Jacob"}]
+    robots_json: "[]"
+
+    # optional: override trust (0..1)
+    trust_overrides_json: >
+      {"human_b": 0.60}
+
+    help_target_speaker: "human_b"
+    decision_period_sec: 1.0
+    speed_mps: 1.0
+    dispose_threshold: 0.80
+    giveup_threshold: 0.20
+    help_wait_sec: 20.0
+    dist_weight: 2.0
+    log_actions: true
+
+    # traits (optional)
+    risk_aversion: 0.7
+    stubbornness: 0.5
+    fairness_sensitivity: 0.3
+
+sim_human_b:
+  ros__parameters:
+    agent_id: "human_b"
+    goal_property: "Y"
+    server_base_url: "http://172.17.40.64:8080"
+    stt_topic: "/audio/stt_text"
+
+    policy_type: "llm"
+    llm_provider: "openai"
+    llm_model: "gpt-4.1-mini"
+    llm_temperature: 0.2
+    llm_max_tokens: 250
+    llm_top_k_boxes: 6
+    llm_timeout_sec: 30.0
+
+    humans_json: >
+      [{"id":"human_a","name":"Sam"},{"id":"human_b","name":"Jacob"}]
+    robots_json: "[]"
+
+    trust_overrides_json: >
+      {"human_a": 0.60}
+
+    help_target_speaker: "human_a"
+    decision_period_sec: 1.0
+    speed_mps: 1.0
+    dispose_threshold: 0.80
+    giveup_threshold: 0.20
+    help_wait_sec: 20.0
+    dist_weight: 2.0
+    log_actions: true
+
+    risk_aversion: 0.7
+    stubbornness: 0.5
+    fairness_sensitivity: 0.3
+

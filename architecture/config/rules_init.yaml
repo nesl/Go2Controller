@@ -128,7 +128,7 @@ rules:
       exists('skill_done_any', 86400000) and
       not exists('skill_done_any', 30000)
       and not exists('skill_started_any', 30000)
-      and not exists('speech_final_any', 30000)
+      and not exists('stt_processing_any', 30000)
       
 
   # in rules_init.yaml or dynamic rules
@@ -140,6 +140,13 @@ rules:
     mode: "edge"
     expr: "kind == 'step_started' and skill == 'tts.say' and isinstance(inner_ctx.get('text'), str)"
     publish: true
+
+  - id: stt_processing_any
+    enabled: true
+    task: audio_asr
+    output: stt.processing
+    expr: "processing"
+    mode: level
 
       
   # ───────── LLM: interpret human intent from final utterance ─────────

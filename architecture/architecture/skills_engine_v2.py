@@ -123,6 +123,9 @@ def _fraction_to_words(frac_str: str) -> str:
 
 
 def _normalize_tts_text(text: str) -> str:
+
+    return text
+
     def repl_cnode(m: re.Match) -> str:
         nid_str = m.group(1)
         try:

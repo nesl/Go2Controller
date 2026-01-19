@@ -26,6 +26,7 @@ from bt_msgs.msg import BtReading  # NEW
 from geometry_msgs.msg import Quaternion, TransformStamped
 import tf2_ros
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
+from std_msgs.msg import String as StringMsg, Bool as BoolMsg
 
 
 # --- add this helper near the top ---
@@ -41,8 +42,11 @@ MSG_CLASS = {
     "vision_msgs/msg/Detection2DArray": Detection2DArray,
     "nav_msgs/Odometry": Odometry,
     "nav_msgs/msg/Odometry": Odometry,
-    "bt_msgs/BtReading": BtReading,                     # NEW
-    "bt_msgs/msg/BtReading": BtReading,                 # NEW
+    "bt_msgs/BtReading": BtReading,                     
+    "bt_msgs/msg/BtReading": BtReading,       
+    "std_msgs/Bool": BoolMsg,
+    "std_msgs/msg/Bool": BoolMsg,
+          
 }
 
 def quat_to_yaw(q: Quaternion) -> float:
@@ -1105,6 +1109,9 @@ class EventLayerNode(Node):
             return self._cb_vlm_answer
         if topic == "/llm/speech_check_resp":
             return self._cb_llm_speech_check
+        if topic == "/audio/stt_processing":
+            return self._cb_stt_processing
+
         #if topic == "/skills/status":              # NEW
         #    return self._cb_skill_status          # NEW
         # default String
@@ -1312,6 +1319,14 @@ class EventLayerNode(Node):
             # Existing rule path for generic detections:
             self._eval_for_rules("object_detection", "detection.2d", ctx)
 
+    def _cb_stt_processing(self, msg: BoolMsg):
+        ts = self._now()
+        ctx = {
+            "processing": bool(msg.data),
+            "ts": ts,
+        }
+        # Pick task/output names that match your registry.yaml entry
+        self._eval_for_rules("audio_asr", "stt.processing", ctx)
 
 
     def _cb_odom(self, msg: Odometry):

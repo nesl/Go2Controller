@@ -709,6 +709,125 @@ class BrokerNode(Node, BrokerMediationMixin):
         cur.close()
         self.get_logger().info(f"Broker schema ready at {self.db_path}")
 
+    def _plan_fingerprint(self, plan: dict) -> str:
+        """
+        Stable fingerprint so we don't repeatedly announce the same plan.
+        """
+        try:
+            # plan is dict[agent_id] -> list[(box_id, prop, kind)]
+            plan_norm = {}
+            for aid, actions in (plan or {}).items():
+                norm_actions = []
+                for a in actions or []:
+                    try:
+                        box_id, prop, kind = a
+                        norm_actions.append([int(box_id), str(prop), str(kind)])
+                    except Exception:
+                        continue
+                norm_actions.sort(key=lambda x: (x[2], x[0], x[1]))  # kind, box_id, prop
+                plan_norm[str(aid)] = norm_actions
+
+            s = json.dumps(plan_norm, sort_keys=True)
+            return hashlib.sha256(s.encode("utf-8")).hexdigest()
+        except Exception:
+            return str(time.time())
+
+
+    def _format_one_action(self, a: dict) -> str:
+        """
+        a = {"box_id": int, "property": "X"|"Y", "kind": "sense"|"dispose"}
+        """
+        kind = (a.get("kind") or "").strip()
+        box_id = a.get("box_id")
+        prop = (a.get("property") or "").strip()
+
+        if kind == "sense":
+            return f"sense box {box_id} for {prop}"
+        if kind == "dispose":
+            return f"dispose box {box_id} ({prop})"
+        return f"{kind} box {box_id} ({prop})"
+
+
+    def _announce_idle_plan(self, plan: dict, current_time: float):
+        """
+        Called after a trigger_idle optimizer publish.
+        Announces what the robot will do + proposes human assignments.
+        Debounced to avoid spam.
+        """
+        # --- debounce identical plans ---
+        fp = self._plan_fingerprint(plan)
+        now = time.time()
+
+        # small cooldown AND identical-plan suppression
+        cooldown_sec = 4.0
+        last_t = getattr(self, "_last_idle_announce_ts", None)
+        last_fp = getattr(self, "_last_idle_announce_fp", None)
+
+        if last_t is not None and (now - float(last_t)) < cooldown_sec and fp == last_fp:
+            return
+
+        self._last_idle_announce_ts = now
+        self._last_idle_announce_fp = fp
+
+        # --- turn plan into the published JSON-ish structure (same as _publish_optimizer_plan) ---
+        agents_block = {
+            aid: [
+                {"box_id": int(box_id), "property": prop, "kind": kind}
+                for (box_id, prop, kind) in (actions or [])
+            ]
+            for aid, actions in (plan or {}).items()
+        }
+
+        robot_actions = agents_block.get("robot") or []
+        human_a_actions = agents_block.get("human_a") or []
+        human_b_actions = agents_block.get("human_b") or []
+
+        # pick “next” action for each (keep it short)
+        robot_next = robot_actions[0] if robot_actions else None
+        ha_next = human_a_actions[0] if human_a_actions else None
+        hb_next = human_b_actions[0] if human_b_actions else None
+
+        # resolve display names
+        ha_name = self.agent_id_to_human_name.get("human_a", "Human A")
+        hb_name = self.agent_id_to_human_name.get("human_b", "Human B")
+
+        parts = []
+
+        # 1) announce robot intent
+        if robot_next:
+            parts.append(f"I’m going to {self._format_one_action(robot_next)}.")
+        else:
+            parts.append("I don’t have a robot action queued right now.")
+
+        # 2) propose human parts
+        proposals = []
+        if ha_next:
+            proposals.append(f"{ha_name}, could you {self._format_one_action(ha_next)}?")
+        if hb_next:
+            proposals.append(f"{hb_name}, could you {self._format_one_action(hb_next)}?")
+
+        if proposals:
+            parts.append(" ".join(proposals))
+
+        # Optional: mention that optimizer produced more items (without dumping everything)
+        extra = 0
+        if robot_actions: extra += max(0, len(robot_actions) - 1)
+        if human_a_actions: extra += max(0, len(human_a_actions) - 1)
+        if human_b_actions: extra += max(0, len(human_b_actions) - 1)
+        if extra > 0:
+            parts.append("I also have additional suggested actions if you want them.")
+
+        utterance = " ".join(parts).strip()
+        if not utterance:
+            return
+
+        try:
+            # BrokerMediationMixin should provide this
+            self._robot_say(utterance)
+        except Exception as e:
+            self.get_logger().warn(f"[idle] failed to announce plan via TTS: {e}")
+
+
     # ------------------------------ Event ingestion ------------------------------
     def _on_basic_event(self, msg: StringMsg):
         try:
@@ -1907,6 +2026,12 @@ class BrokerNode(Node, BrokerMediationMixin):
 
         current_action = self._current_action_brief()
 
+        human_profiles = {}
+        try:
+            human_profiles = self._load_current_human_profiles() or {}
+        except Exception:
+            human_profiles = {}
+
 
         # 5) Build payload for the LLM.
         context_payload = {
@@ -1914,6 +2039,7 @@ class BrokerNode(Node, BrokerMediationMixin):
             "speaker_id": speaker_id,
             "utterance": utterance,
             "recent_conversation": recent_chat,
+            "human_profiles": human_profiles,
             "current_action": current_action,
             "world_state": {
                 "boxes": simple_boxes,
@@ -1941,10 +2067,13 @@ class BrokerNode(Node, BrokerMediationMixin):
                 "- If they ask you to change the plan, acknowledge the request, restate agreed_plan, and say that "
                 "changes must go through the planning/mediation step.\n"
                 "- Never claim you will add/drop/change actions that are not in agreed_plan.\n"
-                "- Keep answers 1–2 short sentences. No emojis. Use hedged language ('I think', 'probably').\n"
+                "- Keep answers 1-2 short sentences. No emojis. Use hedged language ('I think', 'probably').\n"
                 "- If the utterance is clearly not for you, set should_reply=false and use an empty robot_utterance.\n"
                 "- You may also receive current_action describing what you are doing RIGHT NOW.\n"
                 "- If asked what you are doing, answer using current_action first (if present).\n"
+                "- You also receive human_profiles (human_a/human_b). Use them to tailor tone (direct vs gentle), "
+                "explain more for low-expertise, and manage conflict neutrally.\n"
+
             ),
         }
 
@@ -2391,6 +2520,14 @@ class BrokerNode(Node, BrokerMediationMixin):
             if publish:
                 self._publish_optimizer_plan(plan, current_time, box_positions)
                 self.get_logger().info(f"[optimizer] published plan (reason={publish_reason})")
+
+                # NEW: if idle-triggered, announce robot action + propose human parts
+                if publish_reason == "trigger_idle":
+                    try:
+                        self._announce_idle_plan(plan, current_time)
+                    except Exception as e:
+                        self.get_logger().warn(f"[idle] announce/propose failed: {e}")
+                
             else:
                 self.get_logger().debug("[optimizer] computed plan (not published; periodic tick)")
 

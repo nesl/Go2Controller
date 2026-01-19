@@ -20,6 +20,12 @@ import soundfile as sf
 import librosa
 import torch
 import time, json
+from pathlib import Path
+import base64
+import requests
+
+from openai import OpenAI
+import tempfile
 
 from rclpy.parameter import Parameter
 from rcl_interfaces.msg import SetParametersResult
@@ -34,7 +40,9 @@ class AudioFormat(Enum):
 class TTSProvider(Enum):
     ELEVENLABS = "elevenlabs"
     MMS = "mms"
+    OPENAI = "openai"
 
+'''
 @dataclass
 class TTSConfig:
     api_key: str
@@ -47,6 +55,18 @@ class TTSConfig:
     stability: float = 0.5
     similarity_boost: float = 0.5
     model_id: str = "eleven_turbo_v2_5"
+'''
+
+@dataclass
+class TTSConfig:
+    api_key: str
+    provider: TTSProvider = TTSProvider.OPENAI
+    voice_name: str = "marin"     # OpenAI voice
+    model_id: str = "gpt-4o-mini-tts"
+    language: str = "en"
+    use_cache: bool = True
+    cache_dir: str = "tts_cache"
+
 
 
 # -------------------------- Cache --------------------------
@@ -61,6 +81,7 @@ class AudioCache:
 
     def _path(self, text: str, voice_name: str, provider: str) -> str:
         key = f"{text}_{voice_name}_{provider}"
+
         return os.path.join(self.cache_dir, f"{hashlib.md5(key.encode()).hexdigest()}.mp3")
 
     def get(self, text: str, voice_name: str, provider: str) -> Optional[bytes]:
@@ -156,6 +177,26 @@ class TTSProvider_MMS:
         buf = io.BytesIO()
         sf.write(buf, wav, sr, format="WAV", subtype="PCM_16")
         return buf.getvalue()
+
+from openai import OpenAI
+import tempfile
+
+class TTSProvider_OpenAI:
+    def __init__(self, cfg: TTSConfig):
+        self.cfg = cfg
+        self.client = OpenAI(api_key=cfg.api_key)
+
+    def synthesize(self, text: str) -> bytes:
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            with self.client.audio.speech.with_streaming_response.create(
+                model=self.cfg.model_id,
+                voice=self.cfg.voice_name,
+                input=text,
+            ) as response:
+                response.stream_to_file(f.name)
+            return Path(f.name).read_bytes()
+
+
 # -------------------------- Main Node --------------------------
 
 class EnhancedTTSNode(Node):
@@ -165,13 +206,13 @@ class EnhancedTTSNode(Node):
         # Params
         self.declare_parameter("api_key", "")
         self.declare_parameter("provider", "elevenlabs")
-        self.declare_parameter("voice_name", "XrExE9yKIg1WjnnlVkGX")
+        #self.declare_parameter("voice_name", "XrExE9yKIg1WjnnlVkGX")
         self.declare_parameter("use_cache", True)
         self.declare_parameter("cache_dir", "tts_cache")
         self.declare_parameter("language", "en")
         self.declare_parameter("stability", 0.5)
         self.declare_parameter("similarity_boost", 0.5)
-        self.declare_parameter("model_id", "eleven_turbo_v2_5")
+        #self.declare_parameter("model_id", "eleven_turbo_v2_5")
         # ROS topic to publish WAV bytes for the Pi player:
         self.declare_parameter("wav_topic", "/tts_wav")
         # Stitching options
@@ -180,29 +221,49 @@ class EnhancedTTSNode(Node):
         # Text chunking (reduce provider calls, but keep natural prosody)
         self.declare_parameter("max_chars", 220)
         
+        self.declare_parameter("openai_api_key", "")
+        self.declare_parameter("voice_name", "alloy")
+        self.declare_parameter("model_id", "gpt-4o-mini-tts")
+
+        
         self.declare_parameter("perf_topic", "/tts/perf")
         self.perf_topic = self.get_parameter("perf_topic").get_parameter_value().string_value
         self.pub_perf = self.create_publisher(String, self.perf_topic, 10)
 
-        self.declare_parameter("model_profile", "mms-eng")  # or "elevenlabs-turbo"
+        self.declare_parameter("model_profile", "openai-tts")  # or "elevenlabs-turbo"
         self.model_profile = (
             self.get_parameter("model_profile").get_parameter_value().string_value
         )
 
 
+
         # Config
-        provider = TTSProvider(self.get_parameter("provider").get_parameter_value().string_value)
+
+        api_key = (
+            self.get_parameter("openai_api_key")
+            .get_parameter_value()
+            .string_value
+        )
+
+        if not api_key:
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+
+        if not api_key:
+            self.get_logger().error(
+                "❌ OpenAI API key missing. "
+                "Set ROS param 'openai_api_key' or env var OPENAI_API_KEY."
+            )
+
         self.cfg = TTSConfig(
-            api_key=self.get_parameter("api_key").get_parameter_value().string_value,
-            provider=provider,
+            api_key=api_key,
+            provider=TTSProvider.OPENAI,
             voice_name=self.get_parameter("voice_name").get_parameter_value().string_value,
+            model_id=self.get_parameter("model_id").get_parameter_value().string_value,
+            language=self.get_parameter("language").get_parameter_value().string_value,
             use_cache=self.get_parameter("use_cache").get_parameter_value().bool_value,
             cache_dir=self.get_parameter("cache_dir").get_parameter_value().string_value,
-            language=self.get_parameter("language").get_parameter_value().string_value,
-            stability=self.get_parameter("stability").get_parameter_value().double_value,
-            similarity_boost=self.get_parameter("similarity_boost").get_parameter_value().double_value,
-            model_id=self.get_parameter("model_id").get_parameter_value().string_value,
         )
+
         self.inter_silence_ms = int(self.get_parameter("inter_silence_ms").value)
         self.pad_tail_ms = int(self.get_parameter("pad_tail_ms").value)
         self.max_chars = int(self.get_parameter("max_chars").value)
@@ -263,6 +324,11 @@ class EnhancedTTSNode(Node):
             self.cfg.provider = TTSProvider.ELEVENLABS
             self.cfg.model_id = "eleven_turbo_v2_5"
             return TTSProvider_ElevenLabs(self.cfg)
+        elif self.model_profile == "openai-tts":
+            self.cfg.provider = TTSProvider.OPENAI
+            self.cfg.model_id = "gpt-4o-mini-tts"
+            return TTSProvider_OpenAI(self.cfg)
+            
         else:
             self.get_logger().warn(f"Unknown TTS model_profile={self.model_profile}, defaulting to MMS")
             self.cfg.provider = TTSProvider.MMS

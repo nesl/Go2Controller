@@ -1863,6 +1863,10 @@ class BrokerMediationMixin:
         if robot_utt:
             self._robot_say(robot_utt)
 
+        self.get_logger().info(
+            f"autoresolve"
+        )
+        
         self._finalize_mediation_session(session_id=session_id, session=sess, raw_decision=raw, ts=now_ts)
 
     # ---------- Social context metrics for a proposer ----------

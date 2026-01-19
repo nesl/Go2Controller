@@ -1572,7 +1572,7 @@ class SkillsAgent(Node):
                 self._announce_box_op(
                     "disposal",
                     "finish",
-                    box_id,
+                    node_id,
                     prop,
                     success=result.get("success"),
                     status=result.get("status"),
@@ -1613,13 +1613,13 @@ class SkillsAgent(Node):
                 except Exception as e:
                     self.get_logger().warn(f"[box.dispose] /dispose/cancel failed: {e}")
                 finally:
-                    self._announce_box_op("disposal", "cancel", box_id, prop)
+                    self._announce_box_op("disposal", "cancel", node_id, prop)
                     self._call_soon(_finish)
 
 
             h._cancel = _cancel
 
-            self._announce_box_op("disposal", "start", box_id, prop)
+            self._announce_box_op("disposal", "start", node_id, prop)
 
             def _worker():
                 try:
