@@ -321,6 +321,22 @@ rules:
            - "This is hard."
            - "Are we almost done?"
 
+        1.5. ROBOT-ADDRESS CHECK (IMPORTANT)
+
+           Determine whether the utterance is addressed to the ROBOT.
+
+           Set is_addressed_to_robot=true if:
+           - The speaker names the robot ("robot", "Bob") OR
+           - The speaker uses "you" / "your" in a way that clearly refers to the robot
+             (especially if the robot recently spoke in history).
+
+           Set is_addressed_to_robot=false if:
+           - The utterance is clearly human-to-human (names like "Sam", "Jacob", "A", "B")
+           - The utterance assigns tasks only between humans and does not include the robot.
+
+           If unclear, use history (last 8 items) to infer who "you" refers to.
+
+
         2. AGENT ASSIGNMENT
 
            When the utterance refers to "you", assume it refers to the ROBOT unless it is
@@ -378,6 +394,7 @@ rules:
            You MUST respond with STRICT JSON ONLY, no explanations or markdown.
 
            Fields to output:
+             - is_addressed_to_robot : boolean
              - is_command      : boolean (true if this is a plan/command involving any agent)
              - command_type    : string, one of:
                                  ["robot_only", "multi_agent_plan", "non_command", "ambiguous"]
@@ -446,6 +463,7 @@ rules:
         {
           "type": "object",
           "required": [
+            "is_addressed_to_robot",
             "is_command",
             "command_type",
             "agents_plan",
@@ -453,6 +471,7 @@ rules:
             "natural_summary"
           ],
           "properties": {
+            "is_addressed_to_robot": { "type": "boolean" },
             "is_command": {
               "type": "boolean"
             },

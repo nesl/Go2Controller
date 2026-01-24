@@ -373,7 +373,12 @@ class LLMPolicy(BasePolicy):
         inbox = self._format_inbox(agent)  # implement helper below
 
 
-        recent = [{"speaker_id": m.get("speaker_id"), "text": m.get("text")} for m in agent.last_msgs[-6:]]
+        recent = [{
+            "speaker_id": e.get("speaker_id"),
+            "target_speaker": e.get("target_speaker"),
+            "text": e.get("text"),
+        } for e in agent._get_transcript_tail(12)]
+
 
         last_dec = {
             "last_message_decision": agent.plan_state.get("last_message_decision"),
@@ -527,7 +532,7 @@ class LLMPolicy(BasePolicy):
             lo = max(0.0, float(agent.llm_jitter_min_sec))
             hi = max(lo, float(agent.llm_jitter_max_sec))
             dt = random.uniform(lo, hi)
-            agent._log("LLM", f"jitter_sleep {dt:.2f}s before ACT call")
+            #agent._log("LLM", f"jitter_sleep {dt:.2f}s before ACT call")
             time.sleep(dt)
 
 
@@ -640,7 +645,8 @@ class LLMPolicy(BasePolicy):
 
         # If reply_text exists, publish it as "say" (without blocking action)
         if parsed.get("reply_text"):
-            agent._publish_utterance(str(parsed["reply_text"]))
+            agent._publish_utterance(str(parsed["reply_text"]), target_speaker=requester)
+
 
 
         if act:
@@ -917,6 +923,23 @@ class SimHumanAgent(Node):
         self.llm_jitter_max_sec = float(self.get_parameter("llm_jitter_max_sec").value)
 
 
+
+        self.declare_parameter("infer_target_use_llm", True)
+        self.declare_parameter("infer_target_max_history", 8)
+
+        self.infer_target_use_llm = bool(self.get_parameter("infer_target_use_llm").value)
+        self.infer_target_max_history = int(self.get_parameter("infer_target_max_history").value)
+
+        # ---- transcript: all bus rx + all tx (omniscient log, used for context) ----
+        self.declare_parameter("collect_all_messages", True)
+        self.declare_parameter("collect_all_messages_max", 10)
+        self.collect_all_messages = bool(self.get_parameter("collect_all_messages").value)
+        self.collect_all_messages_max = int(self.get_parameter("collect_all_messages_max").value)
+
+        self._transcript_lock = threading.Lock()
+        self.transcript = deque()  # each item: {dir, t_wall, speaker_id, target_speaker, text, ...}
+
+
         self.agent_id: str = str(self.get_parameter("agent_id").value)
         self.goal_property: Property = str(self.get_parameter("goal_property").value)  # type: ignore
         self.base_url: str = str(self.get_parameter("server_base_url").value).rstrip("/")
@@ -1035,6 +1058,30 @@ class SimHumanAgent(Node):
             f"llm_provider={self.llm_provider} llm_model={self.llm_model}"
         )
 
+    def _record_transcript(self, evt: Dict[str, Any]) -> None:
+        if not self.collect_all_messages:
+            return
+        with self._transcript_lock:
+            self.transcript.append(evt)
+            while len(self.transcript) > self.collect_all_messages_max:
+                self.transcript.popleft()
+
+    def _get_transcript_tail(self, n: int) -> List[Dict[str, Any]]:
+        with self._transcript_lock:
+            tail = list(self.transcript)[-max(0, int(n)):]
+        # keep it compact for prompts
+        out = []
+        for e in tail:
+            out.append({
+                "speaker_id": e.get("speaker_id"),
+                "target_speaker": e.get("target_speaker"),
+                "text": e.get("text"),
+                "t_sim": e.get("t_sim"),
+                "t_wall": e.get("t_wall"),
+            })
+        return out
+
+
     def _clear_waiting_help(self, why: str = "") -> None:
         if self.plan_state.get("phase") == "waiting_help":
             self._log("MEM", f"clear waiting_help {why}".strip())
@@ -1059,7 +1106,7 @@ class SimHumanAgent(Node):
     def _dbg_llm(self, tag: str, txt: str, max_chars: int = 4000) -> None:
         # keep logs readable
         s = txt if len(txt) <= max_chars else (txt[:max_chars] + f"...[trunc {len(txt)-max_chars} chars]")
-        self._log("LLM_PROMPT", f"{tag}={s}")
+        #self._log("LLM_PROMPT", f"{tag}={s}")
 
 
     def _commitments(self) -> List[Dict[str, Any]]:
@@ -1461,6 +1508,93 @@ class SimHumanAgent(Node):
             return bool(self._busy)
 
 
+    def _infer_target_llm(self, speaker_id: str, text: str, now_sim: float) -> Optional[str]:
+        if not self.infer_target_use_llm or self.llm_provider != "openai":
+            return None
+
+        client = self.llm_policy._get_client(self)  # reuse existing OpenAI client init
+        if client is None:
+            return None
+
+        # Build short context: last few dialogue turns + participant roster
+        tail = self._get_transcript_tail(self.infer_target_max_history)
+        hist = [{
+            "speaker_id": e.get("speaker_id"),
+            "target_speaker": e.get("target_speaker"),
+            "text": e.get("text"),
+        } for e in tail]
+
+
+        roster = [{"id": pid, "name": self._display_name(pid), "type": self.participants.get(pid, {}).get("type", "unknown")}
+                  for pid in self.participants.keys()]
+
+        sys_msg = (
+            "You are a message recipient classifier in a multi-agent chat.\n"
+            "Given a new message that omitted an explicit target_speaker, infer who it is addressed to.\n"
+            "Return ONLY JSON with keys: target_speaker and confidence.\n"
+            "target_speaker must be one of the participant ids, or \"all\".\n"
+            "If ambiguous, choose \"all\".\n"
+        )
+
+        user_obj = {
+            "time": round(now_sim, 2),
+            "you_are": self.agent_id,
+            "participants": roster,
+            "recent_dialogue": hist,
+            "incoming": {"speaker_id": speaker_id, "text": text},
+            "output_schema": {"target_speaker": "string", "confidence": "number(0..1)"},
+        }
+
+        # ✅ NEW: log the prompt we send to the infer-target LLM
+        #self.get_logger().info(f"INFER_TARGET_SYSTEM={sys_msg}")
+        #self.get_logger().info(f"INFER_TARGET_USER={json.dumps(user_obj)}")
+
+
+        try:
+            resp = client.responses.create(
+                model=self.llm_model,
+                input=[
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": json.dumps(user_obj)},
+                ],
+                max_output_tokens=80,
+            )
+            raw = resp.output_text
+        except Exception as e:
+            self.get_logger().warn(f"[LLM] infer_target call failed: {e}")
+            return None
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return None
+
+        tgt = str(data.get("target_speaker", "")).strip()
+        conf = data.get("confidence", 0.0)
+        try:
+            conf = float(conf)
+        except Exception:
+            conf = 0.0
+
+        allowed = set(self.participants.keys()) | {"all"}
+        if tgt not in allowed:
+            return None
+
+        # If it’s low confidence, treat as broadcast (prevents accidental ignoring)
+        if conf < 0.55:
+            return "all"
+
+        return tgt
+
+    def _infer_target_speaker(self, speaker_id: str, text: str, now_sim: float) -> str:
+
+        # 2) LLM (may return self / all / someone else)
+        llm = self._infer_target_llm(speaker_id, text, now_sim)
+        if llm is None:
+            return "all"  # safe fallback
+        return llm
+
+
     # ---------------------------
     # ROS bus I/O
     # ---------------------------
@@ -1469,46 +1603,63 @@ class SimHumanAgent(Node):
             payload = json.loads(msg.data)
             if not isinstance(payload, dict):
                 return
-                
-            target = payload.get("target_speaker", None)
-            if target is not None and str(target) not in (self.agent_id, "all"):
-                return
 
             speaker = str(payload.get("speaker_id", "")).strip()
             text = payload.get("text")
+            target = payload.get("target_speaker", None)
+
             if not speaker or not isinstance(text, str):
                 return
+
+            # ✅ record everything seen on the bus
+            self._record_transcript({
+                "t_wall": time.time(),
+                "t_sim": None,  # you can fill this in router thread where you know now_sim
+                "speaker_id": speaker,
+                "target_speaker": (str(target) if target is not None else None),
+                "text": text,
+                "raw": payload,
+            })
+
+            # ----- existing routing filters -----
+            if target is not None and str(target) not in (self.agent_id, "all"):
+                return
+
+            if speaker == self.agent_id:
+                return
+
         except Exception:
             return
 
-        if speaker == self.agent_id:
-            return
-
-        event = {
-            "speaker_id": speaker,
-            "text": text,
-            "t_wall": time.time(),
-        }
+        event = {"speaker_id": speaker, "text": text, "t_wall": time.time()}
         self.last_msgs.append(event)
         self.last_msgs = self.last_msgs[-100:]
 
-        # ✅ Inbox: all messages go here, LLM decides what to do
         self.inbox.append(event)
         while len(self.inbox) > 50:
             self.inbox.popleft()
 
-
         self._log("HEAR", f"from={speaker} text={text!r}")
+
 
 
     def _publish_utterance(self, text: str, target_speaker: Optional[str] = None) -> None:
         out = StringMsg()
+        
+        prefix = ""
+        if target_speaker and target_speaker not in ("all", ""):
+            prefix = self._display_name(target_speaker)
+        
+        text = ("Hey " + prefix + ", " + text) if prefix and not prefix in text else text
+        
         payload = {"text": text, "speaker_id": self.agent_id}
         if target_speaker:
             payload["target_speaker"] = target_speaker
         out.data = json.dumps(payload)
         self.pub_stt.publish(out)
         self._log("SAY", text)
+
+
 
 
     # ---------------------------
@@ -1691,6 +1842,18 @@ class SimHumanAgent(Node):
 
         if action.kind == "say":
             if action.text:
+                # ✅ default recipient if not provided
+                if not action.target_speaker:
+                    # if we're in a conversation context, aim it
+                    if self.plan_state.get("phase") == "waiting_help":
+                        action.target_speaker = str(self.plan_state.get("waiting_on") or "")
+                    else:
+                        # if last message exists, respond to them
+                        if self.last_msgs:
+                            action.target_speaker = str(self.last_msgs[-1].get("speaker_id") or "")
+                    if not action.target_speaker:
+                        action.target_speaker = "all"
+
                 self._publish_utterance(action.text, target_speaker=action.target_speaker)
             return
 
@@ -1896,6 +2059,34 @@ class SimHumanAgent(Node):
                     evt = self.inbox.popleft()
                 except Exception:
                     break
+
+                speaker = str(evt.get("speaker_id", ""))
+                text = str(evt.get("text", ""))
+
+                explicit_target = evt.get("target_speaker", None)
+
+                if explicit_target is not None:
+                    tgt = str(explicit_target)
+                    route_src = "explicit"
+                else:
+                    tgt = self._infer_target_speaker(speaker, text, now_sim)
+                    route_src = "llm_infer" if self.infer_target_use_llm else "fallback"
+
+                # ✅ NEW: log what we think the recipient is
+                self._log(
+                    "ROUTE",
+                    f"route src={route_src} from={speaker} -> target={tgt} "
+                    f"me={self.agent_id} text={text!r}"
+                )
+
+
+                # If not for me (and not broadcast), ignore
+                if tgt not in (self.agent_id, "all"):
+                    self._log("ROUTE", f"ignore msg inferred_target={tgt} from={speaker} text={text!r}")
+                    continue
+
+                # If it IS for me, you can optionally annotate event so downstream LLM sees it
+                evt["target_speaker"] = tgt
 
                 if self.policy_type == "llm":
                     # IMPORTANT: decide_on_message should schedule commitments and publish replies.

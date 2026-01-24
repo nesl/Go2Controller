@@ -35,6 +35,8 @@ from jsonschema import validate, ValidationError  # if you need it for your own 
 
 from std_msgs.msg import String as StringMsg
 
+from collections import defaultdict, deque
+
 import threading
 import copy
 
@@ -134,6 +136,23 @@ class BrokerMediationMixin:
         self._mediation_pending_started_ts: Optional[float] = None
 
         self._mediation_watchdog_timer = None  # rclpy Timer
+        
+        # ---- LLM buffering / single-flight ----
+        # Buffer buckets: (channel, key) -> deque[event_dict]
+        # event_dict is: {"ts": float, "type": "...", "payload": {...}}
+        self._llm_buf = defaultdict(lambda: deque(maxlen=1000))
+        self._llm_inflight = defaultdict(bool)
+        self._llm_lock = threading.Lock()
+
+        # Optional: debounce to coalesce bursts (seconds)
+        self._llm_debounce_sec = {
+            "MEDIATION": 0.15,   # short: natural speech bursts
+            "CHAT": 0.20,
+            "REFLECTION": 1.00,  # slow: let a few messages accumulate
+        }
+
+        # Timers per bucket for debounce scheduling
+        self._llm_debounce_timer = {}  # (channel,key) -> threading.Timer
 
     def _start_pending_deadlines(self, now_ts: float):
         self._mediation_pending_started_ts = float(now_ts)
@@ -159,6 +178,79 @@ class BrokerMediationMixin:
         except Exception:
             # Never let history logging crash the node
             pass
+
+    def _llm_bucket(self, channel: str, key: str) -> tuple:
+        return (str(channel), str(key))
+
+    def _llm_submit(self, channel: str, key: str, ev_type: str, payload: dict, ts: float):
+        """
+        Buffer an event and ensure a worker will run for this (channel,key).
+        If a call is already in flight, we ONLY buffer.
+        If not, we debounce-start a worker to coalesce bursts.
+        """
+        b = self._llm_bucket(channel, key)
+
+        with self._llm_lock:
+            self._llm_buf[b].append({"ts": float(ts), "type": ev_type, "payload": payload})
+
+            # If already in flight, nothing else to do.
+            if self._llm_inflight[b]:
+                return
+
+            # Debounce: restart timer for this bucket
+            # So rapid events become a single call.
+            old_t = self._llm_debounce_timer.get(b)
+            try:
+                if old_t:
+                    old_t.cancel()
+            except Exception:
+                pass
+
+            delay = float(self._llm_debounce_sec.get(channel, 0.0) or 0.0)
+            if delay <= 0.0:
+                # start immediately
+                self._start_llm_worker(channel, key)
+                return
+
+            t = threading.Timer(delay, lambda: self._start_llm_worker(channel, key))
+            self._llm_debounce_timer[b] = t
+            t.daemon = True
+            t.start()
+
+    def _start_llm_worker(self, channel: str, key: str):
+        """
+        Starts a background worker for this bucket if not already running.
+        """
+        b = self._llm_bucket(channel, key)
+
+        with self._llm_lock:
+            # If nothing to do or already running, exit.
+            if self._llm_inflight[b]:
+                return
+            if not self._llm_buf[b]:
+                return
+            self._llm_inflight[b] = True
+
+        def _worker():
+            try:
+                if channel == "MEDIATION":
+                    self._llm_worker_mediation(key)
+                elif channel == "CHAT":
+                    self._llm_worker_chat(key)
+                elif channel == "REFLECTION":
+                    self._llm_worker_reflection(key)
+            finally:
+                # Mark bucket idle, then if more arrived while running, re-run once.
+                with self._llm_lock:
+                    self._llm_inflight[b] = False
+                    has_more = bool(self._llm_buf[b])
+
+                if has_more:
+                    # run again quickly to drain anything that arrived mid-flight
+                    self._start_llm_worker(channel, key)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
 
     def _get_human_turns_with_prev_context(
         self,
@@ -342,11 +434,18 @@ class BrokerMediationMixin:
                     f"[profiles] periodic reflection for {speaker_id} failed: {e}"
                 )
 
-        threading.Thread(target=_worker, daemon=True).start()
+        # Buffer a reflection request (coalesces if reflection already running)
+        self._llm_submit(
+            channel="REFLECTION",
+            key=speaker_id,  # human_id
+            ev_type="trigger",
+            payload={"mode": "periodic"},
+            ts=float(ts),
+        )
 
-        # After we kick off a reflection, reset this human's counter so the next
-        # reflection happens after another full `every` utterances.
+        # Reset counter after triggering
         self._profile_msg_counts[speaker_id] = 0
+
 
 
     def _to_display_text(self, s: str) -> str:
@@ -593,7 +692,7 @@ class BrokerMediationMixin:
         if human_drops:
             d = human_drops[0]
             who = d.get("proposed_by") or "a human"
-            who = self._to_display_human(str(who))  # <-- NEW (humans only)
+            #who = self._to_display_human(str(who))  # <-- NEW (humans only)
             return (
                 f"I couldn't include {who}'s request to {d['kind']} box {d['box_id']} ({d['property']}) "
                 f"because {d['reason']}."
@@ -853,11 +952,12 @@ class BrokerMediationMixin:
         # If there are NO valid robot actions but there WERE issues, Bob should
         # just ask for clarification and stop – there's nothing to optimize.
         if not prefix_plan:
-            if parse_issues_note:
-                self._robot_say(parse_issues_note)
-            else:
-                self.get_logger().info("[llm-plan] no valid robot actions in prefix; ignoring")
-                self._robot_say("I could not understand you.")
+            if not self.sim_mode:
+                if parse_issues_note:
+                    self._robot_say(parse_issues_note)
+                else:
+                    self.get_logger().info("[llm-plan] no valid robot actions in prefix; ignoring")
+                    self._robot_say("I could not understand you.")
             return
 
 
@@ -898,7 +998,7 @@ class BrokerMediationMixin:
 
         # If the plan was partially usable but had missing fields, let Bob
         # proactively tell humans what he had to ignore.
-        if prefix_plan and parse_issues_note:
+        if prefix_plan and parse_issues_note and not self.sim_mode:
             self._robot_say(parse_issues_note)
 
 
@@ -1093,7 +1193,8 @@ class BrokerMediationMixin:
         self._active_mediation_id = session_id
 
         # 7) Optionally do a first mediation step (robot explains / asks questions)
-        self._robot_say("Let me think.")
+        if not self.sim_mode:
+            self._robot_say("Let me think.")
         state, raw = self._plan_mediator.step(state)
         self._mediation_sessions[session_id] = state
 
@@ -1253,7 +1354,7 @@ class BrokerMediationMixin:
                 dropped=dropped,
                 fallback=(raw_decision.get("robot_utterance") or "Okay."),
             )
-            if final_utt:
+            if final_utt and not self.sim_mode:
                 self._robot_say(final_utt)
 
             self.get_logger().info(
@@ -1655,6 +1756,89 @@ class BrokerMediationMixin:
 
     # ---------- Speech routing into an active mediation ----------
 
+    def _llm_worker_mediation(self, session_id: str):
+        """
+        Drain buffered mediation turns for this session_id and do ONE mediator.step().
+        Coalescing rule: append all turns to state, call step once using the last turn.
+        """
+        b = self._llm_bucket("MEDIATION", session_id)
+
+        # Drain events
+        with self._llm_lock:
+            events = list(self._llm_buf[b])
+            self._llm_buf[b].clear()
+
+        if not events:
+            return
+
+        # Defensive: session may have ended
+        sid = getattr(self, "_active_mediation_id", None)
+        sess = self._mediation_sessions.get(session_id)
+        if sid != session_id or not sess or sess.status != "pending":
+            return
+
+        # Collect MediationTurn objects in order
+        turns = []
+        last_ts = None
+        for ev in events:
+            if ev.get("type") != "turn":
+                continue
+            t = ev.get("payload", {}).get("turn")
+            if t is not None:
+                turns.append(t)
+            last_ts = ev.get("ts")
+
+        if not turns:
+            return
+
+        # Bump pending deadline once (most recent time)
+        try:
+            if last_ts is not None:
+                self._bump_pending_deadline(float(last_ts))
+        except Exception:
+            pass
+
+        # Coalesce: append all but last directly into session history
+        for t in turns[:-1]:
+            try:
+                sess.turns.append(t)
+                sess.interaction.recent_utterances.append(t)
+            except Exception:
+                pass
+
+        # One mediator step with the last turn (ONE LLM call)
+        try:
+            sess, raw = self._plan_mediator.step(sess, new_human_turn=turns[-1])
+        except Exception as e:
+            self.get_logger().warn(f"[mediation] buffered step failed: {e}")
+            return
+
+        # Turn cap check (same logic you had)
+        turns_used = int(getattr(sess, "turns_used", 0) or 0)
+        if turns_used >= int(self.mediation_max_turns):
+            now_ts = float(last_ts or time.time())
+            self.get_logger().warn(
+                f"[mediation] max turns reached ({turns_used}); auto-resolving session {session_id}"
+            )
+            self._auto_resolve_pending_session(session_id, sess, reason="max_turns", now_ts=now_ts)
+            return
+
+        self._mediation_sessions[session_id] = sess
+
+        robot_utt = (raw.get("robot_utterance") or "").strip()
+        if robot_utt and not self.sim_mode:
+            self._robot_say(robot_utt)
+
+        if sess.status in ("accept", "reject"):
+            now_ts = float(last_ts or time.time())
+            self._finalize_mediation_session(
+                session_id=session_id,
+                session=sess,
+                raw_decision=raw,
+                ts=now_ts,
+            )
+
+
     def _maybe_route_speech_to_mediation(self, rule: str, trace_entry: dict) -> bool:
         """
         If a mediation session is pending and this basic event looks like human speech,
@@ -1721,36 +1905,48 @@ class BrokerMediationMixin:
         self._bump_pending_deadline(ts)
 
 
-        # Step the mediator with this new human turn
-        sess, raw = self._plan_mediator.step(sess, new_human_turn=human_turn)
-        
-        # Hard cap: if too many steps/turns, resolve
-        turns_used = int(getattr(sess, "turns_used", 0) or 0)
-        if turns_used >= int(self.mediation_max_turns):
-            self.get_logger().warn(
-                f"[mediation] max turns reached ({turns_used}); auto-resolving session {sid}"
-            )
-            self._auto_resolve_pending_session(sid, sess, reason="max_turns", now_ts=ts)
-            return True
-
-        
-        self._mediation_sessions[sid] = sess
-
-        robot_utt = (raw.get("robot_utterance") or "").strip()
-        if robot_utt:
-            self.get_logger().info(f"[mediation] Bob says: {robot_utt}")
-            self._robot_say(robot_utt)
-
-        # If the mediator has reached a decision, finalize the session
-        if sess.status in ("accept", "reject"):
-            self._finalize_mediation_session(
-                session_id=sid,
-                session=sess,
-                raw_decision=raw,
-                ts=ts,
-            )
+        # Buffer the turn into the MEDIATION channel for this session.
+        # If a mediation LLM call is in-flight, this will simply queue it.
+        # Otherwise, this will debounce and then do ONE coalesced step.
+        self._llm_submit(
+            channel="MEDIATION",
+            key=sid,
+            ev_type="turn",
+            payload={"turn": human_turn},
+            ts=float(ts),
+        )
 
         return True
+
+    def _llm_worker_reflection(self, reflection_key: str):
+        """
+        Drain reflection triggers and run at most ONE reflection.
+        For periodic per-human reflection, key=human_id.
+        """
+        b = self._llm_bucket("REFLECTION", reflection_key)
+        with self._llm_lock:
+            events = list(self._llm_buf[b])
+            self._llm_buf[b].clear()
+
+        if not events:
+            return
+
+        # Use the most recent trigger time
+        last_ts = None
+        mode = None
+        for ev in events:
+            mode = (ev.get("payload") or {}).get("mode") or mode
+            last_ts = ev.get("ts") or last_ts
+
+        ts = float(last_ts or time.time())
+
+        # Decide what reflection to run
+        if reflection_key.startswith("human_"):
+            # periodic per-human reflection
+            try:
+                self._run_periodic_profile_reflection_for(reflection_key, ts)
+            except Exception as e:
+                self.get_logger().warn(f"[reflection] periodic failed for {reflection_key}: {e}")
 
 
     def _mediation_watchdog_tick(self):

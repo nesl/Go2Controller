@@ -28,7 +28,7 @@ from go2_interfaces.msg import WebRtcReq
 import requests
 from nav2_msgs.srv import GetCostmap
 import threading
-
+import random
 from dataclasses import dataclass, field
 import time
 
@@ -871,7 +871,7 @@ class SkillsAgent(Node):
 
         self.get_logger().info(f"[tts_immediate] saying: {text!r}")
         # This uses the existing normalization + publish to /tts
-        self.say(text)
+        self.say(text, True)
 
 
     def _announce_box_op(self, op: str, phase: str, box_id: int, prop: str, *,
@@ -1121,7 +1121,7 @@ class SkillsAgent(Node):
 
 
 
-    def say(self, text: str):
+    def say(self, text, mediator = False):
         raw = str(text)
         spoken = _normalize_tts_text(raw)
 
@@ -1129,7 +1129,8 @@ class SkillsAgent(Node):
         sim = bool(self.get_parameter("sim_mode").value)
 
         if sim:
-            self._publish_simulated_stt(spoken)
+            if mediator:
+                self._publish_simulated_stt(spoken)
             return
 
         self.get_logger().info(f"[TTS] {spoken}")

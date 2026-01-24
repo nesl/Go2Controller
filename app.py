@@ -5,7 +5,7 @@ import asyncio
 import random
 from datetime import datetime
 from typing import Literal, Optional, List, Dict, Tuple
-
+from threading import Lock
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -17,9 +17,11 @@ from sqlalchemy import (
     Integer,
     ForeignKey,
     Index,
+    func,
+    case
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
-
+import json
 # ---------------------------------
 # DB setup & sim time
 # ---------------------------------
@@ -38,6 +40,17 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
 SERVER_START = datetime.utcnow()
+TIME_LIMIT_SEC = 600
+
+
+# --- time freeze / scoring state ---
+_TIME_LOCK = Lock()
+FROZEN_TIME: Optional[float] = None   # sim-time value once time is up (typically TIME_LIMIT_SEC)
+TIME_UP: bool = False
+FINAL_SCORE: Optional[dict] = None    # computed once at time-up
+
+# Optional: control any manual prints in endpoints
+ENABLE_STATE_PRINTS = False
 
 
 # ---------------------------------
@@ -53,12 +66,12 @@ AGENT_DETECTION_PARAMS = {
         "Y": {"present": 0.95, "absent": 0.05},
     },
     "human_a": {
-        "X": {"present": 0.80, "absent": 0.20},
-        "Y": {"present": 0.75, "absent": 0.25},
+        "X": {"present": 0.70, "absent": 0.30},
+        "Y": {"present": 0.65, "absent": 0.35},
     },
     "human_b": {
-        "X": {"present": 0.75, "absent": 0.25},
-        "Y": {"present": 0.80, "absent": 0.20},
+        "X": {"present": 0.95, "absent": 0.05},
+        "Y": {"present": 0.95, "absent": 0.05},
     },
 }
 
@@ -68,13 +81,158 @@ DEFAULT_AGENT_PARAMS = {
     "Y": {"present": 0.75, "absent": 0.25},
 }
 
-
 def sim_time() -> float:
     """
     Simulation time in seconds since SERVER_START.
+    Freezes at TIME_LIMIT_SEC once reached.
     Resets when /reset_boxes is called.
     """
-    return (datetime.utcnow() - SERVER_START).total_seconds()
+    global FROZEN_TIME, TIME_UP
+    elapsed = (datetime.utcnow() - SERVER_START).total_seconds()
+
+    with _TIME_LOCK:
+        if FROZEN_TIME is not None:
+            return float(FROZEN_TIME)
+
+        if elapsed >= TIME_LIMIT_SEC:
+            FROZEN_TIME = float(TIME_LIMIT_SEC)
+            TIME_UP = True
+            return float(FROZEN_TIME)
+
+    return float(elapsed)
+
+
+def compute_live_score(db) -> dict:
+    """
+    Live scoreboard (not just final):
+      - senses completed per agent
+      - sensing accuracy per agent (detected == ground truth)
+      - disposals completed per agent
+      - disposal correctness per agent:
+          * correct_on_time  (== success True in your logic)
+          * wrong_property   (disposed when property not present, even if on time)
+          * late             (completed after deadline, regardless of property)
+      - totals
+    """
+
+    # --------
+    # Sensing
+    # --------
+    # Accuracy: compare SenseResult.detected to Box.has_X/has_Y
+    sensed_rows = (
+        db.query(
+            SenseResult.agent_id.label("agent"),
+            func.count().label("sensed_completed"),
+            func.sum(
+                case(
+                    # correct if detected == ground truth presence
+                    (
+                        case(
+                            (SenseResult.property == "X", Box.has_X),
+                            else_=Box.has_Y,
+                        ) == SenseResult.detected,
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("sensed_correct"),
+        )
+        .join(Box, Box.id == SenseResult.box_id)
+        .filter(SenseResult.status == "completed")
+        .group_by(SenseResult.agent_id)
+        .all()
+    )
+
+    sense_by_agent = {}
+    for r in sensed_rows:
+        total = int(r.sensed_completed or 0)
+        correct = int(r.sensed_correct or 0)
+        sense_by_agent[str(r.agent)] = {
+            "completed": total,
+            "correct": correct,
+            "accuracy": (correct / total) if total > 0 else None,
+        }
+
+    # ---------
+    # Disposal
+    # ---------
+    disposal_rows = (
+        db.query(
+            DisposalResult.agent_id.label("agent"),
+            func.count().label("disposed_completed"),
+            func.sum(case((DisposalResult.success == True, 1), else_=0)).label("correct_on_time"),
+            func.sum(
+                case(
+                    # late: completed_at > deadline
+                    (DisposalResult.completed_at != None, 1),  # placeholder; refined below
+                    else_=0,
+                )
+            ).label("dummy"),
+        )
+        .join(Box, Box.id == DisposalResult.box_id)
+        .filter(DisposalResult.status == "completed")
+        .group_by(DisposalResult.agent_id)
+        .all()
+    )
+
+    # We’ll compute wrong_property + late with explicit conditions (clearer).
+    # (Could also do this entirely in SQL; this is fine for small N.)
+    disp_by_agent = {}
+    completed_disposals = (
+        db.query(DisposalResult, Box)
+        .join(Box, Box.id == DisposalResult.box_id)
+        .filter(DisposalResult.status == "completed")
+        .all()
+    )
+
+    for dr, box in completed_disposals:
+        a = str(dr.agent_id)
+        disp_by_agent.setdefault(a, {
+            "completed": 0,
+            "correct_on_time": 0,
+            "wrong_property": 0,
+            "late": 0,
+        })
+
+        disp_by_agent[a]["completed"] += 1
+
+        # Ground truth presence for the disposed property:
+        prop_present = bool(box.has_X) if dr.property == "X" else bool(box.has_Y)
+        late = (dr.completed_at is not None) and (dr.completed_at > box.deadline)
+
+        if late:
+            disp_by_agent[a]["late"] += 1
+        if (not prop_present):
+            disp_by_agent[a]["wrong_property"] += 1
+        if dr.success is True:
+            disp_by_agent[a]["correct_on_time"] += 1
+
+    # Totals
+    total_sensed = sum(v["completed"] for v in sense_by_agent.values())
+    total_disposed = sum(v["completed"] for v in disp_by_agent.values())
+    total_correct_disposals = sum(v["correct_on_time"] for v in disp_by_agent.values())
+
+    return {
+        "t": sim_time(),
+        "time_up": bool(TIME_UP),
+        "sense_by_agent": sense_by_agent,
+        "dispose_by_agent": disp_by_agent,
+        "totals": {
+            "sensed_completed": total_sensed,
+            "disposed_completed": total_disposed,
+            "correct_disposals_on_time": total_correct_disposals,
+        },
+    }
+
+
+def print_live_score(db, reason: str = "") -> None:
+    score = compute_live_score(db)
+    tag = f" ({reason})" if reason else ""
+    print("\n========== LIVE SCORE UPDATE" + tag + " ==========")
+    print(json.dumps(score, indent=2, sort_keys=True))
+    print("==================================================\n")
+
+
 
 
 # ---------------------------------
@@ -190,6 +348,31 @@ objects_pre_data = {
     10: {"x": 6.0, "y": -4.5},
 }
 
+def probability_reading_correct(
+    agent_id: str,
+    prop: str,
+    detected: bool,
+    prior_present: float = 0.5,
+) -> float:
+    agent_params = AGENT_DETECTION_PARAMS.get(agent_id, DEFAULT_AGENT_PARAMS)
+    t = float(agent_params[prop]["present"])  # P(+ | present)
+    f = float(agent_params[prop]["absent"])   # P(+ | absent)
+
+    pi = max(0.0, min(1.0, float(prior_present)))
+
+    if detected:
+        # P(present | +)
+        num = t * pi
+        den = (t * pi) + (f * (1.0 - pi))
+    else:
+        # P(absent | -)
+        num = (1.0 - f) * (1.0 - pi)
+        den = ((1.0 - t) * pi) + ((1.0 - f) * (1.0 - pi))
+
+    if den <= 1e-12:
+        return 0.5
+    return num / den
+
 
 # ---------------------------------
 # Seeding: 20 random boxes (deadlines in sim time)
@@ -211,10 +394,10 @@ def seed_boxes_if_empty():
             deadline = sim_time() + deadline_offset_sec
 
             # Sense and disposal times: 1–5 seconds
-            sense_time_X = random.uniform(30.0, 120.0)
-            sense_time_Y = random.uniform(30.0, 120.0)
-            dispose_time_X = random.uniform(30.0, 120.0)
-            dispose_time_Y = random.uniform(30.0, 120.0)
+            sense_time_X = random.uniform(5.0, 60.0)
+            sense_time_Y = random.uniform(5.0, 60.0)
+            dispose_time_X = random.uniform(5.0, 60.0)
+            dispose_time_Y = random.uniform(5.0, 60.0)
 
             # Locations in a simple square
             x = objects_pre_data[idx+1]["x"] #random.uniform(-5.0, 5.0)
@@ -342,6 +525,14 @@ class SenseResultView(BaseModel):
     completed_at: Optional[float]  # sim time seconds
 
 
+class DisposalResultView(BaseModel):
+    agent_id: str
+    property: PropertyLiteral
+    status: str
+    success: Optional[bool]
+    completed_at: Optional[float]
+
+
 class BoxState(BaseModel):
     box_id: int
     deadline: float         # sim time seconds
@@ -354,14 +545,106 @@ class BoxState(BaseModel):
     sense_time_Y: float
     dispose_time_X: float
     dispose_time_Y: float
+    has_X: bool
+    has_Y: bool
+    disposal_results: List[DisposalResultView]
 
 class TimeResp(BaseModel):
-    server_time: float      # sim time seconds
+    server_time: float
+    time_limit_sec: float
+    time_up: bool
+    score: Optional[dict] = None
 
 
 # ---------------------------------
 # Helpers
 # ---------------------------------
+
+def _print_final_score_once() -> None:
+    # Called only after FINAL_SCORE is set.
+    # Uses a lock so it won’t double-print under concurrent requests.
+    global FINAL_SCORE
+    with _TIME_LOCK:
+        if FINAL_SCORE is None:
+            return
+        if FINAL_SCORE.get("_printed", False):
+            return
+        FINAL_SCORE["_printed"] = True
+
+    # Print outside the lock
+    print("\n================ FINAL SCORE ================\n")
+    print(json.dumps(FINAL_SCORE, indent=2, sort_keys=True))
+    print("\n============================================\n")
+
+
+def compute_score(db) -> dict:
+    """
+    Example score:
+      +1 for each successful completed disposal that finished before its box deadline
+      (and therefore also before time freeze).
+    You can extend this however you want (penalties, deadline bonuses, etc.).
+    """
+    # Success is already computed in /dispose as (prop_present and finished_before_deadline)
+    # but double-check deadline anyway to be safe.
+    success_disposals = (
+        db.query(DisposalResult)
+        .filter(DisposalResult.status == "completed")
+        .filter(DisposalResult.success == True)  # noqa: E712
+        .all()
+    )
+
+    # Count successes, and also count by agent/property if you want
+    total_success = 0
+    per_agent: Dict[str, int] = {}
+    per_property: Dict[str, int] = {"X": 0, "Y": 0}
+
+    for dr in success_disposals:
+        box = db.query(Box).filter(Box.id == dr.box_id).one_or_none()
+        if box is None:
+            continue
+        if dr.completed_at is None:
+            continue
+        if dr.completed_at <= box.deadline:
+            total_success += 1
+            per_agent[dr.agent_id] = per_agent.get(dr.agent_id, 0) + 1
+            per_property[str(dr.property)] = per_property.get(str(dr.property), 0) + 1
+
+    # Optional: percent of all present properties correctly disposed
+    boxes = db.query(Box).all()
+    total_present_props = sum((1 if b.has_X else 0) + (1 if b.has_Y else 0) for b in boxes)
+    completion_rate = (total_success / total_present_props) if total_present_props > 0 else 0.0
+
+    return {
+        "total_successful_disposals": total_success,
+        "total_present_properties": total_present_props,
+        "completion_rate": completion_rate,
+        "per_agent_success": per_agent,
+        "per_property_success": per_property,
+    }
+
+
+def maybe_finalize_time_and_score() -> None:
+    """
+    If time limit reached, freeze time (if not already), compute FINAL_SCORE once.
+    """
+    global FINAL_SCORE, FROZEN_TIME, TIME_UP
+
+    now = sim_time()  # this will freeze when crossing the limit
+    if now < TIME_LIMIT_SEC:
+        return
+
+    with _TIME_LOCK:
+        if FINAL_SCORE is not None:
+            return
+
+        # Ensure frozen flags are set
+        FROZEN_TIME = float(TIME_LIMIT_SEC)
+        TIME_UP = True
+
+        with SessionLocal() as db:
+            FINAL_SCORE = compute_score(db)
+    _print_final_score_once()
+
 def get_box(db, box_id: int) -> Box:
     box = db.query(Box).filter(Box.id == box_id).one_or_none()
     if box is None:
@@ -512,13 +795,23 @@ async def sense(req: SenseRequest):
             )
 
         # Still running and not cancelled: finalize
-        detected, prob = sample_detection(box, prop, req.agent_id)
+        detected, _ = sample_detection(box, prop, req.agent_id)
+        prob = probability_reading_correct(
+            agent_id=req.agent_id,
+            prop=prop,
+            detected=detected,
+            prior_present=0.5,  # consistent with your seeding
+        )
+
         sr.detected = detected
         sr.probability = prob
         sr.completed_at = sim_time()
         sr.status = "completed"
         db.commit()
         db.refresh(sr)
+
+        print_live_score(db, reason=f"sense completed: agent={req.agent_id} box={box_id} prop={prop}")
+
 
         return SenseResponse(
             agent_id=req.agent_id,
@@ -590,6 +883,9 @@ def cancel_sense(req: SenseCancelRequest):
                 property=req.property,
                 status="already_completed",
             )
+
+        print_live_score(db, reason=f"sense cancelled: agent={req.agent_id} box={req.box_id} prop={req.property}")
+
 
         return SenseCancelResponse(
             agent_id=req.agent_id,
@@ -675,6 +971,9 @@ async def dispose(req: DisposeRequest):
         db.commit()
         db.refresh(dr)
 
+        print_live_score(db, reason=f"dispose completed: agent={req.agent_id} box={box_id} prop={prop} success={success}")
+
+
         return DisposeResponse(
             agent_id=req.agent_id,
             box_id=box_id,
@@ -743,6 +1042,8 @@ def cancel_dispose(req: DisposeCancelRequest):
                 status="already_completed",
             )
 
+        print_live_score(db, reason=f"dispose cancelled: agent={req.agent_id} box={req.box_id} prop={req.property}")
+
         return DisposeCancelResponse(
             agent_id=req.agent_id,
             box_id=req.box_id,
@@ -763,6 +1064,11 @@ def get_boxes_state():
     - completed_at in sense_results is sim-time seconds
     - sense_time_* and dispose_time_* are per-box durations (seconds)
     """
+    
+    now = sim_time()
+    if now >= TIME_LIMIT_SEC:
+        maybe_finalize_time_and_score()
+    
     with SessionLocal() as db:
         boxes = db.query(Box).all()
         result: List[BoxState] = []
@@ -781,13 +1087,25 @@ def get_boxes_state():
 
             # aggregate disposal state (success per property)
             disposed_X = any(
-                (dr.property == "X" and dr.status == "completed" and dr.success)
+                (dr.property == "X" and dr.status == "completed")
                 for dr in b.disposal_results
             )
             disposed_Y = any(
-                (dr.property == "Y" and dr.status == "completed" and dr.success)
+                (dr.property == "Y" and dr.status == "completed")
                 for dr in b.disposal_results
             )
+
+
+            dr_views = [
+                DisposalResultView(
+                    agent_id=dr.agent_id,
+                    property=dr.property,  # type: ignore
+                    status=dr.status,
+                    success=dr.success,
+                    completed_at=dr.completed_at,
+                )
+                for dr in b.disposal_results
+            ]
 
             result.append(
                 BoxState(
@@ -802,12 +1120,16 @@ def get_boxes_state():
                     sense_time_Y=b.sense_time_Y,
                     dispose_time_X=b.dispose_time_X,
                     dispose_time_Y=b.dispose_time_Y,
+                    has_X=bool(b.has_X),
+                    has_Y=bool(b.has_Y), 
+                    disposal_results=dr_views,
                 )
             )
             
-        print(result)
-            
+        if ENABLE_STATE_PRINTS and not TIME_UP:
+            print(result)
         return result
+
 
 
 
@@ -816,12 +1138,17 @@ def get_boxes_state():
 # -------------
 @app.get("/time", response_model=TimeResp)
 def get_time():
-    """
-    Returns current simulation time in seconds since last reset/server start.
-    """
-    print(sim_time())
-    return TimeResp(server_time=sim_time())
+    now = sim_time()
+    # If we hit the limit, compute score exactly once
+    if now >= TIME_LIMIT_SEC:
+        maybe_finalize_time_and_score()
 
+    return TimeResp(
+        server_time=now,
+        time_limit_sec=float(TIME_LIMIT_SEC),
+        time_up=bool(TIME_UP),
+        score=FINAL_SCORE if TIME_UP else None,
+    )
 
 # -------------
 # Maintenance
@@ -835,8 +1162,14 @@ def reset_boxes():
     - All boxes, sense_results, disposal_results are cleared.
     - New 20 boxes seeded with deadlines based on new sim_time().
     """
-    global SERVER_START
-    SERVER_START = datetime.utcnow()   # reset simulation clock
+    global SERVER_START, FROZEN_TIME, TIME_UP, FINAL_SCORE
+
+    SERVER_START = datetime.utcnow()
+
+    with _TIME_LOCK:
+        FROZEN_TIME = None
+        TIME_UP = False
+        FINAL_SCORE = None
 
     with SessionLocal() as db:
         db.query(SenseResult).delete()

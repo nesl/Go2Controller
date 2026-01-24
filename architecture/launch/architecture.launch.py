@@ -72,6 +72,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'task_registry_path': os.path.join(pkg_share, 'config', 'task_registry.yaml'),
+                'sim_mode': True,
             }]
         ),
         Node(

@@ -455,7 +455,7 @@ class PlanMediator:
         system_msg = {
             "role": "system",
             "content": (
-                "You are Bob's planning mediator in a mixed human-robot team.\n"
+                "You are Bob's planning mediator in a mixed human-robot team. Bob is the robot.\n"
                 "- You receive a planning view with four groups:\n"
                 "  - baseline_human_agreed_actions = tasks previously proposed by humans and already adopted\n"
                 "  - baseline_optimizer_suggestions = tasks the optimizer added earlier (not explicitly agreed)\n"

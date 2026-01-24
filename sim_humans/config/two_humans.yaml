@@ -16,7 +16,9 @@ sim_human_a:
     # ✅ ROS2-safe: JSON strings (NOT nested YAML dict lists)
     humans_json: >
       [{"id":"human_a","name":"Sam"},{"id":"human_b","name":"Jacob"}]
-    robots_json: "[]"
+    robots_json: >
+      [{"id":"robot","name":"Bob"}]
+
 
     # optional: override trust (0..1)
     trust_overrides_json: >
@@ -53,7 +55,8 @@ sim_human_b:
 
     humans_json: >
       [{"id":"human_a","name":"Sam"},{"id":"human_b","name":"Jacob"}]
-    robots_json: "[]"
+    robots_json: >
+      [{"id":"robot","name":"Bob"}]
 
     trust_overrides_json: >
       {"human_a": 0.60}

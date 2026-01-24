@@ -157,6 +157,8 @@ class BrokerNode(Node, BrokerMediationMixin):
         self.declare_parameter('iteration_limit', 2)
         self.declare_parameter('pull_limit', 2)
 
+        self.declare_parameter('sim_mode', False)
+
         # Allowed SQL objects (read-only)
         self.declare_parameter('allowed_objects_json', json.dumps([
             "bt_nodes","nodes_state",
@@ -264,6 +266,12 @@ class BrokerNode(Node, BrokerMediationMixin):
 
         self.event_summary_batch_size = int(
             self.get_parameter("event_summary_batch_size").value
+        )
+
+        self.sim_mode = int(
+            self.get_parameter("sim_mode")
+            .get_parameter_value()
+            .bool_value
         )
 
         # Async running event summary state
@@ -995,7 +1003,11 @@ class BrokerNode(Node, BrokerMediationMixin):
 
                 # We only care about is_command here
                 is_command = bool(plan_json.get("is_command"))
-
+                is_addr    = bool(plan_json.get("is_addressed_to_robot"))
+                
+                if not is_addr:
+                    return            
+                
                 # Non-command utterances should NOT start a new mediation session here.
                 # They are handled via _maybe_route_speech_to_mediation on speech_final_any,
                 # and during the race window they should just be ignored in this hook.
@@ -1920,6 +1932,96 @@ class BrokerNode(Node, BrokerMediationMixin):
 
 
     def _maybe_chat_reply_to_utterance(
+        self,
+        utterance: str,
+        speaker_id: str,
+        plan_json: Optional[dict],
+        ts: float,
+    ) -> None:
+        # Never chat during mediation (same semantics as before)
+        if self._mediation_in_progress():
+            return
+
+        utterance = (utterance or "").strip()
+        if not utterance:
+            return
+
+        key = (speaker_id or "global").strip() or "global"
+
+        # Buffer the chat event; a worker will coalesce and call the LLM once.
+        self._llm_submit(
+            channel="CHAT",
+            key=key,
+            ev_type="utterance",
+            payload={
+                "speaker_id": speaker_id,
+                "utterance": utterance,
+                "plan_json": plan_json,
+            },
+            ts=float(ts),
+        )
+
+    def _llm_worker_chat(self, chat_key: str):
+        """
+        Drain buffered chat utterances for this speaker key and make ONE LLM call.
+
+        Coalescing policy:
+          - If multiple utterances arrived, merge them into one "utterance" string.
+          - Use the most recent plan_json (last event wins).
+          - speaker_id: last event wins (but we keep all text in merged utterance).
+        """
+        # Gate chat while mediation is pending (double safety)
+        if self._mediation_in_progress():
+            return
+
+        b = self._llm_bucket("CHAT", chat_key)
+
+        # Drain
+        with self._llm_lock:
+            events = list(self._llm_buf[b])
+            self._llm_buf[b].clear()
+
+        if not events:
+            return
+
+        # Build one combined utterance
+        merged_lines = []
+        last_ts = None
+        last_plan_json = None
+        last_speaker_id = chat_key
+
+        for ev in events:
+            if ev.get("type") != "utterance":
+                continue
+            p = ev.get("payload") or {}
+            spk = (p.get("speaker_id") or chat_key or "unknown").strip()
+            txt = (p.get("utterance") or "").strip()
+            if txt:
+                merged_lines.append(f"{spk}: {txt}")
+            if "plan_json" in p:
+                last_plan_json = p.get("plan_json")
+            last_speaker_id = spk
+            last_ts = ev.get("ts") or last_ts
+
+        if not merged_lines:
+            return
+
+        merged_utterance = "\n".join(merged_lines)
+        ts = float(last_ts or time.time())
+
+        # IMPORTANT: one LLM call (your original chat logic)
+        try:
+            self._maybe_chat_reply_to_utterance_impl(
+                utterance=merged_utterance,
+                speaker_id=last_speaker_id,
+                plan_json=last_plan_json,
+                ts=ts,
+            )
+        except Exception as e:
+            self.get_logger().warn(f"[chat] buffered chat worker failed: {e}")
+
+
+    def _maybe_chat_reply_to_utterance_impl(
         self,
         utterance: str,
         speaker_id: str,

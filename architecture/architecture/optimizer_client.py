@@ -292,6 +292,8 @@ def plan_assignments_gurobi(
     s_vars: Dict[Tuple[str, int, Property], gp.Var] = {}
     d_vars: Dict[Tuple[str, int, Property], gp.Var] = {}
 
+
+
     for a in agents:
         for b in boxes:
             for p in props:
@@ -354,7 +356,7 @@ def plan_assignments_gurobi(
     # -----------------------------------------------------------------------
     # Constraints
     # -----------------------------------------------------------------------
-
+    BIG_M = 1000.0
     # (1) At most one disposal for each (box, property)
     for b in boxes:
         for p in props:
@@ -368,6 +370,58 @@ def plan_assignments_gurobi(
                     gp.quicksum(vars_bp) <= 1,
                     name=f"one_disp_box{b.box_id}_{p}",
                 )
+
+    # (1b) NEW (Option A): In this timestep (i.e., this optimizer solve),
+    # a given (box, property) can be EITHER:
+    #   - disposed by at most one agent, OR
+    #   - sensed by any number of agents
+    # but NOT both.
+    #
+    # Implement with an indicator y_disp[box,prop] and gate all senses by (1 - y_disp).
+    y_disp: Dict[Tuple[int, Property], gp.Var] = {}
+
+    # create indicators
+    for b in boxes:
+        for p in props:
+            y_disp[(b.box_id, p)] = model.addVar(
+                vtype=GRB.BINARY, name=f"y_disp_{b.box_id}_{p}"
+            )
+
+    # link indicators to disposal vars and gate sensing
+    for b in boxes:
+        for p in props:
+            disp_bp = [
+                v
+                for (aid, bid, pp), v in d_vars.items()
+                if bid == b.box_id and pp == p
+            ]
+            sense_bp = [
+                v
+                for (aid, bid, pp), v in s_vars.items()
+                if bid == b.box_id and pp == p
+            ]
+
+            # Link: y_disp == sum(disp_vars). Since you already enforce <= 1 disposal,
+            # this is a correct OR-equivalence.
+            if disp_bp:
+                model.addConstr(
+                    gp.quicksum(disp_bp) == y_disp[(b.box_id, p)],
+                    name=f"link_y_disp_{b.box_id}_{p}",
+                )
+            else:
+                model.addConstr(
+                    y_disp[(b.box_id, p)] == 0,
+                    name=f"link_y_disp_zero_{b.box_id}_{p}",
+                )
+
+            # Gate sensing: if disposal happens (y_disp=1), all senses must be 0.
+            # If no disposal (y_disp=0), senses can be many (bounded only by time budget etc.).
+            if sense_bp:
+                model.addConstr(
+                    gp.quicksum(sense_bp) <= BIG_M * (1 - y_disp[(b.box_id, p)]),
+                    name=f"no_sense_if_disp_{b.box_id}_{p}",
+                )
+
 
     # (2) Agent time budget (travel + base action times)
     agent_load_expr: Dict[str, gp.LinExpr] = {}
@@ -397,7 +451,7 @@ def plan_assignments_gurobi(
         agent_load_expr[a.agent_id] = expr
 
     # (3) Role coupling: if agent is sensing, it cannot dispose (and vice versa)
-    BIG_M = 1000.0
+
 
     for a in agents:
         sense_vars_a = [v for (aid, _bid, _p), v in s_vars.items() if aid == a.agent_id]
