@@ -14,7 +14,7 @@ from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformListener, LookupException, ExtrapolationException
 import requests
 
-from openai import OpenAI
+from openai import OpenAI, APITimeoutError
 from jsonschema import validate, ValidationError
 
 import yaml  # NEW
@@ -157,6 +157,8 @@ class BrokerNode(Node, BrokerMediationMixin):
         self.declare_parameter('iteration_limit', 2)
         self.declare_parameter('pull_limit', 2)
 
+        self.declare_parameter("plan_accept_policy", "normal")
+
         self.declare_parameter('sim_mode', False)
 
         # Allowed SQL objects (read-only)
@@ -218,6 +220,10 @@ class BrokerNode(Node, BrokerMediationMixin):
             self.get_parameter("optimizer_speed_human_b_mps").value
         )
 
+        # valid: "normal", "always_accept"
+        self.plan_accept_policy = (
+            self.get_parameter("plan_accept_policy").get_parameter_value().string_value
+        )
 
         # Last plan and “fingerprint” of box server state
         self._last_plan = None
@@ -425,6 +431,10 @@ class BrokerNode(Node, BrokerMediationMixin):
         )
 
 
+    def _always_accept(self) -> bool:
+        return (getattr(self, "plan_accept_policy", "normal") == "always_accept")
+
+
     def _swap_str(self, s: str, mapping: dict) -> str:
         if not isinstance(s, str) or not mapping:
             return s
@@ -560,6 +570,11 @@ class BrokerNode(Node, BrokerMediationMixin):
                 self.get_logger().info(
                     f"[broker] event_summary_batch_size = {self.event_summary_batch_size}"
                 )
+
+            if p.name == "plan_accept_policy":
+                self.plan_accept_policy = str(p.value)
+
+
 
         return SetParametersResult(successful=True, reason="ok")
 
@@ -2422,7 +2437,7 @@ class BrokerNode(Node, BrokerMediationMixin):
                         reasoning_effort="medium",
                     )
                 else:
-                    client = OpenAI()
+                    client = OpenAI(timeout=60.0, max_retries=0)
                     resp = client.chat.completions.create(
                         model=used_model,
                         messages=messages_for_llm,
@@ -2451,6 +2466,20 @@ class BrokerNode(Node, BrokerMediationMixin):
                 validate(instance=obj, schema=used_schema)
                 return obj
 
+            except APITimeoutError as e:
+                dt_ms = int((time.time() - t0) * 1000)
+                last_exc = e
+                self.get_logger().warn(
+                    f"[llm] timeout after {dt_ms} ms "
+                    f"(attempt {attempt + 1}/{retries + 1})"
+                )
+
+                if attempt >= retries:
+                    break
+
+                # simple fixed backoff (or remove sleep if you want immediate retry)
+                time.sleep(0.5)
+                continue
 
 
             except (json.JSONDecodeError, ValidationError) as e:
@@ -2461,6 +2490,9 @@ class BrokerNode(Node, BrokerMediationMixin):
                     "role": "system",
                     "content": "Return ONLY valid JSON per the given schema. No prose.",
                 }]
+                self.get_logger().info(
+                    "\n=== LLM JSON DECODE ERROR ===\n"
+                )
                 continue
 
 
@@ -2468,7 +2500,12 @@ class BrokerNode(Node, BrokerMediationMixin):
             except Exception as e:
                 dt_ms = int((time.time() - t0) * 1000)
                 last_exc = e
+                self.get_logger().warn(f"[llm] error?")
                 continue
+
+        self.get_logger().info(
+            "\n=== lllm ERROR ===\n"
+        )
 
         raise ValueError(f"LLM did not return valid JSON ({schema_name}): {last_exc}")
 
@@ -2855,10 +2892,12 @@ class BrokerNode(Node, BrokerMediationMixin):
             disposed_Y = bool(b.get("disposed_Y", False))
 
             # --- Build already_sensed + crude beliefs from sense_results ---
-            already_sensed: Dict[str, Dict[str, bool]] = {}
+            # already_sensed_any[prop] = True if ANY agent has a completed sense for (box, prop)
+            already_sensed_any = {"X": False, "Y": False}
+
+            already_sensed: Dict[str, Dict[str, bool]] = {}   # keep your per-agent map too
             sense_results = b.get("sense_results") or []
 
-            # Track last detection for each (prop)
             last_det_X = None
             last_det_Y = None
             count_X = 0
@@ -2870,13 +2909,17 @@ class BrokerNode(Node, BrokerMediationMixin):
                 status = sr.get("status")
                 detected = sr.get("detected")
 
-                if prop not in ("X", "Y") or not agent_id:
+                if prop not in ("X", "Y"):
                     continue
 
                 if status == "completed":
-                    # mark already_sensed[agent_id][prop] = True
-                    amap = already_sensed.setdefault(agent_id, {})
-                    amap[prop] = True
+                    # Any-agent completion flag (THIS is what you’ll use for the optimizer constraint)
+                    already_sensed_any[prop] = True
+
+                    # Keep your existing per-agent bookkeeping (may still be useful elsewhere)
+                    if agent_id:
+                        amap = already_sensed.setdefault(agent_id, {})
+                        amap[prop] = True
 
                     if prop == "X":
                         count_X += 1
@@ -2884,6 +2927,7 @@ class BrokerNode(Node, BrokerMediationMixin):
                     else:
                         count_Y += 1
                         last_det_Y = detected
+
 
             # Very crude belief heuristics:
             #   - prior 0.5
@@ -2918,8 +2962,12 @@ class BrokerNode(Node, BrokerMediationMixin):
                 disposed_Y=disposed_Y,
                 info_X=info_X,
                 info_Y=info_Y,
-                already_sensed=already_sensed,
+                already_sensed={
+                    **already_sensed,
+                    "__any__": already_sensed_any,   # << add this
+                },
             )
+
             boxes.append(box_info)
 
         return boxes, positions

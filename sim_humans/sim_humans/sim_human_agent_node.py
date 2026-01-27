@@ -631,6 +631,9 @@ class LLMPolicy(BasePolicy):
                     # (urgent_override=True bypasses this)
                     c["blocked_on_busy"] = not c["urgent_override"]
 
+                    if c.get("urgent_override", False):
+                        agent._request_preempt(why=f"urgent_accept from={requester} box={box_id} prop={prop}")
+
 
         # If reject/ignore and action refers to a previously-active commitment, cancel it
         if decision in ("reject", "ignore") and isinstance(act, dict):
@@ -922,6 +925,13 @@ class SimHumanAgent(Node):
         self.llm_jitter_min_sec = float(self.get_parameter("llm_jitter_min_sec").value)
         self.llm_jitter_max_sec = float(self.get_parameter("llm_jitter_max_sec").value)
 
+        self._op_lock = threading.Lock()
+        self._current_op: Optional[Dict[str, Any]] = None
+        # example: {"kind":"dispose","box_id":10,"prop":"Y","started_sim":123.4}
+
+        self._cancel_lock = threading.Lock()
+        self._cancel_evt: Optional[threading.Event] = None
+
 
 
         self.declare_parameter("infer_target_use_llm", True)
@@ -940,6 +950,9 @@ class SimHumanAgent(Node):
         self.transcript = deque()  # each item: {dir, t_wall, speaker_id, target_speaker, text, ...}
 
 
+
+
+
         self.agent_id: str = str(self.get_parameter("agent_id").value)
         self.goal_property: Property = str(self.get_parameter("goal_property").value)  # type: ignore
         self.base_url: str = str(self.get_parameter("server_base_url").value).rstrip("/")
@@ -955,6 +968,8 @@ class SimHumanAgent(Node):
         self.help_wait_sec: float = float(self.get_parameter("help_wait_sec").value)
         self.help_target_speaker: str = str(self.get_parameter("help_target_speaker").value)
         self.dist_weight: float = float(self.get_parameter("dist_weight").value)
+
+
 
         # LLM config
         self.llm_provider = str(self.get_parameter("llm_provider").value).lower()
@@ -997,7 +1012,17 @@ class SimHumanAgent(Node):
         self._router_lock = threading.Lock()
         self._router_thread: Optional[threading.Thread] = None
 
+        # ---------------------------
+        # Action journal + graceful shutdown
+        # ---------------------------
+        self._journal_lock = threading.Lock()
+        self._action_journal: List[Dict[str, Any]] = []
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = False
 
+        # keep timer handles so we can cancel them on shutdown
+        self._action_timer = self.create_timer(self.decision_period, self._tick)
+        self._router_timer = self.create_timer(self.router_period_sec, self._router_tick)
 
         self.plan_state: Dict[str, Any] = {
             "focus_box_id": None,
@@ -1044,11 +1069,6 @@ class SimHumanAgent(Node):
         self.llm_policy = LLMPolicy(fallback=self.scripted_policy)
         self.policy: BasePolicy = self.llm_policy if self.policy_type == "llm" else self.scripted_policy
 
-        self.create_timer(self.decision_period, self._tick)
-
-        # ✅ message router runs independently; stays responsive while server calls block
-        self.create_timer(self.router_period_sec, self._router_tick)
-
 
         self.get_logger().info(
             f"SimHumanAgent up agent_id={self.agent_id} goal={self.goal_property} "
@@ -1057,6 +1077,63 @@ class SimHumanAgent(Node):
             f"help_wait={self.help_wait_sec}s speed={self.speed_mps} timeout={self.timeout}s "
             f"llm_provider={self.llm_provider} llm_model={self.llm_model}"
         )
+
+    def _request_preempt(self, why: str = "") -> None:
+        self._log("PREEMPT", why)
+
+        # 1) cancel server op if we are in sense/dispose
+        self._cancel_current_server_op()
+
+        # 2) also cancel travel sleep / local work (your own cancel event)
+        with self._cancel_lock:
+            if self._cancel_evt is not None:
+                self._cancel_evt.set()
+
+
+    def _new_cancel_evt(self) -> threading.Event:
+        with self._cancel_lock:
+            self._cancel_evt = threading.Event()
+            return self._cancel_evt
+
+
+    def _set_current_op(self, kind: str, box_id: int, prop: str, now_sim: float) -> None:
+        with self._op_lock:
+            self._current_op = {"kind": kind, "box_id": int(box_id), "prop": str(prop), "started_sim": float(now_sim)}
+
+    def _clear_current_op(self) -> None:
+        with self._op_lock:
+            self._current_op = None
+
+    def _get_current_op(self) -> Optional[Dict[str, Any]]:
+        with self._op_lock:
+            return dict(self._current_op) if self._current_op else None
+
+
+    def _cancel_current_server_op(self) -> bool:
+        op = self._get_current_op()
+        if not op:
+            return False
+
+        kind = op["kind"]
+        box_id = int(op["box_id"])
+        prop = str(op["prop"])
+
+        try:
+            if kind == "sense":
+                r = self._http("POST", "/sense/cancel", json_body={"agent_id": self.agent_id, "box_id": box_id, "property": prop})
+            elif kind == "dispose":
+                r = self._http("POST", "/dispose/cancel", json_body={"agent_id": self.agent_id, "box_id": box_id, "property": prop})
+            else:
+                return False
+
+            # if cancel succeeded or already done, treat as “we no longer own it”
+            if r.status_code == 200:
+                self._log("CANCEL", f"{kind} box={box_id} prop={prop} -> {r.json().get('status')}")
+                return True
+        except Exception as e:
+            self.get_logger().warn(f"[CANCEL] failed: {e}")
+        return False
+
 
     def _record_transcript(self, evt: Dict[str, Any]) -> None:
         if not self.collect_all_messages:
@@ -1352,6 +1429,120 @@ class SimHumanAgent(Node):
         if tag in {"START", "HTTP"}:
             return
         self.get_logger().info(f"[{tag}] {msg}")
+
+
+    def _journal_add(self, evt: Dict[str, Any]) -> int:
+        """Append an action event and return its index (so we can update outcomes later)."""
+        with self._journal_lock:
+            self._action_journal.append(evt)
+            return len(self._action_journal) - 1
+
+    def _journal_update(self, idx: int, patch: Dict[str, Any]) -> None:
+        with self._journal_lock:
+            if 0 <= idx < len(self._action_journal):
+                self._action_journal[idx].update(patch)
+
+    def _print_action_summary(self, *, now_sim: float, time_limit: float) -> None:
+        with self._journal_lock:
+            rows = list(self._action_journal)
+
+        self.get_logger().info("")
+        self.get_logger().info("========== ACTION SUMMARY ==========")
+        self.get_logger().info(f"agent_id={self.agent_id} goal={self.goal_property}  end_t={now_sim:.2f}/{time_limit:.2f}")
+        if not rows:
+            self.get_logger().info("(no actions recorded)")
+            self.get_logger().info("====================================")
+            self.get_logger().info("")
+            return
+
+        for i, e in enumerate(rows, start=1):
+            t = e.get("t_sim", None)
+            kind = e.get("kind", "")
+            box_id = e.get("box_id", None)
+            prop = e.get("prop", None)
+            tgt = e.get("target_speaker", None)
+            reason = e.get("reason", "")
+            text = e.get("text", None)
+
+            parts = [f"{i:03d}"]
+            if isinstance(t, (int, float)):
+                parts.append(f"t={float(t):.2f}")
+            parts.append(f"kind={kind}")
+
+            if box_id is not None:
+                parts.append(f"box={box_id}")
+            if prop is not None:
+                parts.append(f"prop={prop}")
+            if tgt:
+                parts.append(f"to={tgt}")
+
+            # outcomes (optional)
+            if "status" in e:
+                parts.append(f"status={e.get('status')}")
+            if "success" in e:
+                parts.append(f"success={e.get('success')}")
+            if "detected" in e:
+                parts.append(f"detected={e.get('detected')}")
+            if "probability" in e:
+                parts.append(f"p={e.get('probability')}")
+
+            line = " | ".join(parts)
+
+            # keep text/reason short to avoid spam
+            if isinstance(text, str) and text.strip():
+                line += f" | text={text.strip()[:160]!r}"
+            if isinstance(reason, str) and reason.strip():
+                line += f" | reason={reason.strip()[:160]!r}"
+
+            self.get_logger().info(line)
+
+        self.get_logger().info("====================================")
+        self.get_logger().info("")
+
+    def _request_shutdown_with_summary(self, *, now_sim: float, time_limit: float, why: str) -> None:
+        """Print summary once, stop timers/threads, and shutdown ROS so the program exits."""
+        with self._shutdown_lock:
+            if self._shutdown_requested:
+                return
+            self._shutdown_requested = True
+
+        self._log("TIME", f"Shutting down: {why}")
+
+        # stop future work
+        self._stop = True
+
+        # cancel timers so no more callbacks fire
+        try:
+            if hasattr(self, "_action_timer") and self._action_timer is not None:
+                self._action_timer.cancel()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_router_timer") and self._router_timer is not None:
+                self._router_timer.cancel()
+        except Exception:
+            pass
+
+        # best-effort cancel any in-flight ops
+        try:
+            self._cancel_current_server_op()
+        except Exception:
+            pass
+        try:
+            with self._cancel_lock:
+                if self._cancel_evt is not None:
+                    self._cancel_evt.set()
+        except Exception:
+            pass
+
+        # print step-by-step summary
+        self._print_action_summary(now_sim=now_sim, time_limit=time_limit)
+
+        # shutdown ROS -> rclpy.spin() returns -> program ends
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
     # ---------------------------
@@ -1808,6 +1999,20 @@ class SimHumanAgent(Node):
     def _execute(self, action: PolicyAction, box_lookup: Dict[int, BoxSummary], now_sim: float) -> None:
         self._log("ACT", f"execute kind={action.kind} box={action.box_id} prop={action.prop} reason={action.reason}")
 
+        j_idx = None
+        if action.kind != "idle":
+            j_idx = self._journal_add({
+                "t_sim": float(now_sim),
+                "kind": action.kind,
+                "box_id": action.box_id,
+                "prop": action.prop,
+                "target_speaker": action.target_speaker,
+                "text": action.text,
+                "reason": action.reason,
+            })
+
+
+
 
         if self.plan_state.get("phase") == "waiting_help" and self.waiting_mode == "soft":
             w_box = self.plan_state.get("waiting_help_box_id")
@@ -1823,15 +2028,18 @@ class SimHumanAgent(Node):
                 return
 
 
+        cancel_evt = None
         # update focus for real physical actions (not ask_help; we update that inside ask_help handler)
-        if action.kind in ("sense_self", "dispose", "goto_only") and action.box_id is not None and action.prop is not None:
-            self.plan_state["focus_box_id"] = int(action.box_id)
-            self.plan_state["focus_prop"] = str(action.prop)
-            self.plan_state["phase"] = (
-                "sense" if action.kind == "sense_self"
-                else "dispose" if action.kind == "dispose"
-                else "goto"
-            )
+        if action.kind in ("sense_self", "dispose", "goto_only"):
+            cancel_evt = self._new_cancel_evt()
+            if action.box_id is not None and action.prop is not None:
+                self.plan_state["focus_box_id"] = int(action.box_id)
+                self.plan_state["focus_prop"] = str(action.prop)
+                self.plan_state["phase"] = (
+                    "sense" if action.kind == "sense_self"
+                    else "dispose" if action.kind == "dispose"
+                    else "goto"
+                )
 
         if action.text:
             self.plan_state["last_commitment"] = action.text
@@ -1939,12 +2147,23 @@ class SimHumanAgent(Node):
             self._set_busy(True)
             try:
                 self._travel_to(box)
+                self._set_current_op("sense", box.box_id, action.prop, now_sim)
                 js = self._sense(box.box_id, action.prop)
+                
+                if j_idx is not None:
+                    self._journal_update(j_idx, {
+                        "status": js.get("status"),
+                        "detected": js.get("detected"),
+                        "probability": js.get("probability"),
+                    })
+
+                
                 st["self_sensed"] = True
                 st["last_self_sense_status"] = js.get("status")
                 # ✅ mark commitment done after success
                 self._complete_active_commitment_if_any(status="done")
             finally:
+                self._clear_current_op()
                 self._set_busy(False)
             return
 
@@ -1954,10 +2173,20 @@ class SimHumanAgent(Node):
             self._set_busy(True)
             try:
                 self._travel_to(box)
+                self._set_current_op("dispose", box.box_id, action.prop, now_sim)
                 js = self._dispose(box.box_id, action.prop)
+                
+                if j_idx is not None:
+                    self._journal_update(j_idx, {
+                        "status": js.get("status"),
+                        "success": js.get("success"),
+                    })
+
+                
                 self._complete_active_commitment_if_any(status="done")
                 self._mark_done(box.box_id, action.prop, why=f"dispose_attempt success={js.get('success')}")
             finally:
+                self._clear_current_op()
                 self._set_busy(False)
             return
 
@@ -1979,9 +2208,16 @@ class SimHumanAgent(Node):
     def _run_one_cycle(self) -> None:
         t = self._time()
         now_sim = float(t["server_time"])
-        if now_sim >= float(t["time_limit_sec"]):
-            self._log("TIME", f"limit reached server_time={now_sim:.2f} >= {t['time_limit_sec']:.2f}")
+        time_limit = float(t["time_limit_sec"])
+        if now_sim >= time_limit:
+            self._log("TIME", f"limit reached server_time={now_sim:.2f} >= {time_limit:.2f}")
+            self._request_shutdown_with_summary(
+                now_sim=now_sim,
+                time_limit=time_limit,
+                why="time_limit_reached (action loop)",
+            )
             return
+
 
         boxes = self._boxes_state()
         box_lookup = {b.box_id: b for b in boxes}
@@ -2051,6 +2287,18 @@ class SimHumanAgent(Node):
             # Lightweight snapshot of time + boxes for router context
             t = self._time()
             now_sim = float(t["server_time"])
+            
+            
+            time_limit = float(t["time_limit_sec"])
+            if now_sim >= time_limit:
+                self._request_shutdown_with_summary(
+                    now_sim=now_sim,
+                    time_limit=time_limit,
+                    why="time_limit_reached (router loop)",
+                )
+                return
+
+            
             boxes = self._boxes_state()
 
             handled = 0

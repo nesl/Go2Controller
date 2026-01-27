@@ -207,7 +207,57 @@ def compute_live_score(db) -> dict:
         if dr.success is True:
             disp_by_agent[a]["correct_on_time"] += 1
 
-    # Totals
+    # -----------------------
+    # NEW: per-agent itemized lists
+    # -----------------------
+    sensed_items_by_agent: Dict[str, List[Dict[str, Any]]] = {}
+    sensed_items = (
+        db.query(SenseResult, Box)
+        .join(Box, Box.id == SenseResult.box_id)
+        .filter(SenseResult.status == "completed")
+        .order_by(SenseResult.completed_at.asc())
+        .all()
+    )
+    for sr, box in sensed_items:
+        a = str(sr.agent_id)
+        sensed_items_by_agent.setdefault(a, []).append({
+            "box_id": int(sr.box_id),
+            "prop": str(sr.property),
+            "detected": bool(sr.detected) if sr.detected is not None else None,
+            "probability": float(sr.probability) if sr.probability is not None else None,
+            "completed_at": float(sr.completed_at) if sr.completed_at is not None else None,
+            # optional: include ground truth so you can inspect correctness quickly
+            "truth_present": bool(box.has_X) if str(sr.property) == "X" else bool(box.has_Y),
+        })
+
+    disposed_items_by_agent: Dict[str, List[Dict[str, Any]]] = {}
+    disposed_items = (
+        db.query(DisposalResult, Box)
+        .join(Box, Box.id == DisposalResult.box_id)
+        .filter(DisposalResult.status == "completed")
+        .order_by(DisposalResult.completed_at.asc())
+        .all()
+    )
+    for dr, box in disposed_items:
+        a = str(dr.agent_id)
+        prop = str(dr.property)
+        prop_present = bool(box.has_X) if prop == "X" else bool(box.has_Y)
+        late = (dr.completed_at is not None) and (dr.completed_at > box.deadline)
+        wrong_property = (not prop_present)
+
+        disposed_items_by_agent.setdefault(a, []).append({
+            "box_id": int(dr.box_id),
+            "prop": prop,
+            "success": bool(dr.success) if dr.success is not None else None,
+            "completed_at": float(dr.completed_at) if dr.completed_at is not None else None,
+            "late": bool(late),
+            "wrong_property": bool(wrong_property),
+            "deadline": float(box.deadline),
+            # optional: include truth
+            "truth_present": bool(prop_present),
+        })
+
+    # Totals (your existing totals)
     total_sensed = sum(v["completed"] for v in sense_by_agent.values())
     total_disposed = sum(v["completed"] for v in disp_by_agent.values())
     total_correct_disposals = sum(v["correct_on_time"] for v in disp_by_agent.values())
@@ -217,13 +267,17 @@ def compute_live_score(db) -> dict:
         "time_up": bool(TIME_UP),
         "sense_by_agent": sense_by_agent,
         "dispose_by_agent": disp_by_agent,
+
+        # ✅ NEW FIELDS
+        "sensed_items_by_agent": sensed_items_by_agent,
+        "disposed_items_by_agent": disposed_items_by_agent,
+
         "totals": {
             "sensed_completed": total_sensed,
             "disposed_completed": total_disposed,
             "correct_disposals_on_time": total_correct_disposals,
         },
     }
-
 
 def print_live_score(db, reason: str = "") -> None:
     score = compute_live_score(db)

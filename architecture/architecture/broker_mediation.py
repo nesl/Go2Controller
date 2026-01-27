@@ -147,12 +147,24 @@ class BrokerMediationMixin:
         # Optional: debounce to coalesce bursts (seconds)
         self._llm_debounce_sec = {
             "MEDIATION": 0.15,   # short: natural speech bursts
+            "MEDIATION_INIT": 0.05,
             "CHAT": 0.20,
             "REFLECTION": 1.00,  # slow: let a few messages accumulate
+            "MEDIATION_AUTORESOLVE": 0.00,
         }
 
         # Timers per bucket for debounce scheduling
         self._llm_debounce_timer = {}  # (channel,key) -> threading.Timer
+        
+        # ---- Always-accept override tracking ----
+        # Remember the last committed robot first-action and who requested it,
+        # so we can announce overrides when another human issues a new request.
+        self._last_always_accept_commit = None  # type: Optional[dict]
+        # How soon two requests count as "consecutive" (seconds)
+        self.always_accept_override_window_sec = float(
+            getattr(self, "always_accept_override_window_sec", 25.0)
+        )
+
 
     def _start_pending_deadlines(self, now_ts: float):
         self._mediation_pending_started_ts = float(now_ts)
@@ -179,6 +191,8 @@ class BrokerMediationMixin:
             # Never let history logging crash the node
             pass
 
+
+
     def _llm_bucket(self, channel: str, key: str) -> tuple:
         return (str(channel), str(key))
 
@@ -188,11 +202,17 @@ class BrokerMediationMixin:
         If a call is already in flight, we ONLY buffer.
         If not, we debounce-start a worker to coalesce bursts.
         """
+        
+        self.get_logger().info(
+        f"[llm_worker] {channel}"
+        )
+        
         b = self._llm_bucket(channel, key)
 
         with self._llm_lock:
             self._llm_buf[b].append({"ts": float(ts), "type": ev_type, "payload": payload})
 
+            
             # If already in flight, nothing else to do.
             if self._llm_inflight[b]:
                 return
@@ -239,6 +259,11 @@ class BrokerMediationMixin:
                     self._llm_worker_chat(key)
                 elif channel == "REFLECTION":
                     self._llm_worker_reflection(key)
+                elif channel == "MEDIATION_INIT":
+                    self._llm_worker_mediation_init(key)
+                elif channel == "MEDIATION_AUTORESOLVE":
+                    self._llm_worker_mediation_autoresolve(key)
+
             finally:
                 # Mark bucket idle, then if more arrived while running, re-run once.
                 with self._llm_lock:
@@ -1021,28 +1046,35 @@ class BrokerMediationMixin:
             self.get_logger().info("[llm-plan] optimizer returned empty candidate plan; ignoring")
             return
 
-        # 6) Unified evaluation: score + constraints + adopt + suboptimality
-        try:
-            eval_res = evaluate_candidate_plan(
-                current_plan=current_plan,
-                candidate_plan=candidate_plan,
-                agents=agents,
-                boxes=boxes,
-                current_time=current_time,
-                travel_time_fn=travel_time_fn,
-                horizon=horizon,
-                weights=weights,
-                margin=getattr(self, "optimizer_llm_margin", 0.01),
-            )
+        if self._always_accept():
+            # Build session with objective metrics (optional) but do NOT compute `better/adopt`
+            better = True
+            suboptimal_pct = 0.0
+            score_optimal = None
+            score_candidate = None
+        else:
+            # 6) Unified evaluation: score + constraints + adopt + suboptimality
+            try:
+                eval_res = evaluate_candidate_plan(
+                    current_plan=current_plan,
+                    candidate_plan=candidate_plan,
+                    agents=agents,
+                    boxes=boxes,
+                    current_time=current_time,
+                    travel_time_fn=travel_time_fn,
+                    horizon=horizon,
+                    weights=weights,
+                    margin=getattr(self, "optimizer_llm_margin", 0.01),
+                )
 
-        except Exception as e:
-            self.get_logger().warn(f"[llm-plan] plan evaluation failed: {e}")
-            return
+            except Exception as e:
+                self.get_logger().warn(f"[llm-plan] plan evaluation failed: {e}")
+                return
 
-        better = bool(eval_res["adopt"])
-        score_optimal = eval_res["score_current"]
-        score_candidate = eval_res["score_candidate"]
-        suboptimal_pct = eval_res["suboptimal_pct"]
+            better = bool(eval_res["adopt"])
+            score_optimal = eval_res["score_current"]
+            score_candidate = eval_res["score_candidate"]
+            suboptimal_pct = eval_res["suboptimal_pct"]
 
         xy_metrics = compute_xy_imbalance_for_plan(
             plan=candidate_plan,
@@ -1138,6 +1170,13 @@ class BrokerMediationMixin:
             except Exception:
                 continue
 
+        seen_turn_keys = set()
+        for u in recent_utterances:
+            try:
+                seen_turn_keys.add((u.role, u.text.strip()))
+            except Exception:
+                pass
+
 
         interaction = MediationInteractionContext(
             event_summary=self._event_summary_text,
@@ -1158,17 +1197,22 @@ class BrokerMediationMixin:
 
         initial_turns = []
         if isinstance(human_text, str) and human_text.strip():
-            initial_turns.append(
-                MediationTurn(
-                    role=proposer_id,
-                    text=human_text.strip(),
-                    meta={
-                        "ts": ts,
-                        "req_id": req_id,
-                        "source_rule": trace_entry.get("rule"),
-                    },
-                )
+            ht = human_text.strip()
+
+            already_in_recent = any(
+                (t.role == proposer_id and (t.text or "").strip() == ht)
+                for t in (recent_utterances or [])
             )
+
+            if not already_in_recent:
+                initial_turns.append(
+                    MediationTurn(
+                        role=proposer_id,
+                        text=ht,
+                        meta={"ts": ts, "req_id": req_id, "source_rule": trace_entry.get("rule")},
+                    )
+                )
+
 
 
         human_ids = list(self.human_agent_ids)  # ["human_a","human_b"]
@@ -1187,35 +1231,49 @@ class BrokerMediationMixin:
             baseline_provenance=getattr(self, "_last_plan_provenance", None),
 
         )
+        setattr(state, "_seen_turn_keys", seen_turn_keys)
+
+
+        if self._always_accept():
+            # Detect whether this always-accept request overrides a recent one
+            new_robot_action = self._first_robot_action(candidate_plan)
+            override_info = self._detect_always_accept_override(
+                proposer_id=proposer_id,
+                ts=float(ts),
+                new_robot_action=new_robot_action,
+            )
+            setattr(state, "_always_accept_override_info", override_info)
+            setattr(state, "_always_accept_proposer_id", proposer_id)
+
+            # raw robot_utterance is not trusted later; finalize() will compose the final utterance
+            raw = {
+                "decision": "accept",
+                "planner_action": {"kind": "adopt_candidate", "notes": "forced by always_accept policy"},
+                "robot_utterance": "",  # will be composed from committed plan in finalize
+                "log_tags": {"strategy": "always_accept", "rationale": "policy"},
+            }
+
 
 
         self._mediation_sessions[session_id] = state
         self._active_mediation_id = session_id
 
-        # 7) Optionally do a first mediation step (robot explains / asks questions)
+        # 7) Kick off first mediation step ASYNC (never block ROS thread)
         if not self.sim_mode:
             self._robot_say("Let me think.")
-        state, raw = self._plan_mediator.step(state)
+
+        # Important: store initial state + mark active BEFORE enqueueing
         self._mediation_sessions[session_id] = state
+        self._active_mediation_id = session_id
 
-        # --- NEW: if mediation is now pending, block llm_speech_plan in EventLayer ---
-        if state.status == "pending":
-            self._publish_mediation_status(session_id, "pending")
-            self._start_pending_deadlines(ts)
-
-        robot_utt = (raw.get("robot_utterance") or "").strip()
-        if robot_utt:
-            self.get_logger().info(f"[mediation] Bob says: {robot_utt}")
-            self._robot_say(robot_utt)
-
-        # If the mediator already reached a decision in this first step, finalize now.
-        if state.status in ("accept", "reject"):
-            self._finalize_mediation_session(
-                session_id=session_id,
-                session=state,
-                raw_decision=raw,
-                ts=ts,
-            )
+        # Run initial mediator.step() via buffering system
+        self._llm_submit(
+            channel="MEDIATION_INIT",
+            key=session_id,
+            ev_type="init",
+            payload={"ts": float(ts)},
+            ts=float(ts),
+        )
 
         # 8) Log plan proposal for objective planning stats (no adoption yet: humans decide)
         try:
@@ -1243,6 +1301,133 @@ class BrokerMediationMixin:
             self.conn.commit()
         except Exception as e:
             self.get_logger().warn(f"[llm-plan] failed to log plan_proposal: {e}")
+
+    def _format_accept_utterance_for_plan(self, plan: Plan, proposer_id: str) -> str:
+        """
+        Produce a short acceptance utterance grounded in the robot's first action.
+        """
+        robot_actions = (plan or {}).get("robot") or []
+        target = self._to_display_text(proposer_id)
+        
+        if robot_actions:
+            try:
+                box_id, prop, kind = robot_actions[0]
+                return f"Hey {target}, I accept your plan to {kind} box {box_id} ({prop})."
+            except Exception:
+                pass
+        return "I accept your plan."
+
+    def _first_robot_action(self, plan: Plan) -> Optional[Tuple[int, str, str]]:
+        """
+        Returns (box_id, prop, kind) for robot's first action, or None.
+        """
+        try:
+            ra = (plan or {}).get("robot") or []
+            if not ra:
+                return None
+            box_id, prop, kind = ra[0]
+            return (int(box_id), str(prop), str(kind))
+        except Exception:
+            return None
+
+    def _detect_always_accept_override(
+        self,
+        proposer_id: str,
+        ts: float,
+        new_robot_action: Optional[Tuple[int, str, str]],
+    ) -> Optional[dict]:
+        """
+        If the new always-accept request overrides a recent prior always-accept request
+        from a different human, return info about the overridden request.
+        """
+        prev = getattr(self, "_last_always_accept_commit", None)
+        if not prev or not new_robot_action:
+            return None
+
+        prev_ts = float(prev.get("ts") or 0.0)
+        if ts - prev_ts > float(getattr(self, "always_accept_override_window_sec", 25.0)):
+            return None
+
+        prev_proposer = (prev.get("proposer_id") or "unknown")
+        if prev_proposer == proposer_id:
+            return None
+
+        prev_action = prev.get("robot_action")
+        if not prev_action:
+            return None
+
+        # If action is identical, it's not really an override.
+        if tuple(prev_action) == tuple(new_robot_action):
+            return None
+
+        # Only treat real humans as override targets (optional but usually desired)
+        if not (isinstance(prev_proposer, str) and prev_proposer.startswith("human_")):
+            return None
+        if not (isinstance(proposer_id, str) and proposer_id.startswith("human_")):
+            return None
+
+        return {
+            "prev_proposer_id": prev_proposer,
+            "prev_robot_action": tuple(prev_action),
+            "prev_ts": prev_ts,
+        }
+
+    def _compose_always_accept_utterance(
+        self,
+        committed_plan: Plan,
+        dropped: List[dict],
+        proposer_id: str,
+        override_info: Optional[dict],
+    ) -> str:
+        """
+        Always-accept speech:
+          - If override happened: tell the previous human we won't do their action anymore.
+          - Confirm to the new proposer what we *will* do (grounded in first robot action).
+          - Preserve your dropped-action explanation if relevant.
+        """
+        drop_note = self._summarize_dropped_actions_for_humans(dropped)
+        new_act = self._first_robot_action(committed_plan)
+
+        # Build the "switch" sentence if override
+        switch_sentence = None
+        if override_info:
+            prev_id = override_info.get("prev_proposer_id") or "unknown"
+            prev_name = self._to_display_text(prev_id)
+            new_name = self._to_display_text(proposer_id)
+
+            try:
+                (p_box, p_prop, p_kind) = override_info.get("prev_robot_action")
+                switch_sentence = (
+                    f"Hey {prev_name}, I'm switching to {new_name}'s request, "
+                    f"so I won't {p_kind} box {p_box} ({p_prop}) anymore."
+                )
+            except Exception:
+                switch_sentence = (
+                    f"Hey {prev_name}, I'm switching to {new_name}'s request, "
+                    f"so I won't follow your last request anymore."
+                )
+
+        # Build the "accept + action" sentence
+        new_name = self._to_display_text(proposer_id)
+        if new_act:
+            (box_id, prop, kind) = new_act
+            accept_sentence = f"Hey {new_name}, I accept—I'll {kind} box {box_id} ({prop}) now."
+        else:
+            accept_sentence = f"Hey {new_name}, I accept your plan."
+
+        parts = []
+        if switch_sentence:
+            parts.append(switch_sentence)
+
+        # If we dropped something, include it but keep it short
+        if drop_note:
+            parts.append(drop_note)
+
+        parts.append(accept_sentence)
+
+        # Keep to ~1–3 short sentences
+        return " ".join([p.strip() for p in parts if p and p.strip()])
+
 
     # ---------- Finalize mediation session ----------
 
@@ -1283,10 +1468,17 @@ class BrokerMediationMixin:
 
             # Decide the intended plan BEFORE filtering
             intended_plan: Plan
-            if kind in ("adopt_candidate", "merge_plans"):
+            
+            if self._always_accept():
+                # Always adopt the candidate we computed from the human prefix
                 intended_plan = candidate_plan
+                kind = "adopt_candidate"  # for logs/consistency
             else:
-                intended_plan = baseline_plan
+            
+                if kind in ("adopt_candidate", "merge_plans"):
+                    intended_plan = candidate_plan
+                else:
+                    intended_plan = baseline_plan
 
             # Feasibility filtering:
             # - If we’re keeping baseline, we can still filter baseline (optional), but usually baseline should already be feasible.
@@ -1348,14 +1540,45 @@ class BrokerMediationMixin:
                 else:
                     self.get_logger().warn(f"[mediation] dropped infeasible actions: {dropped}")
 
-            # Speak: force consistency with committed plan (do NOT trust raw mediator utterance after filtering)
-            final_utt = self._compose_committed_plan_utterance(
-                committed_plan=committed_plan,
-                dropped=dropped,
-                fallback=(raw_decision.get("robot_utterance") or "Okay."),
-            )
-            if final_utt and not self.sim_mode:
+            # Speak: always_accept gets a special "override-aware" acceptance message.
+            if self._always_accept() or ((raw_decision.get("log_tags") or {}).get("strategy") == "always_accept"):
+                proposer_id = getattr(session, "_always_accept_proposer_id", None) or (
+                    (getattr(session, "social", None) and session.social.proposer_id) or "unknown"
+                )
+                override_info = getattr(session, "_always_accept_override_info", None)
+
+                final_utt = self._compose_always_accept_utterance(
+                    committed_plan=committed_plan,
+                    dropped=dropped,
+                    proposer_id=proposer_id,
+                    override_info=override_info,
+                )
+            else:
+                final_utt = self._compose_committed_plan_utterance(
+                    committed_plan=committed_plan,
+                    dropped=dropped,
+                    fallback=(raw_decision.get("robot_utterance") or "Okay."),
+                )
+
+            if (final_utt and not self.sim_mode) or (self.sim_mode and final_utt and self._always_accept()):
                 self._robot_say(final_utt)
+
+            # Update override-tracking memory after committing (only if we actually have a robot action)
+            try:
+                act = self._first_robot_action(committed_plan)
+                if act:
+                    proposer_for_mem = (
+                        getattr(session, "_always_accept_proposer_id", None)
+                        or ((getattr(session, "social", None) and session.social.proposer_id) or "unknown")
+                    )
+                    self._last_always_accept_commit = {
+                        "ts": float(ts),
+                        "proposer_id": str(proposer_for_mem),
+                        "robot_action": tuple(act),
+                    }
+            except Exception:
+                pass
+
 
             self.get_logger().info(
                 f"[mediation] finalized session {session_id} with planner_action={kind} "
@@ -1756,6 +1979,92 @@ class BrokerMediationMixin:
 
     # ---------- Speech routing into an active mediation ----------
 
+    def _llm_worker_mediation_init(self, session_id: str):
+        """
+        Run the FIRST PlanMediator.step() for a newly created session in a worker thread.
+        This prevents ROS callbacks from blocking on slow/hung LLM calls.
+
+        Expected buffered events:
+          - type="init" payload may contain {"ts": float}
+        """
+        b = self._llm_bucket("MEDIATION_INIT", session_id)
+
+        # Drain events
+        with self._llm_lock:
+            events = list(self._llm_buf[b])
+            self._llm_buf[b].clear()
+
+        if not events:
+            return
+
+        # Defensive: session may have been cancelled/cleared
+        sid = getattr(self, "_active_mediation_id", None)
+        sess = self._mediation_sessions.get(session_id)
+        if sid != session_id or not sess:
+            return
+
+        # If someone already advanced it, don't init again
+        if getattr(sess, "turns_used", 0) not in (None, 0):
+            return
+        if getattr(sess, "status", None) in ("accept", "reject", "cancelled"):
+            return
+
+        # Use most recent ts if provided
+        last_ts = None
+        for ev in events:
+            last_ts = ev.get("ts") or last_ts
+        ts = float(last_ts or time.time())
+
+        # Run the first mediation step (ONE LLM call)
+        try:
+            if not self.sim_mode:
+                # optional: already said "Let me think." in callback, so this can be omitted
+                pass
+
+            self.get_logger().info(
+                f"[chat]  {sess.turns} {sess.interaction.recent_utterances}"
+            )
+            sess2, raw = self._plan_mediator.step(sess)
+        except Exception as e:
+            self.get_logger().warn(f"[mediation] init step failed: {e}")
+
+            # Fail closed: keep baseline, unblock EventLayer
+            raw = {
+                "decision": "reject",
+                "planner_action": {"kind": "keep_baseline", "notes": f"init step failed: {e}"},
+                "robot_utterance": "Something went wrong while thinking—I'll keep the current plan for now.",
+                "log_tags": {"strategy": "init_error_fallback", "rationale": "LLM/step failed"},
+            }
+            raw = self._normalize_mediation_decision(raw)
+            sess.status = "reject"
+            self._mediation_sessions[session_id] = sess
+            self._finalize_mediation_session(session_id=session_id, session=sess, raw_decision=raw, ts=ts)
+            return
+
+        # Save updated session
+        self._mediation_sessions[session_id] = sess2
+
+        # If pending, publish pending and start deadlines (this is what used to happen inline)
+        if sess2.status == "pending":
+            self._publish_mediation_status(session_id, "pending")
+            self._start_pending_deadlines(ts)
+
+        # Speak any robot utterance
+        robot_utt = (raw.get("robot_utterance") or "").strip()
+        if robot_utt:
+            self.get_logger().info(f"[mediation] Bob says: {robot_utt}")
+            self._robot_say(robot_utt)
+
+        # If terminal immediately, finalize
+        if sess2.status in ("accept", "reject"):
+            self._finalize_mediation_session(
+                session_id=session_id,
+                session=sess2,
+                raw_decision=raw,
+                ts=ts,
+            )
+
+
     def _llm_worker_mediation(self, session_id: str):
         """
         Drain buffered mediation turns for this session_id and do ONE mediator.step().
@@ -1798,6 +2107,8 @@ class BrokerMediationMixin:
         except Exception:
             pass
 
+
+
         # Coalesce: append all but last directly into session history
         for t in turns[:-1]:
             try:
@@ -1805,6 +2116,10 @@ class BrokerMediationMixin:
                 sess.interaction.recent_utterances.append(t)
             except Exception:
                 pass
+
+        self.get_logger().info(
+            f"[chat]  {turns}, {sess.turns}"
+        )
 
         # One mediator step with the last turn (ONE LLM call)
         try:
@@ -1820,13 +2135,20 @@ class BrokerMediationMixin:
             self.get_logger().warn(
                 f"[mediation] max turns reached ({turns_used}); auto-resolving session {session_id}"
             )
-            self._auto_resolve_pending_session(session_id, sess, reason="max_turns", now_ts=now_ts)
+            self._llm_submit(
+                channel="MEDIATION_AUTORESOLVE",
+                key=sid,
+                ev_type="autoresolve",
+                payload={"reason": "turn_timeout", "now_ts": float(now_ts)},
+                ts=float(now_ts),
+            )
             return
+
 
         self._mediation_sessions[session_id] = sess
 
         robot_utt = (raw.get("robot_utterance") or "").strip()
-        if robot_utt and not self.sim_mode:
+        if robot_utt:
             self._robot_say(robot_utt)
 
         if sess.status in ("accept", "reject"):
@@ -1895,6 +2217,17 @@ class BrokerMediationMixin:
         if not sid or not sess:
             return False
 
+        dedup_key = (speaker_id, text.strip())
+        seen = getattr(sess, "_seen_turn_keys", None)
+        if seen is None:
+            seen = set()
+            setattr(sess, "_seen_turn_keys", seen)
+        if dedup_key in seen:
+            return True
+        seen.add(dedup_key)
+
+        self._mediation_sessions[sid] = sess  # persist mutation if you want
+
         human_turn = MediationTurn(
             role=speaker_id,
             text=text,
@@ -1917,6 +2250,79 @@ class BrokerMediationMixin:
         )
 
         return True
+
+    def _llm_worker_mediation_autoresolve(self, session_id: str):
+        """
+        Async autoresolve: do the LLM call in the background bucket worker,
+        then finalize. Never blocks watchdog / ROS callbacks.
+        """
+        b = self._llm_bucket("MEDIATION_AUTORESOLVE", session_id)
+
+        with self._llm_lock:
+            events = list(self._llm_buf[b])
+            self._llm_buf[b].clear()
+
+        if not events:
+            return
+
+        # Use the most recent autoresolve request
+        last = events[-1]
+        payload = last.get("payload") or {}
+        reason = (payload.get("reason") or "unknown")
+        now_ts = float(payload.get("now_ts") or last.get("ts") or time.time())
+
+        # Defensive: only act if still pending and active
+        sid = getattr(self, "_active_mediation_id", None)
+        sess = self._mediation_sessions.get(session_id)
+        if sid != session_id or not sess or sess.status != "pending":
+            return
+
+        # NOTE: prevent duplicate autoresolves racing
+        if getattr(sess, "_autoresolving", False):
+            return
+        setattr(sess, "_autoresolving", True)
+        self._mediation_sessions[session_id] = sess
+
+        try:
+            # Option A (simplest): don't change PlanMediator at all.
+            # Reuse the last normal step prompt if you have it, otherwise just call your existing method.
+            # If you DON'T have build_messages_for_autoresolve, you can just do keep_baseline fallback here.
+            try:
+                messages = self._plan_mediator.build_messages_for_autoresolve(sess, reason=reason)
+                raw = self._mediate_llm_call(messages)
+            except Exception as e:
+                self.get_logger().warn(f"[mediation] autoresolve LLM failed: {e}; falling back to keep_baseline")
+                raw = {
+                    "decision": "reject",
+                    "planner_action": {"kind": "keep_baseline", "notes": f"autoresolve fallback: {e}"},
+                    "robot_utterance": "No response in time—I'll keep the current plan for now.",
+                    "log_tags": {"strategy": "timeout_fallback", "rationale": "LLM autoresolve failed"},
+                }
+
+            raw = self._normalize_mediation_decision(raw)
+
+            # Force terminal
+            if (raw.get("decision") or "").strip() == "pending":
+                raw["decision"] = "reject"
+                raw["planner_action"] = {"kind": "keep_baseline", "notes": "autoresolve forced non-pending"}
+                raw["robot_utterance"] = "No response in time—I'll keep the current plan for now."
+                raw["log_tags"] = {"strategy": "timeout_forced", "rationale": "autoresolve must finalize"}
+
+            sess.status = "accept" if raw.get("decision") == "accept" else "reject"
+            self._mediation_sessions[session_id] = sess
+
+            # IMPORTANT: don't speak here if finalize() already composes a forced utterance
+            self._finalize_mediation_session(session_id=session_id, session=sess, raw_decision=raw, ts=now_ts)
+
+        finally:
+            # clear flag if session still exists
+            s2 = self._mediation_sessions.get(session_id)
+            if s2:
+                try:
+                    setattr(s2, "_autoresolving", False)
+                except Exception:
+                    pass
+
 
     def _llm_worker_reflection(self, reflection_key: str):
         """
@@ -1969,8 +2375,19 @@ class BrokerMediationMixin:
             self.get_logger().warn(
                 f"[mediation] turn timeout hit (no utterance); auto-resolving {sid}"
             )
-            self._auto_resolve_pending_session(sid, sess, reason="turn_timeout", now_ts=now_ts)
+            # NEW (enqueue bucketed autoresolve; single-flight + coalesced)
+            self.get_logger().warn(
+                f"[mediation] turn timeout hit (no utterance); enqueue autoresolve {sid}"
+            )
+            self._llm_submit(
+                channel="MEDIATION_AUTORESOLVE",
+                key=sid,
+                ev_type="autoresolve",
+                payload={"reason": "turn_timeout", "now_ts": float(now_ts)},
+                ts=float(now_ts),
+            )
             return
+
 
 
    

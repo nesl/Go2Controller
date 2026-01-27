@@ -635,6 +635,9 @@ class PlanMediator:
                 "- Never speak as if suggested tasks are already agreed; use wording like "
                 "\"If you agree, one option is…\".\n"
                 "- If notes indicate impossible actions (expired, already fulfilled), explicitly mention them.\n"
+                "- Mediation is always grounded in concrete actions.\n"
+                "- In robot_utterance, you MUST explicitly mention at least one concrete task from the proposed plan (agent, box_id, property, kind).\n"
+                "- Avoid abstract phrases like 'some optimizer suggestions' or 'improving coverage' unless tied to specific actions.\n"
                 f"{negotiation_suffix}"
             ),
         }
