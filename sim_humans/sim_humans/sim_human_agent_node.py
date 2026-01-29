@@ -917,7 +917,28 @@ class SimHumanAgent(Node):
         self.declare_parameter("llm_jitter_min_sec", 1.0)
         self.declare_parameter("llm_jitter_max_sec", 2.0)
 
+        # ---------------------------
+        # Speech simulation (delay before publishing utterances)
+        # ---------------------------
+        self.declare_parameter("speech_sim_enable", True)
+        self.declare_parameter("speech_rate_wpm", 150.0)          # typical conversational ~130-170 wpm
+        self.declare_parameter("speech_min_delay_sec", 0.15)      # minimum "start speaking" delay
+        self.declare_parameter("speech_max_delay_sec", 6.0)       # cap so long messages don't stall forever
+        self.declare_parameter("speech_punct_pause_sec", 0.06)    # extra pause per punctuation mark
+        self.declare_parameter("speech_queue_max", 30)            # prevent unbounded queue growth
+
+
         self.declare_parameter("waiting_mode", "strict")  # strict | soft
+        
+        
+        self.speech_sim_enable = bool(self.get_parameter("speech_sim_enable").value)
+        self.speech_rate_wpm = float(self.get_parameter("speech_rate_wpm").value)
+        self.speech_min_delay_sec = float(self.get_parameter("speech_min_delay_sec").value)
+        self.speech_max_delay_sec = float(self.get_parameter("speech_max_delay_sec").value)
+        self.speech_punct_pause_sec = float(self.get_parameter("speech_punct_pause_sec").value)
+        self.speech_queue_max = int(self.get_parameter("speech_queue_max").value)
+
+        
         self.waiting_mode = str(self.get_parameter("waiting_mode").value).lower()
 
 
@@ -989,6 +1010,21 @@ class SimHumanAgent(Node):
         # ---- ROS pub/sub ----
         self.pub_stt = self.create_publisher(StringMsg, self.stt_topic, 10)
         self.sub_stt = self.create_subscription(StringMsg, self.stt_topic, self._on_stt_text, 10)
+
+
+        self._speech_busy_lock = threading.Lock()
+        self._speech_busy = False
+
+        # ---------------------------
+        # Speech worker (non-blocking "talk time" simulation)
+        # ---------------------------
+        self._speech_lock = threading.Lock()
+        self._speech_cv = threading.Condition(self._speech_lock)
+        self._speech_queue = deque()  # items: {"text": str, "target_speaker": Optional[str], "t_enq": float}
+        self._speech_stop_evt = threading.Event()
+        self._speech_thread = threading.Thread(target=self._speech_worker_main, daemon=True)
+        self._speech_thread.start()
+
 
         # ---- internal state ----
         self.pose = Pose2D(0.0, 0.0)
@@ -1183,7 +1219,7 @@ class SimHumanAgent(Node):
     def _dbg_llm(self, tag: str, txt: str, max_chars: int = 4000) -> None:
         # keep logs readable
         s = txt if len(txt) <= max_chars else (txt[:max_chars] + f"...[trunc {len(txt)-max_chars} chars]")
-        #self._log("LLM_PROMPT", f"{tag}={s}")
+        self._log("LLM_PROMPT", f"{tag}={s}")
 
 
     def _commitments(self) -> List[Dict[str, Any]]:
@@ -1264,7 +1300,8 @@ class SimHumanAgent(Node):
         self._expire_old_commitments(now_sim)
 
         candidates = []
-        busy = self._is_busy()
+        busy = self._is_busy() or self._is_speaking()
+
 
         for c in self._commitments():
             if c.get("status") != "active":
@@ -1832,26 +1869,196 @@ class SimHumanAgent(Node):
 
         self._log("HEAR", f"from={speaker} text={text!r}")
 
+    def _set_speech_busy(self, v: bool) -> None:
+        with self._speech_busy_lock:
+            self._speech_busy = bool(v)
+
+    def _is_speaking(self) -> bool:
+        with self._speech_busy_lock:
+            return bool(self._speech_busy)
 
 
     def _publish_utterance(self, text: str, target_speaker: Optional[str] = None) -> None:
-        out = StringMsg()
-        
-        prefix = ""
-        if target_speaker and target_speaker not in ("all", ""):
-            prefix = self._display_name(target_speaker)
-        
-        text = ("Hey " + prefix + ", " + text) if prefix and not prefix in text else text
-        
-        payload = {"text": text, "speaker_id": self.agent_id}
-        if target_speaker:
-            payload["target_speaker"] = target_speaker
-        out.data = json.dumps(payload)
-        self.pub_stt.publish(out)
-        self._log("SAY", text)
+        """
+        Blocking utterance: do not return until the speech worker has finished
+        "speaking" and the message has been published.
+        """
+        # If we're somehow calling from the speech thread itself, don't deadlock.
+        if getattr(self, "_speech_thread", None) is not None and threading.current_thread() is self._speech_thread:
+            # publish immediately (no simulated delay here)
+            out = StringMsg()
+
+            prefix = ""
+            if target_speaker and target_speaker not in ("all", ""):
+                prefix = self._display_name(str(target_speaker))
+
+            final_text = text.strip() if isinstance(text, str) else ""
+            if not final_text:
+                return
+
+            if prefix and (prefix not in final_text):
+                final_text = "Hey " + prefix + ", " + final_text
+
+            payload = {"text": final_text, "speaker_id": self.agent_id}
+            if target_speaker:
+                payload["target_speaker"] = str(target_speaker)
+
+            out.data = json.dumps(payload)
+            self.pub_stt.publish(out)
+            self._log("SAY", final_text)
+            return
+
+        # Normal path: block until done
+        self._speak_and_wait(text, target_speaker=target_speaker)
 
 
 
+
+    def _enqueue_utterance(self, text: str, target_speaker: Optional[str], *, done_evt: Optional[threading.Event] = None) -> None:
+        if not isinstance(text, str):
+            if done_evt:
+                done_evt.set()
+            return
+        text = text.strip()
+        if not text:
+            if done_evt:
+                done_evt.set()
+            return
+
+        with self._speech_cv:
+            if len(self._speech_queue) >= int(self.speech_queue_max):
+                # drop oldest; also unblock whoever was waiting on it
+                dropped = self._speech_queue.popleft()
+                ev = dropped.get("done_evt")
+                if isinstance(ev, threading.Event):
+                    ev.set()
+
+            self._speech_queue.append({
+                "text": text,
+                "target_speaker": target_speaker,
+                "t_enq": time.time(),
+                "done_evt": done_evt,  # ✅ let caller wait until finished
+            })
+            self._speech_cv.notify()
+
+    def _speak_and_wait(self, text: str, target_speaker: Optional[str] = None, *, timeout: Optional[float] = None) -> None:
+        """
+        Block until the utterance has been 'spoken' and published.
+        Safe to call from action loop OR router loop.
+        """
+        ev = threading.Event()
+        self._enqueue_utterance(text, target_speaker, done_evt=ev)
+
+        # Guardrail timeout to avoid deadlock if something breaks.
+        if timeout is None:
+            timeout = max(5.0, float(self.speech_max_delay_sec) + 5.0)
+
+        ev.wait(timeout=timeout)
+
+
+
+    def _speech_worker_main(self) -> None:
+        """
+        Dedicated worker thread:
+          - pops queued utterances
+          - waits proportional to message length (simulated speaking)
+          - publishes to STT topic
+        """
+        while not self._speech_stop_evt.is_set():
+            item = None
+            with self._speech_cv:
+                while not self._speech_queue and not self._speech_stop_evt.is_set():
+                    self._speech_cv.wait(timeout=0.2)
+                if self._speech_stop_evt.is_set():
+                    break
+                try:
+                    item = self._speech_queue.popleft()
+                except Exception:
+                    item = None
+
+            if not item:
+                continue
+
+            done_evt = item.get("done_evt", None)
+            if done_evt is not None and not isinstance(done_evt, threading.Event):
+                done_evt = None
+            # ✅ mark speaking busy for the duration of this utterance
+            self._set_speech_busy(True)
+
+
+            text = str(item.get("text", ""))
+            target_speaker = item.get("target_speaker", None)
+            if target_speaker is not None:
+                target_speaker = str(target_speaker)
+
+            # Simulated speaking time (skip if disabled)
+            if self.speech_sim_enable:
+                dt = self._estimate_speech_delay_sec(text)
+
+                # sleep in small increments so shutdown is responsive
+                end = time.time() + dt
+                while time.time() < end:
+                    if self._speech_stop_evt.is_set() or self._stop:
+                        break
+                    time.sleep(0.05)
+
+                if self._speech_stop_evt.is_set() or self._stop:
+                    self._set_speech_busy(False)
+                    if isinstance(done_evt, threading.Event):
+                        done_evt.set()
+                    continue
+
+
+            # Build final outgoing text (your existing "Hey <name>" behavior)
+            out = StringMsg()
+
+            prefix = ""
+            if target_speaker and target_speaker not in ("all", ""):
+                prefix = self._display_name(target_speaker)
+
+            final_text = text
+            if prefix and (prefix not in final_text):
+                final_text = "Hey " + prefix + ", " + final_text
+
+            payload = {"text": final_text, "speaker_id": self.agent_id}
+            if target_speaker:
+                payload["target_speaker"] = target_speaker
+
+            out.data = json.dumps(payload)
+
+            # Publish (this is the actual "message send" moment)
+            self.pub_stt.publish(out)
+            self._log("SAY", final_text)
+            self._set_speech_busy(False)
+            if isinstance(done_evt, threading.Event):
+                done_evt.set()
+
+            
+    def _estimate_speech_delay_sec(self, text: str) -> float:
+        """
+        Estimate speaking duration from text length.
+        - Base is words / WPM
+        - Add small pauses for punctuation
+        - Clamp to [min, max]
+        """
+        if not text:
+            return 0.0
+
+        # word count (simple + robust)
+        words = re.findall(r"\b\w+\b", text)
+        n_words = max(1, len(words))
+
+        wpm = max(60.0, float(self.speech_rate_wpm))  # guardrail
+        sec_words = (n_words / wpm) * 60.0
+
+        # punctuation micro-pauses
+        punct = re.findall(r"[,.!?;:]", text)
+        sec_punct = float(len(punct)) * float(self.speech_punct_pause_sec)
+
+        dt = sec_words + sec_punct
+        dt = max(float(self.speech_min_delay_sec), dt)
+        dt = min(float(self.speech_max_delay_sec), dt)
+        return float(dt)
 
     # ---------------------------
     # Server HTTP helpers
@@ -2062,7 +2269,8 @@ class SimHumanAgent(Node):
                     if not action.target_speaker:
                         action.target_speaker = "all"
 
-                self._publish_utterance(action.text, target_speaker=action.target_speaker)
+                # ✅ block until speaking finished
+                self._speak_and_wait(action.text, target_speaker=action.target_speaker)
             return
 
         if action.kind == "ask_help":
@@ -2093,8 +2301,10 @@ class SimHumanAgent(Node):
 
 
             if action.text:
-                self._publish_utterance(action.text, target_speaker=action.target_speaker)
+                # ✅ block until speaking finished
+                self._speak_and_wait(action.text, target_speaker=action.target_speaker)
             return
+
 
 
         if action.box_id is None or action.box_id not in box_lookup:

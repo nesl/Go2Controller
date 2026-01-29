@@ -470,6 +470,78 @@ def _cond_pass(cond: dict, rules: RulesView, defaults_window_ms: int, empty_mean
     return empty_means
 
 
+def canonical_box_action_from_execute(engine: "SkillEngineV2", root_skill_name: str, root_ctx: dict) -> dict | None:
+    """
+    Extract canonical box op from a state_machine skill that was requested via /skills/execute.
+    Returns:
+      {"kind":"sense"|"dispose", "node_id":"CNode102", "property":"X"|"Y"}
+    or None.
+    """
+    root_def = engine.registry.get(root_skill_name)
+    if not isinstance(root_def, dict) or root_def.get("kind") != "state_machine":
+        return None
+
+    states = root_def.get("states") or []
+    if not isinstance(states, list):
+        return None
+
+    for st in states:
+        if not isinstance(st, dict) or st.get("type") != "action":
+            continue
+        action = st.get("action") or {}
+        if not isinstance(action, dict):
+            continue
+
+        use = str(action.get("use") or "").strip()
+        with_params = action.get("with") or {}
+        if not isinstance(with_params, dict):
+            with_params = {}
+
+        # Only check these wrapper/primitive skills
+        if use not in ("box.sense_nearby", "box.dispose_nearby", "box.sense", "box.dispose"):
+            continue
+
+        # Step ctx = root ctx + rendered "with"
+        step_ctx = dict(root_ctx or {})
+        rendered_with = _render_params(with_params, step_ctx, engine.rules, engine.defaults_window_ms)
+        step_ctx.update(rendered_with)
+
+        if use == "box.sense_nearby":
+            node_id = str(step_ctx.get("target_node_id") or "").strip()
+            prop = str(step_ctx.get("property") or "X").strip().upper()
+            return {"kind": "sense", "node_id": node_id, "property": prop}
+
+        if use == "box.dispose_nearby":
+            node_id = str(step_ctx.get("target_node_id") or "").strip()
+            prop = str(step_ctx.get("property") or "X").strip().upper()
+            return {"kind": "dispose", "node_id": node_id, "property": prop}
+
+        if use == "box.sense":
+            node_id = str(step_ctx.get("node_id") or "").strip()
+            prop = str(step_ctx.get("property") or "X").strip().upper()
+            return {"kind": "sense", "node_id": node_id, "property": prop}
+
+        if use == "box.dispose":
+            node_id = str(step_ctx.get("node_id") or "").strip()
+            prop = str(step_ctx.get("property") or "X").strip().upper()
+            return {"kind": "dispose", "node_id": node_id, "property": prop}
+
+    return None
+
+
+def same_canonical_box_action(a: dict | None, b: dict | None) -> bool:
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    if a.get("kind") not in ("sense", "dispose"):
+        return False
+    return (
+        a.get("kind") == b.get("kind")
+        and str(a.get("node_id") or "").strip() == str(b.get("node_id") or "").strip()
+        and str(a.get("property") or "").strip().upper() == str(b.get("property") or "").strip().upper()
+    )
+
+
+
 # ───────────────────────────────────────────────────────────────────────────────
 #                                  SkillEngineV2
 # ───────────────────────────────────────────────────────────────────────────────

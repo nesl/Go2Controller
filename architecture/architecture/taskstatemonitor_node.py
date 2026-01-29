@@ -227,6 +227,14 @@ class BrokerNode(Node, BrokerMediationMixin):
 
         # Last plan and “fingerprint” of box server state
         self._last_plan = None
+        
+        # Optimizer output (suggestion / baseline)
+        self._last_optimizer_plan: Optional[Plan] = None
+
+        # Plan that the team is actually committed to (ONLY set on mediation accept)
+        self._committed_plan: Plan = {}
+        self._has_committed_plan: bool = False
+
         self._last_boxes_fp = None
         self._optimizer_running = False
 
@@ -864,6 +872,9 @@ class BrokerNode(Node, BrokerMediationMixin):
         ts   = float(o.get("ts") or time.time())
         zone = o.get("zone")  # NEW: top-level zone from EventLayer
         
+        if rule == "speech_final_any":
+            return
+        
         # --- NEW: track nested current action using skill events ---
         try:
             self._update_action_stack_from_skill_event(rule, data, ts)
@@ -932,6 +943,7 @@ class BrokerNode(Node, BrokerMediationMixin):
 
         try:
             if self._maybe_route_speech_to_mediation(rule, trace_entry):
+                self.get_logger().info("returned route speech mediation")
                 return
         except Exception as e:
             self.get_logger().warn(f"[mediation] routing speech turn failed: {e}")
@@ -1066,21 +1078,47 @@ class BrokerNode(Node, BrokerMediationMixin):
         data: dict,
         default_ts: float,
     ):
-        if not rule.startswith("speech_final_any"):
+        # We log chat turns from:
+        #  - speech_final_any: literal recognized human text (preferred)
+        #  - speech_intent_inferred: classifier output; use embedded request.text, not data.text JSON blob
+        if rule not in ("speech_final_any", "speech_intent_inferred"):
             return
 
-        text = (data.get("text") or "").strip()
-        if not text:
-            text = (data.get("utterance") or "").strip()
-
-        if not text:
+        if not isinstance(data, dict):
             return
-
-        speaker_id_raw = data.get("speaker_id") or "unknown"
-        speaker_id = (speaker_id_raw or "unknown").strip()
-
 
         ts = float(data.get("ts") or default_ts or time.time())
+
+        speaker_id = None
+        text = ""
+
+        if rule == "speech_final_any":
+            # Expected shape (based on your logs):
+            # data: {"text": "...", "speaker_id": "human_a", ...}
+            speaker_id = (data.get("speaker_id") or "").strip() or None
+            text = (data.get("text") or "").strip()
+
+        else:
+            # speech_intent_inferred:
+            # data["text"] is a JSON string of the inferred plan → DO NOT log that.
+            req = data.get("request") if isinstance(data.get("request"), dict) else {}
+            speaker_id = (req.get("speaker_id") or "").strip() or None
+            text = (req.get("text") or "").strip()
+
+            # Fallback: if request.text missing, try natural_summary (still not the JSON blob)
+            if not text:
+                try:
+                    raw = data.get("text")
+                    if isinstance(raw, str) and raw.strip().startswith("{"):
+                        parsed = json.loads(raw)
+                        text = (parsed.get("natural_summary") or "").strip()
+                except Exception:
+                    pass
+
+        if not text:
+            return
+
+        speaker_id = (speaker_id or "unknown").strip()
 
         # 1) Log in global chat history (mixin)
         self._append_chat_turn(speaker_id, text, ts)
@@ -1976,30 +2014,22 @@ class BrokerNode(Node, BrokerMediationMixin):
             ts=float(ts),
         )
 
-    def _llm_worker_chat(self, chat_key: str):
+    def _process_chat_events(self, chat_key: str, events: List[dict]):
         """
-        Drain buffered chat utterances for this speaker key and make ONE LLM call.
+        Process drained CHAT events for this key and make ONE LLM call.
 
-        Coalescing policy:
-          - If multiple utterances arrived, merge them into one "utterance" string.
-          - Use the most recent plan_json (last event wins).
-          - speaker_id: last event wins (but we keep all text in merged utterance).
+        Coalescing policy (same as your old _llm_worker_chat):
+          - merge all utterances into one block
+          - last plan_json wins
+          - last speaker_id wins (but merged text includes all speaker lines)
         """
         # Gate chat while mediation is pending (double safety)
         if self._mediation_in_progress():
             return
 
-        b = self._llm_bucket("CHAT", chat_key)
-
-        # Drain
-        with self._llm_lock:
-            events = list(self._llm_buf[b])
-            self._llm_buf[b].clear()
-
         if not events:
             return
 
-        # Build one combined utterance
         merged_lines = []
         last_ts = None
         last_plan_json = None
@@ -2024,7 +2054,6 @@ class BrokerNode(Node, BrokerMediationMixin):
         merged_utterance = "\n".join(merged_lines)
         ts = float(last_ts or time.time())
 
-        # IMPORTANT: one LLM call (your original chat logic)
         try:
             self._maybe_chat_reply_to_utterance_impl(
                 utterance=merged_utterance,
@@ -2033,7 +2062,7 @@ class BrokerNode(Node, BrokerMediationMixin):
                 ts=ts,
             )
         except Exception as e:
-            self.get_logger().warn(f"[chat] buffered chat worker failed: {e}")
+            self.get_logger().warn(f"[chat] buffered chat processor failed: {e}")
 
 
     def _maybe_chat_reply_to_utterance_impl(
@@ -2437,7 +2466,7 @@ class BrokerNode(Node, BrokerMediationMixin):
                         reasoning_effort="medium",
                     )
                 else:
-                    client = OpenAI(timeout=60.0, max_retries=0)
+                    client = OpenAI(timeout=30.0, max_retries=0)
                     resp = client.chat.completions.create(
                         model=used_model,
                         messages=messages_for_llm,
@@ -2653,7 +2682,8 @@ class BrokerNode(Node, BrokerMediationMixin):
                 travel_time_fn=travel_time_fn,
             )
 
-            self._last_plan = plan
+            self._last_optimizer_plan = plan
+
 
             # ✅ Publish ONLY if this run came from a trigger callback
             if publish:

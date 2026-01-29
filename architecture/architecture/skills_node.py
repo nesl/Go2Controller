@@ -42,6 +42,8 @@ from .skills_engine_v2 import (  # adjust to ".skills_engine_v2" if inside a pac
     _normalize_tts_text,
     _num_to_words,
     _box_id_from_node_id,
+    canonical_box_action_from_execute,
+    same_canonical_box_action,
 )
 
 
@@ -116,6 +118,7 @@ class SkillsAgent(Node):
         self.box_req_timeout = float(self.get_parameter("box_req_timeout").value)
         self.agent_id = self.get_parameter("agent_id").get_parameter_value().string_value or "robot"
 
+        self._current_box_action = None
         
         # internal simulated pose (used only in sim mode)
         self._sim_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
@@ -268,6 +271,7 @@ class SkillsAgent(Node):
 
         # call engine.tick() ~10–20 Hz, lightweight
         self.create_timer(0.05, self._tick_engine)
+
 
     def _sim_is_on(self) -> bool:
         return bool(self.get_parameter("sim_mode").value) and bool(self.get_parameter("sim_move_enable").value)
@@ -926,10 +930,25 @@ class SkillsAgent(Node):
             name = str(obj["skill"])
             ctx  = obj.get("ctx") or {}
 
-            # NEW: cancel everything before starting the new skill
-            self._cancel_all_active(why=f"before_execute:{name}")
+            # ------------------------------------------------------------
+            # B) CANCEL-GATING LOGIC (PUTS HERE)
+            # ------------------------------------------------------------
+            new_sig = canonical_box_action_from_execute(self.skill_engine, name, ctx)
+            cur_sig = self._current_box_action
 
-            # NEW: orchestrator explicitly requested this skill → reset quarantine for it
+            # Only skip cancel if:
+            #  - new action is sense/dispose (new_sig != None implies that), AND
+            #  - it matches the currently running box action
+            if same_canonical_box_action(new_sig, cur_sig):
+                self.get_logger().info(
+                    f"[SkillsAgent] /skills/execute '{name}': NOT canceling; "
+                    f"new matches current box op {cur_sig}"
+                )
+                return
+            else:
+                self._cancel_all_active(why=f"before_execute:{name}")
+
+            # orchestrator explicitly requested this skill → reset quarantine for it
             if hasattr(self.skill_engine, "bad_skills"):
                 if name in self.skill_engine.bad_skills:
                     self.get_logger().info(
@@ -1527,6 +1546,10 @@ class SkillsAgent(Node):
                 self.get_logger().warn(f"[box.sense] invalid property={property!r}; forcing 'X'.")
                 prop = "X"
 
+            # Track "current action" for cancel gating
+            self._current_box_action = {"kind": "sense", "node_id": node_id, "property": prop}
+
+
             base_url   = self.box_server_url.rstrip("/")
             url        = base_url + "/sense"
             cancel_url = base_url + "/sense/cancel"
@@ -1580,6 +1603,10 @@ class SkillsAgent(Node):
                     f"status={result.get('status')}, detected={result.get('detected')}, "
                     f"prob={result.get('probability')}"
                 )
+
+                if same_canonical_box_action(self._current_box_action, {"kind":"dispose","node_id":node_id,"property":prop}):
+                    self._current_box_action = None
+
 
                 h.mark_done()
 
@@ -1685,6 +1712,8 @@ class SkillsAgent(Node):
             if prop not in ("X", "Y"):
                 self.get_logger().warn(f"[box.dispose] invalid property={property!r}; forcing 'X'.")
                 prop = "X"
+            self._current_box_action = {"kind": "dispose", "node_id": node_id, "property": prop}
+
 
             base_url   = self.box_server_url.rstrip("/")
             url        = base_url + "/dispose"
@@ -1737,6 +1766,10 @@ class SkillsAgent(Node):
                     f"[box.dispose] box_id={box_id}, prop={prop}, "
                     f"status={result.get('status')}, success={result.get('success')}"
                 )
+
+                if same_canonical_box_action(self._current_box_action, {"kind":"sense","node_id":node_id,"property":prop}):
+                    self._current_box_action = None
+
 
                 h.mark_done()
 

@@ -1289,33 +1289,9 @@ def extend_plan_with_prefix(
             )
         )
 
-    # --- 4) Build residual box world: treat prefix as if just completed ---
+    # --- 4) Build residual box world ---
+    # Prefix are PROPOSED, not executed -> do NOT modify already_sensed/info/disposed.
     residual_boxes: List[BoxInfo] = copy.deepcopy(boxes)
-    box_res_by_id: Dict[int, BoxInfo] = {b.box_id: b for b in residual_boxes}
-
-    for aid, actions in (prefix_plan or {}).items():
-        for (box_id, prop, kind) in actions:
-            b = box_res_by_id.get(box_id)
-            if b is None:
-                continue
-
-            if kind == "sense":
-                # Mark that this agent has already sensed this (box, prop)
-                amap = b.already_sensed.setdefault(aid, {})
-                amap[prop] = True
-
-                # Heuristic: bump info_X/Y because we are planning *after* this sense
-                if prop == "X":
-                    b.info_X = min(1.0, max(b.info_X, 0.7))
-                else:
-                    b.info_Y = min(1.0, max(b.info_Y, 0.7))
-
-            elif kind == "dispose":
-                # Mark disposal as already done so optimizer won't schedule it again
-                if prop == "X":
-                    b.disposed_X = True
-                else:
-                    b.disposed_Y = True
 
     # --- 5) Run optimizer on residual problem ---
     suffix_plan = plan_assignments_gurobi(
@@ -1326,6 +1302,24 @@ def extend_plan_with_prefix(
         travel_time_fn=travel_time_fn,
         weights=weights,
     )
+
+    # --- 5.5) Remove suffix actions that duplicate prefix actions ---
+    prefix_set = set()
+    for aid, actions in (prefix_plan or {}).items():
+        for (box_id, prop, kind) in actions:
+            prefix_set.add((aid, int(box_id), prop, kind))
+
+    for aid, actions in list((suffix_plan or {}).items()):
+        filtered = []
+        for (box_id, prop, kind) in actions:
+            if (aid, int(box_id), prop, kind) in prefix_set:
+                continue
+            filtered.append((int(box_id), prop, kind))
+        if filtered:
+            suffix_plan[aid] = filtered
+        else:
+            suffix_plan.pop(aid, None)
+
 
     # --- 6) Merge prefix + suffix into a full plan ---
     full_plan: Plan = {}

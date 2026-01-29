@@ -71,38 +71,35 @@ PROFILE_REFLECTION_SCHEMA = {
     "properties": {
         "humans": {
             "type": "object",
-            # Each key under "humans" is a human_id ("human_a", "human_b", ...)
             "additionalProperties": {
                 "type": "object",
-                # summary_delta + trait_updates are *optional*
                 "properties": {
                     "summary_delta": {"type": "string"},
                     "trait_updates": {
                         "type": "object",
-                        # Each key under trait_updates is a trait name
                         "additionalProperties": {
                             "type": "object",
                             "required": ["new_value"],
                             "properties": {
                                 "new_value": {},
-                                "confidence_delta": {"type": "number"},
+                                # Qualitative strength instead of numeric deltas
+                                "evidence_level": {
+                                    "type": "string",
+                                    "enum": ["very_low", "low", "medium", "high", "very_high"],
+                                },
+                                "evidence_notes": {"type": "string"},
                             },
                             "additionalProperties": False,
                         },
                     },
                 },
-                # Allow extra keys like:
-                # "leadership_preference": "emerging"
-                # "trust_in_robot_plans": "low"
-                # We'll normalize them in _apply_profile_updates.
                 "additionalProperties": True,
             },
         }
     },
-    # IMPORTANT: allow top-level extra keys the model sometimes adds,
-    # like "type" and "properties".
     "additionalProperties": True,
 }
+
 
 
 class BrokerMediationMixin:
@@ -127,10 +124,22 @@ class BrokerMediationMixin:
         # In __init__ or _init_mediation_tts or BrokerNode init
         self._last_plan_provenance = {}  # type: Dict[str, List[Dict[str, str]]]
 
+        # Single source of truth for "what we're actually doing"
+        self._committed_plan = {}               # type: Plan
+        self._committed_plan_provenance = {}    # type: Optional[dict]
+
+
         # ---- Mediation liveness controls ----
         self.mediation_turn_timeout_sec = float(getattr(self, "mediation_turn_timeout_sec", 60.0))
-        self.mediation_max_turns = int(getattr(self, "mediation_max_turns", 6))   # human+robot steps combined
+        self.mediation_max_turns = int(getattr(self, "mediation_max_turns", 3))   # human+robot steps combined
 
+
+        # ---- Mediation single-flight (per session across INIT / MEDIATION / AUTORESOLVE) ----
+        self._mediation_llm_busy = {}   # session_id -> bool
+        self._mediation_llm_phase = {}  # session_id -> "init"|"turn"|"autoresolve"|None
+
+        self._baseline_human_agreed_plan = {}  # type: Plan
+        self._baseline_human_agreed_provenance = {}  # type: Optional[dict]
 
         self._mediation_pending_deadline_ts: Optional[float] = None
         self._mediation_pending_started_ts: Optional[float] = None
@@ -153,8 +162,21 @@ class BrokerMediationMixin:
             "MEDIATION_AUTORESOLVE": 0.00,
         }
 
-        # Timers per bucket for debounce scheduling
-        self._llm_debounce_timer = {}  # (channel,key) -> threading.Timer
+        # ---- Debounce without thread timers ----
+        # Per-bucket "do not run before this timestamp"
+        self._llm_next_run_ts = {}  # (channel,key) -> float epoch seconds
+
+        # Dispatcher timer: checks buckets and starts workers when due.
+        self._llm_dispatch_period_sec = float(getattr(self, "llm_dispatch_period_sec", 0.05))
+        self._llm_dispatch_timer = self.create_timer(
+            self._llm_dispatch_period_sec, self._llm_dispatch_tick
+        )
+
+        # NOTE: We no longer use thread-based debounce timers
+        self._llm_debounce_timer = {}  # can be removed; kept only if referenced elsewhere
+
+        
+    
         
         # ---- Always-accept override tracking ----
         # Remember the last committed robot first-action and who requested it,
@@ -164,6 +186,199 @@ class BrokerMediationMixin:
         self.always_accept_override_window_sec = float(
             getattr(self, "always_accept_override_window_sec", 25.0)
         )
+
+
+    def _action_sig(self, action: Tuple[int, str, str]) -> Tuple[str, int, str]:
+        # action is (box_id, prop, kind)
+        (box_id, prop, kind) = action
+        return (str(kind).lower(), int(box_id), str(prop).upper())
+
+    def _plan_robot_sig_set(self, plan: Plan, limit: int = 8) -> set:
+        s = set()
+        ra = (plan or {}).get("robot") or []
+        for a in ra[: max(0, int(limit))]:
+            try:
+                s.add(self._action_sig(a))
+            except Exception:
+                pass
+        return s
+
+    def _canon_action(self, a) -> Optional[Tuple[int, str, str]]:
+        """
+        Normalize an action tuple to (box_id:int, prop:upper, kind:lower).
+        """
+        try:
+            (box_id, prop, kind) = a
+            return (int(box_id), str(prop).upper(), str(kind).lower())
+        except Exception:
+            return None
+
+
+    def _agent_actions(self, plan: Plan, aid: str, limit: int = 50) -> List[Tuple[int, str, str]]:
+        acts = (plan or {}).get(aid) or []
+        out = []
+        for a in acts[: max(0, int(limit))]:
+            ca = self._canon_action(a)
+            if ca is not None:
+                out.append(ca)
+        return out
+
+
+    def _subtract_committed_prefix_in_order_all_agents(
+        self,
+        requested: Plan,
+        committed: Plan,
+        agents: Optional[List[str]] = None,
+        lookahead: int = 12,
+    ) -> Plan:
+        """
+        For each agent in `agents`, remove the longest in-order prefix of requested[agent]
+        that already matches committed[agent] prefix.
+
+        Returns a new Plan containing ONLY the remaining (true) changes.
+        """
+        if not isinstance(requested, dict) or not requested:
+            return {}
+
+        if agents is None:
+            # default to all keys seen in either requested or committed
+            agents = sorted(set(list(requested.keys()) + list((committed or {}).keys())))
+
+        out: Plan = {}
+
+        for aid in agents:
+            req = self._agent_actions(requested, aid, limit=lookahead)
+            if not req:
+                continue
+
+            com = self._agent_actions(committed, aid, limit=lookahead)
+
+            k = 0
+            while k < len(req) and k < len(com) and req[k] == com[k]:
+                k += 1
+
+            remaining = req[k:]
+            if remaining:
+                out[str(aid)] = [(box_id, prop, kind) for (box_id, prop, kind) in remaining]
+
+        return out
+
+
+    def _plan_has_any_actions(self, plan: Plan) -> bool:
+        if not isinstance(plan, dict) or not plan:
+            return False
+        for aid, acts in plan.items():
+            if acts:
+                return True
+        return False
+
+
+    def _is_prefix_plan_already_committed_in_order_all_agents(
+        self,
+        requested: Plan,
+        committed: Plan,
+        agents: Optional[List[str]] = None,
+        lookahead: int = 12,
+    ) -> bool:
+        """
+        True if requested[aid] is an in-order prefix of committed[aid] for all agents with requests.
+        """
+        if not isinstance(requested, dict) or not requested:
+            return False
+
+        if agents is None:
+            agents = list(requested.keys())
+
+        for aid in agents:
+            req = self._agent_actions(requested, aid, limit=lookahead)
+            if not req:
+                continue
+            com = self._agent_actions(committed, aid, limit=lookahead)
+            if len(com) < len(req):
+                return False
+            if com[:len(req)] != req:
+                return False
+
+        return True
+
+
+    def _confirm_already_committed(self, proposer_id: str, proposed: Plan) -> None:
+        """
+        Quick acknowledgement (no mediation).
+        """
+        ra = (proposed or {}).get("robot") or []
+        target = self._to_display_text(proposer_id)
+        if ra:
+            try:
+                (box_id, prop, kind) = ra[0]
+                self._robot_say(f"Hey {target}, yes — I'm already doing that: I'll {kind} box {box_id} ({prop}).")
+                return
+            except Exception:
+                pass
+        self._robot_say(f"Hey {target}, yes — that plan is already in progress.")
+
+
+    def _llm_dispatch_tick(self):
+        """
+        Single periodic dispatcher (ROS timer) that starts bucket workers when:
+          - bucket has buffered events
+          - bucket is not already inflight
+          - debounce window has elapsed (now >= next_run_ts)
+        This replaces threading.Timer-based debounce and prevents thread explosion.
+        """
+        now = time.time()
+        to_start: List[Tuple[str, str]] = []
+
+        with self._llm_lock:
+            # Snapshot candidate buckets quickly under lock
+            for (channel, key), q in list(self._llm_buf.items()):
+                if not q:
+                    continue
+
+                b = (channel, key)
+
+                if self._llm_inflight.get(b, False):
+                    continue
+
+                next_ts = float(self._llm_next_run_ts.get(b, 0.0) or 0.0)
+                if now < next_ts:
+                    continue
+
+                # Eligible to start
+                to_start.append((channel, key))
+
+        # Start outside lock
+        for (channel, key) in to_start:
+            try:
+                self._start_llm_worker(channel, key)
+            except Exception:
+                # Don't let dispatcher crash
+                pass
+
+
+    def _try_acquire_mediation_session_llm(self, session_id: str, phase: str) -> bool:
+        """
+        Session-global single-flight across mediation channels (INIT / TURN / AUTORESOLVE).
+        Returns True if acquired, False if another mediation phase is running.
+        """
+        sid = str(session_id)
+        with self._llm_lock:
+            if self._mediation_llm_busy.get(sid, False):
+                return False
+            self._mediation_llm_busy[sid] = True
+            self._mediation_llm_phase[sid] = str(phase)
+            return True
+
+    def _release_mediation_session_llm(self, session_id: str):
+        sid = str(session_id)
+        with self._llm_lock:
+            self._mediation_llm_busy[sid] = False
+            self._mediation_llm_phase[sid] = None
+
+    def _mediation_session_llm_phase(self, session_id: str) -> Optional[str]:
+        sid = str(session_id)
+        with self._llm_lock:
+            return self._mediation_llm_phase.get(sid)
 
 
     def _start_pending_deadlines(self, now_ts: float):
@@ -198,83 +413,107 @@ class BrokerMediationMixin:
 
     def _llm_submit(self, channel: str, key: str, ev_type: str, payload: dict, ts: float):
         """
-        Buffer an event and ensure a worker will run for this (channel,key).
-        If a call is already in flight, we ONLY buffer.
-        If not, we debounce-start a worker to coalesce bursts.
+        Buffer an event into (channel,key) bucket and schedule execution via dispatcher timer.
+
+        Debounce behavior:
+          - next_run_ts is pushed to now + debounce_sec on every submit
+          - worker will only start when now >= next_run_ts
         """
-        
-        self.get_logger().info(
-        f"[llm_worker] {channel}"
-        )
+        self.get_logger().info(f'submit {channel}')
         
         b = self._llm_bucket(channel, key)
+        now = time.time()
+
+        start_now = False
 
         with self._llm_lock:
             self._llm_buf[b].append({"ts": float(ts), "type": ev_type, "payload": payload})
 
-            
-            # If already in flight, nothing else to do.
-            if self._llm_inflight[b]:
-                return
-
-            # Debounce: restart timer for this bucket
-            # So rapid events become a single call.
-            old_t = self._llm_debounce_timer.get(b)
-            try:
-                if old_t:
-                    old_t.cancel()
-            except Exception:
-                pass
-
             delay = float(self._llm_debounce_sec.get(channel, 0.0) or 0.0)
-            if delay <= 0.0:
-                # start immediately
-                self._start_llm_worker(channel, key)
-                return
 
-            t = threading.Timer(delay, lambda: self._start_llm_worker(channel, key))
-            self._llm_debounce_timer[b] = t
-            t.daemon = True
-            t.start()
+            # Push next run time forward (debounce extends on every new event)
+            self._llm_next_run_ts[b] = now + delay
+
+            # If not inflight and delay==0, we can start immediately (outside lock)
+            if (not self._llm_inflight.get(b, False)) and delay <= 0.0:
+                start_now = True
+
+        if start_now:
+            self._start_llm_worker(channel, key)
+
+
 
     def _start_llm_worker(self, channel: str, key: str):
         """
-        Starts a background worker for this bucket if not already running.
+        Start ONE worker thread for this bucket (if not already inflight).
+        Worker drains in a LOOP until empty or until debounce says "wait".
         """
         b = self._llm_bucket(channel, key)
+        now = time.time()
 
         with self._llm_lock:
-            # If nothing to do or already running, exit.
-            if self._llm_inflight[b]:
+            # Already running or nothing to do
+            if self._llm_inflight.get(b, False):
                 return
-            if not self._llm_buf[b]:
+            if not self._llm_buf.get(b):
                 return
+
+            # Respect debounce gate
+            next_ts = float(self._llm_next_run_ts.get(b, 0.0) or 0.0)
+            if now < next_ts:
+                return
+
+            # Mark inflight: one worker per bucket
             self._llm_inflight[b] = True
 
-        def _worker():
+        def _worker_loop():
             try:
-                if channel == "MEDIATION":
-                    self._llm_worker_mediation(key)
-                elif channel == "CHAT":
-                    self._llm_worker_chat(key)
-                elif channel == "REFLECTION":
-                    self._llm_worker_reflection(key)
-                elif channel == "MEDIATION_INIT":
-                    self._llm_worker_mediation_init(key)
-                elif channel == "MEDIATION_AUTORESOLVE":
-                    self._llm_worker_mediation_autoresolve(key)
+                while True:
+                    # 1) Check debounce and drain a batch
+                    with self._llm_lock:
+                        # If bucket emptied, we're done
+                        if not self._llm_buf.get(b):
+                            break
+
+                        # If new events arrived and debounce window hasn't elapsed, stop.
+                        next_ts2 = float(self._llm_next_run_ts.get(b, 0.0) or 0.0)
+                        if time.time() < next_ts2:
+                            break
+
+                        events = list(self._llm_buf[b])
+                        self._llm_buf[b].clear()
+
+                    # 2) Process drained batch (outside lock)
+                    try:
+                        if channel == "MEDIATION":
+                            self._process_mediation_events(key, events)
+                        elif channel == "CHAT":
+                            self._process_chat_events(key, events)
+                        elif channel == "REFLECTION":
+                            self._process_reflection_events(key, events)
+                        elif channel == "MEDIATION_INIT":
+                            self._process_mediation_init_events(key, events)
+                        elif channel == "MEDIATION_AUTORESOLVE":
+                            self._process_mediation_autoresolve_events(key, events)
+                        else:
+                            pass
+                    except Exception as e:
+                        try:
+                            self.get_logger().warn(f"[llm] worker for {channel}:{key} failed: {e}")
+                        except Exception:
+                            pass
+
+
+                    # Loop continues: if more events arrived and debounce is satisfied,
+                    # we will drain again in the same thread.
 
             finally:
-                # Mark bucket idle, then if more arrived while running, re-run once.
+                # Clear inflight flag; dispatcher will restart if there is leftover work
                 with self._llm_lock:
                     self._llm_inflight[b] = False
-                    has_more = bool(self._llm_buf[b])
 
-                if has_more:
-                    # run again quickly to drain anything that arrived mid-flight
-                    self._start_llm_worker(channel, key)
+        threading.Thread(target=_worker_loop, daemon=True).start()
 
-        threading.Thread(target=_worker, daemon=True).start()
 
 
     def _get_human_turns_with_prev_context(
@@ -328,6 +567,137 @@ class BrokerMediationMixin:
         if limit is not None and limit > 0:
             hist = hist[-limit:]
         return hist
+
+    def _level_3(self, x: Optional[float]) -> Optional[str]:
+        """
+        Map a numeric value to low/medium/high.
+        If x is None -> None.
+        """
+        try:
+            if x is None:
+                return None
+            v = float(x)
+        except Exception:
+            return None
+
+        # Generic buckets; tune if you want
+        if v <= 0.33:
+            return "low"
+        if v <= 0.66:
+            return "medium"
+        return "high"
+
+
+    def _level_5(self, x: Optional[float]) -> Optional[str]:
+        """
+        Map a numeric value to very_low/low/medium/high/very_high.
+        """
+        try:
+            if x is None:
+                return None
+            v = float(x)
+        except Exception:
+            return None
+
+        if v <= 0.20:
+            return "very_low"
+        if v <= 0.40:
+            return "low"
+        if v <= 0.60:
+            return "medium"
+        if v <= 0.80:
+            return "high"
+        return "very_high"
+
+
+    def _pct_to_level(self, pct: Optional[float]) -> Optional[str]:
+        """
+        For percentages like suboptimality_pct (0..100).
+        """
+        try:
+            if pct is None:
+                return None
+            v = float(pct)
+        except Exception:
+            return None
+
+        # Example buckets (tune):
+        # 0-5 excellent, 5-15 low, 15-35 medium, 35-60 high, >60 very_high
+        if v <= 5.0:
+            return "very_low"
+        if v <= 15.0:
+            return "low"
+        if v <= 35.0:
+            return "medium"
+        if v <= 60.0:
+            return "high"
+        return "very_high"
+
+
+    def _rate_to_trust_level(self, rate: Optional[float]) -> Optional[str]:
+        """
+        For correct_rate / success_rate style values (0..1).
+        Higher rate -> higher trust.
+        """
+        try:
+            if rate is None:
+                return None
+            v = float(rate)
+        except Exception:
+            return None
+
+        if v >= 0.85:
+            return "very_high"
+        if v >= 0.70:
+            return "high"
+        if v >= 0.50:
+            return "medium"
+        if v >= 0.30:
+            return "low"
+        return "very_low"
+
+
+    def _qualitative_objective_summary_for_reflection(self, objective: Any) -> dict:
+        """
+        Convert MediationObjectiveMetrics (numeric-heavy) into qualitative-only fields
+        for reflection prompts/payloads.
+        """
+        try:
+            subopt_lvl = self._pct_to_level(getattr(objective, "suboptimality_pct", None))
+            deadline_risk = getattr(objective, "deadline_risk", None)
+            imbalance_xy = getattr(objective, "imbalance_XY", None)
+        except Exception:
+            subopt_lvl = None
+            deadline_risk = None
+            imbalance_xy = None
+
+        return {
+            "suboptimality_level": subopt_lvl,                 # very_low..very_high
+            "deadline_risk_level": self._level_5(deadline_risk),  # very_low..very_high
+            "imbalance_xy_level": self._level_5(imbalance_xy),    # very_low..very_high
+            "fulfillment_history_ok": bool(getattr(objective, "fulfillment_history_ok", True)),
+            "notes": getattr(objective, "notes", None),
+        }
+
+
+    def _qualitative_social_summary_for_reflection(self, social: Any, conflict_index: Optional[float] = None) -> dict:
+        """
+        Convert social context to qualitative-only fields for reflection prompts/payloads.
+        """
+        proposer_id = getattr(social, "proposer_id", None)
+
+        # If you have numeric proposer_success_rate / conflict_index, bucket them.
+        psr = getattr(social, "proposer_success_rate", None)
+        ci = conflict_index if conflict_index is not None else getattr(social, "conflict_index", None)
+
+        return {
+            "proposer_id": proposer_id,
+            "proposer_success_level": self._rate_to_trust_level(psr),
+            "conflict_level": self._level_3(ci),
+            "override_frequency": getattr(social, "override_frequency", None),        # already low/medium/high in your code
+            "leadership_contestation": getattr(social, "leadership_contestation", None),  # already none/emerging/strong
+        }
+
 
     # ---------- Per-human periodic reflection ----------
 
@@ -383,18 +753,25 @@ class BrokerMediationMixin:
             "role": "user",
             "content": (
                 "Given these recent utterances and the current profile, propose updates "
-                "for this ONE human.\n"
-                "Return STRICT JSON of the same form as the ProfileReflection.humans entry, e.g.:\n"
+                "for this ONE human.\n\n"
+                "IMPORTANT:\n"
+                "- For each trait update object, output ONLY: new_value (required), "
+                "evidence_level (optional), evidence_notes (optional).\n"
+                "- Do NOT output confidence_delta or numeric fields.\n\n"
+                "Return STRICT JSON of the form:\n"
                 "{\n"
                 f'  "humans": {{ "{human_id}": {{\n'
-                '      "summary_delta": "...",\n'
+                '      "summary_delta": "optional short summary",\n'
                 '      "trait_updates": {\n'
-                '        "leadership_preference": {"new_value": "emerging", "confidence_delta": 0.1}\n'
+                '        "leadership_preference": {"new_value": "emerging", "evidence_level": "medium"},\n'
+                '        "trust_in_robot_plans": {"new_value": "low", "evidence_level": "high", "evidence_notes": "…"}\n'
                 "      }\n"
                 "  }}}\n"
                 "}\n"
             ),
         }
+
+
 
         payload_msg = {
             "role": "user",
@@ -558,7 +935,7 @@ class BrokerMediationMixin:
                     "additionalProperties": True,
                 },
             },
-            "additionalProperties": False,
+            "additionalProperties": True,
         }
 
         obj = self._chat_json(
@@ -596,6 +973,74 @@ class BrokerMediationMixin:
                 except Exception:
                     continue
         return idx
+
+    def _plan_to_keyset(self, plan: Plan) -> set:
+        """
+        Convert Plan dict -> set of (aid, box_id, prop, kind) for fast membership.
+        """
+        s = set()
+        for aid, actions in (plan or {}).items():
+            for (box_id, prop, kind) in (actions or []):
+                try:
+                    s.add(self._action_key(str(aid), int(box_id), str(prop), str(kind)))
+                except Exception:
+                    pass
+        return s
+
+
+    def _prune_human_agreed_plan(self, plan: Plan, boxes, current_time: float) -> Plan:
+        """
+        Keep agreed actions until they are truly fulfilled or infeasible.
+        DO NOT use membership in self._last_plan as a completion signal,
+        because optimizer replanning can drop/reorder actions that are still agreed.
+        """
+        plan = copy.deepcopy(plan or {})
+        if not plan:
+            return {}
+
+        box_by_id = {b.box_id: b for b in (boxes or [])}
+
+        out: Plan = {}
+        for aid, actions in plan.items():
+            kept = []
+            for (box_id, prop, kind) in (actions or []):
+                try:
+                    ok, _ = self._check_action_feasible(
+                        aid=str(aid),
+                        box_id=int(box_id),
+                        prop=str(prop),
+                        kind=str(kind),
+                        box_by_id=box_by_id,
+                        current_time=float(current_time),
+                    )
+                    if not ok:
+                        continue
+
+                    # Also drop if it is already fulfilled (stronger than "feasible")
+                    b = box_by_id.get(int(box_id))
+                    if b is None:
+                        continue
+
+                    if kind == "dispose":
+                        if prop == "X" and bool(getattr(b, "disposed_X", False)):
+                            continue
+                        if prop == "Y" and bool(getattr(b, "disposed_Y", False)):
+                            continue
+
+                    if kind == "sense":
+                        already = (getattr(b, "already_sensed", None) or {}).get(str(aid), {}).get(str(prop), False)
+                        if already:
+                            continue
+
+                    kept.append((int(box_id), str(prop), str(kind)))
+                except Exception:
+                    continue
+
+            if kept:
+                out[str(aid)] = kept
+
+        return out
+
 
     def _check_action_feasible(
         self,
@@ -761,14 +1206,18 @@ class BrokerMediationMixin:
         self,
         committed_plan: Plan,
         session: MediationState,
+        baseline_provenance: Optional[dict] = None,
     ) -> dict:
         """
         Provenance rules:
           - default origin=optimizer
           - upgrade to origin=human for actions in session.prefix_plan
+          - PRESERVE baseline human/robot origins for actions that were already human-agreed
         """
+        # Start from optimizer default
         prov = self._build_optimizer_provenance(committed_plan)
 
+        # Build prefix_set (explicit new human request)
         prefix = getattr(session, "prefix_plan", None) or {}
         prefix_set = set()
         for aid, actions in (prefix or {}).items():
@@ -777,27 +1226,44 @@ class BrokerMediationMixin:
 
         proposer = (getattr(session, "social", None) and session.social.proposer_id) or "unknown"
 
+        # Index baseline provenance so we can preserve prior human-agreed entries
+        base_idx = self._index_provenance(baseline_provenance)
+
         for aid, actions in (committed_plan or {}).items():
             updated = []
             for (box_id, prop, kind) in (actions or []):
+                k = self._action_key(aid, int(box_id), prop, kind)
+
                 origin = "optimizer"
                 proposed_by = None
-                k = self._action_key(aid, int(box_id), prop, kind)
+
+                # 1) Explicit new human request wins
                 if k in prefix_set:
                     origin = "human"
                     proposed_by = proposer
+
+                # 2) Otherwise preserve baseline if it was already human/robot origin
+                else:
+                    prev = base_idx.get(k)
+                    if isinstance(prev, dict):
+                        prev_origin = (prev.get("origin") or "").strip()
+                        if prev_origin in ("human", "robot"):
+                            origin = prev_origin
+                            proposed_by = prev.get("proposed_by")
+
                 updated.append(
                     {
                         "box_id": int(box_id),
-                        "property": prop,
-                        "kind": kind,
+                        "property": str(prop),
+                        "kind": str(kind),
                         "origin": origin,
                         "proposed_by": proposed_by,
                     }
                 )
-            prov[aid] = updated
+            prov[str(aid)] = updated
 
         return prov
+
 
 
     def _summarize_impossible_actions(
@@ -999,7 +1465,27 @@ class BrokerMediationMixin:
             self.get_logger().warn(f"[llm-plan] failed to build agents/boxes: {e}")
             return
 
-        current_plan = getattr(self, "_last_plan", {}) or {}
+        current_plan = getattr(self, "_committed_plan", None) or {}# or getattr(self, "_last_plan", {}) or {}
+
+
+        committed = current_plan
+
+        # ✅ Only treat as "human_proposed_changes" what differs from committed plan (per-agent, in-order)
+        prefix_changes = self._subtract_committed_prefix_in_order_all_agents(
+            requested=prefix_plan,
+            committed=committed,
+            agents=["robot", "human_a", "human_b"],
+            lookahead=12,
+        )
+
+        # If nothing remains, there's nothing to mediate.
+        if not self._plan_has_any_actions(prefix_changes):
+            self.get_logger().info("[llm-plan] requested actions already match committed plan prefix; skipping mediation_init")
+
+            self._confirm_already_committed(proposer_id, prefix_plan)  # confirm original request text
+            return
+
+
 
         # 4b) Build travel_time_fn + current_time + horizon as in optimizer thread
         box_positions = getattr(self, "_last_box_positions", {}) or {}
@@ -1030,7 +1516,7 @@ class BrokerMediationMixin:
         # 5) First, extend the prefix plan into a full candidate via optimizer
         try:
             candidate_plan = extend_plan_with_prefix(
-                prefix_plan=prefix_plan,
+                prefix_plan=prefix_changes,
                 agents=agents,
                 boxes=boxes,
                 current_time=current_time,
@@ -1045,6 +1531,20 @@ class BrokerMediationMixin:
         if not candidate_plan:
             self.get_logger().info("[llm-plan] optimizer returned empty candidate plan; ignoring")
             return
+
+        # ✅ EARLY BYPASS: if this request is already covered by the committed plan, do NOT start mediation
+        try:
+            # Prefer checking the explicit request (prefix), fall back to candidate if needed
+            if self._is_prefix_plan_already_committed_in_order_all_agents(prefix_plan, committed, agents=["robot","human_a","human_b"]):
+                self.get_logger().info("[llm-plan] requested robot actions already in committed plan; skipping mediation_init")
+
+                # confirm using the most direct representation of what they asked
+                self._confirm_already_committed(proposer_id, prefix_plan or candidate_plan)
+                return
+        except Exception as e:
+            self.get_logger().warn(f"[llm-plan] early already-committed bypass failed: {e}")
+            # fall through to normal behavior
+
 
         if self._always_accept():
             # Build session with objective metrics (optional) but do NOT compute `better/adopt`
@@ -1144,7 +1644,7 @@ class BrokerMediationMixin:
         if impossible_note:
             base_notes = base_notes + "\n\n" + impossible_note
 
-        base_notes = base_notes + "\n\n" + plan_diff_note
+        base_notes = base_notes + "\n\n"# + plan_diff_note
 
         current_profiles = self._load_current_human_profiles()
 
@@ -1218,6 +1718,26 @@ class BrokerMediationMixin:
         human_ids = list(self.human_agent_ids)  # ["human_a","human_b"]
 
 
+        # ---- Human-agreed baseline carryover (pruned) ----
+        baseline_agreed = copy.deepcopy(getattr(self, "_baseline_human_agreed_plan", {}) or {})
+        baseline_agreed_prov = copy.deepcopy(getattr(self, "_baseline_human_agreed_provenance", {}) or {})
+
+        # Prune completed/expired agreed actions
+        baseline_agreed = self._prune_human_agreed_plan(
+            plan=baseline_agreed,
+            boxes=boxes,
+            current_time=current_time,
+        )
+
+
+        self.get_logger().warn(f"[DEBUG] baseline_agreed AFTER prune keys={list((baseline_agreed or {}).keys())}")
+
+        # If nothing left, we don't "wait" on anything; baseline agreed becomes empty naturally.
+        # (No special waiting behavior needed: it only affects planning_view.)
+
+
+        self.get_logger().info(f'To comitt {candidate_plan}, {current_plan}, {prefix_plan}')
+
         state = MediationState(
             session_id=session_id,
             baseline_plan=current_plan,
@@ -1226,12 +1746,23 @@ class BrokerMediationMixin:
             social=social,
             interaction=interaction,
             turns=initial_turns,
-            prefix_plan=prefix_plan,
+            prefix_plan=prefix_changes,
             human_ids=human_ids,
-            baseline_provenance=getattr(self, "_last_plan_provenance", None),
-
+            baseline_provenance=(getattr(self, "_committed_plan_provenance", None) or getattr(self, "_last_plan_provenance", None)),
         )
+        
+        self.get_logger().warn(
+            f"[DEBUG] baseline_agreed_override keys={list((baseline_agreed or {}).keys())}, "
+            f"last_plan_provenance keys={list((getattr(self,'_last_plan_provenance', {}) or {}).keys())}"
+        )
+
+
+        
         setattr(state, "_seen_turn_keys", seen_turn_keys)
+        setattr(state, "baseline_human_agreed_override", baseline_agreed)
+        setattr(state, "baseline_human_agreed_override_provenance", baseline_agreed_prov)
+        setattr(state, "committed_plan_snapshot", copy.deepcopy(current_plan))
+        setattr(state, "committed_plan_provenance_snapshot", copy.deepcopy(getattr(self, "_committed_plan_provenance", None)))
 
 
         if self._always_accept():
@@ -1252,6 +1783,8 @@ class BrokerMediationMixin:
                 "robot_utterance": "",  # will be composed from committed plan in finalize
                 "log_tags": {"strategy": "always_accept", "rationale": "policy"},
             }
+            self._finalize_mediation_session(session_id=session_id, session=state, raw_decision=raw, ts=float(ts))
+            return
 
 
 
@@ -1265,6 +1798,15 @@ class BrokerMediationMixin:
         # Important: store initial state + mark active BEFORE enqueueing
         self._mediation_sessions[session_id] = state
         self._active_mediation_id = session_id
+
+        self.get_logger().warn(f"[DEBUG] baseline_human_agreed_plan keys={list(getattr(self,'_baseline_human_agreed_plan',{}).keys())}")
+        try:
+            self.get_logger().warn(f"[DEBUG] human_ids={getattr(sess, 'human_ids', None)}")
+            self.get_logger().warn(f"[DEBUG] proposer_id={(getattr(sess, 'social', None) and sess.social.proposer_id) or None}")
+        except Exception:
+            pass
+
+        self.get_logger().warn(f"[DEBUG] chat_recent_roles={[t.get('role') for t in self._get_recent_chat_turns(6)]}")
 
         # Run initial mediator.step() via buffering system
         self._llm_submit(
@@ -1301,6 +1843,11 @@ class BrokerMediationMixin:
             self.conn.commit()
         except Exception as e:
             self.get_logger().warn(f"[llm-plan] failed to log plan_proposal: {e}")
+
+    def _has_committed_plan(self) -> bool:
+        cp = getattr(self, "_committed_plan", None)
+        return isinstance(cp, dict) and any((cp.get(a) or []) for a in ("robot", "human_a", "human_b"))
+
 
     def _format_accept_utterance_for_plan(self, plan: Plan, proposer_id: str) -> str:
         """
@@ -1455,6 +2002,10 @@ class BrokerMediationMixin:
             candidate_plan = session.candidate_plan or {}
             prefix_plan = getattr(session, "prefix_plan", None) or {}
 
+
+
+
+
             # Pull boxes snapshot for feasibility checks
             boxes = getattr(self, "_last_boxes_for_optimizer", None)
             if boxes is None:
@@ -1464,7 +2015,14 @@ class BrokerMediationMixin:
             box_positions = getattr(self, "_last_box_positions", {}) or {}
 
             # Baseline provenance (what we had before this session)
-            baseline_prov = getattr(session, "baseline_provenance", None) or getattr(self, "_last_plan_provenance", None)
+            baseline_prov = (
+                getattr(session, "baseline_provenance", None)
+                or getattr(self, "_committed_plan_provenance", None)
+                or getattr(self, "_baseline_human_agreed_provenance", None)
+                or getattr(self, "_last_plan_provenance", None)
+            )
+
+
 
             # Decide the intended plan BEFORE filtering
             intended_plan: Plan
@@ -1515,13 +2073,55 @@ class BrokerMediationMixin:
 
             committed_plan = filtered_plan or {}
 
-            # Commit + provenance
-            self._last_plan = committed_plan
-            try:
-                self._last_plan_provenance = self._build_committed_provenance(committed_plan, session)
-            except Exception as e:
-                self.get_logger().warn(f"[mediation] failed to build committed provenance: {e}")
-                self._last_plan_provenance = self._build_optimizer_provenance(committed_plan)
+            self._commit_plan_with_provenance(
+                plan=committed_plan,
+                session=session,
+                baseline_provenance=baseline_prov,
+            )
+
+            self.get_logger().info(f'Committed plan {committed_plan}, {intended_plan}, {candidate_plan}, {baseline_plan}')
+            # ✅ Update committed plan (single source of truth)
+            self._committed_plan = copy.deepcopy(committed_plan)
+            self._committed_plan_provenance = copy.deepcopy(getattr(self, "_last_plan_provenance", None))
+
+
+            # After committing (and after self._last_plan_provenance is set)
+            prov = getattr(self, "_last_plan_provenance", None) or {}
+
+            new_agreed: Plan = {}
+
+            for aid, entries in (prov or {}).items():
+                for e in (entries or []):
+                    try:
+                        origin = (e.get("origin") or "unknown")
+                        if origin not in ("human", "robot"):
+                            continue  # ignore optimizer-only tasks
+
+                        new_agreed.setdefault(str(aid), []).append(
+                            (int(e["box_id"]), str(e["property"]), str(e["kind"]))
+                        )
+                    except Exception:
+                        continue
+
+            # Merge with previous agreed baseline, then prune by world state
+            prev_agreed = copy.deepcopy(getattr(self, "_baseline_human_agreed_plan", {}) or {})
+            merged = prev_agreed
+            for aid, acts in new_agreed.items():
+                merged.setdefault(aid, [])
+                for a in acts:
+                    if a not in merged[aid]:
+                        merged[aid].append(a)
+
+            merged = self._prune_human_agreed_plan(plan=merged, boxes=boxes, current_time=current_time)
+
+            self._baseline_human_agreed_plan = merged
+            self._baseline_human_agreed_provenance = copy.deepcopy(prov)
+
+
+
+
+
+
 
             # Publish committed plan once
             if committed_plan:
@@ -1606,6 +2206,34 @@ class BrokerMediationMixin:
             except Exception as e:
                 self.get_logger().warn(f"[mediation] failed to publish final status: {e}")
 
+    def _commit_plan_with_provenance(
+        self,
+        plan: Plan,
+        session: Optional[MediationState] = None,
+        baseline_provenance: Optional[dict] = None,
+    ):
+        """
+        Update both self._last_plan and self._last_plan_provenance consistently.
+
+        - If session is provided, preserve baseline human/robot origins and mark prefix actions as human.
+        - Otherwise, default all actions to optimizer provenance.
+        """
+        plan = plan or {}
+        self._last_plan = plan
+
+        if session is not None:
+            try:
+                self._last_plan_provenance = self._build_committed_provenance(
+                    committed_plan=plan,
+                    session=session,
+                    baseline_provenance=baseline_provenance,
+                )
+                return
+            except Exception as e:
+                self.get_logger().warn(f"[provenance] failed to build committed provenance; defaulting: {e}")
+
+        self._last_plan_provenance = self._build_optimizer_provenance(plan)
+
 
     def _build_optimizer_provenance(self, plan: Plan) -> dict:
         prov = {}
@@ -1626,30 +2254,16 @@ class BrokerMediationMixin:
     # ---------- Async reflection helper ----------
 
     def _kickoff_async_reflection(self, session: MediationState):
-        """
-        Run human-profile reflection in a background thread so it doesn't
-        block the main ROS executor.
-        """
-        session_snapshot = copy.deepcopy(session)
+        session_id = getattr(session, "session_id", "unknown")
+        ts = time.time()
+        self._llm_submit(
+            channel="REFLECTION",
+            key=f"session:{session_id}",
+            ev_type="trigger",
+            payload={"mode": "mediation_session", "session_id": session_id},
+            ts=ts,
+        )
 
-        def _worker():
-            try:
-                if self._should_run_reflection_for_session(session_snapshot):
-                    self._reflect_on_mediation_session(session_snapshot)
-                    # After a full mediation-based reflection, reset per-human
-                    # periodic counters so they start fresh.
-                    self._reset_profile_msg_counts_for_session(session_snapshot)
-                else:
-                    self.get_logger().info(
-                        f"[mediation] skipping profile reflection for {session_snapshot.session_id} "
-                        f"(turns_used={session_snapshot.turns_used}, "
-                        f"humans={self._count_human_turns(session_snapshot)})"
-                    )
-            except Exception as e:
-                self.get_logger().warn(f"[mediation] reflection failed: {e}")
-
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
 
 
     def _reset_profile_msg_counts_for_session(self, session: MediationState):
@@ -1754,22 +2368,55 @@ class BrokerMediationMixin:
         from .optimizer_client import compute_planning_accuracy_by_human
         planning_stats = compute_planning_accuracy_by_human(disposal_outcomes)
 
-        # 3) Prepare payload for LLM
+        # Convert planning outcomes to qualitative-only summary
+        planning_outcomes_qual = {}
+        try:
+            for hid, st in (planning_stats or {}).items():
+                # st may include numeric correct_rate; do NOT forward numbers to the LLM
+                cr = None
+                try:
+                    cr = st.get("correct_rate")
+                except Exception:
+                    cr = None
+
+                planning_outcomes_qual[hid] = {
+                    "planning_correctness_level": self._rate_to_trust_level(cr),
+                    "summary": (
+                        "often correct"
+                        if self._rate_to_trust_level(cr) in ("high", "very_high")
+                        else "mixed or often incorrect"
+                    ),
+                }
+        except Exception:
+            planning_outcomes_qual = {}
+
+
+        objective_qual = self._qualitative_objective_summary_for_reflection(session.objective)
+        social_qual = self._qualitative_social_summary_for_reflection(session.social)
+
         payload = {
             "session_id": session.session_id,
             "status": session.status,
+
+            # Keep plans as text summaries (already non-numeric)
             "baseline_plan": self._plan_mediator._summarize_plan(session.baseline_plan),
             "final_candidate_plan": self._plan_mediator._summarize_plan(session.candidate_plan),
-            "objective_metrics": session.objective.__dict__,
-            "social_context": session.social.__dict__,
+
+            # ✅ qualitative-only
+            "objective_summary": objective_qual,
+            "social_summary": social_qual,
+
             "interaction_context": {
                 "event_summary": session.interaction.event_summary,
                 "session_notes": session.interaction.session_notes,
             },
             "dialogue": transcript,
             "current_profiles": current_profiles or {},
-            "planning_outcomes": planning_stats,
+
+            # ✅ qualitative-only
+            "planning_outcomes_summary": planning_outcomes_qual,
         }
+
 
         system_msg = {
             "role": "system",
@@ -1779,8 +2426,9 @@ class BrokerMediationMixin:
                 "- You also see statistics about how often each human's proposed disposals "
                 "ended up being correct or incorrect.\n"
                 "- Infer how each human prefers to plan and interact with Bob.\n"
-                "- Penalize humans whose disposal plans frequently send Bob to boxes that "
-                "do NOT have the requested property (low correct_rate in planning_outcomes).\n"
+                "- Use planning_outcomes_summary planning_correctness_level "
+                "(very_low/low/medium/high/very_high) to calibrate trust-related traits.\n"
+
                 "- Update only traits you have evidence for. Be conservative.\n"
             ),
         }
@@ -1792,21 +2440,35 @@ class BrokerMediationMixin:
                 "Given this mediation session, propose updates to each human's profile.\n"
                 "Focus on leadership preference, trust in robot plans, need for explanations,\n"
                 "risk aversion or deadline focus, and tolerance for disagreement.\n\n"
+                "IMPORTANT:\n"
+                "- For each trait, output ONLY:\n"
+                "  - new_value (required)\n"
+                "  - evidence_level (optional: very_low|low|medium|high|very_high)\n"
+                "  - evidence_notes (optional short string)\n"
+                "- Do NOT output confidence_delta or any numeric fields.\n\n"
                 "Return STRICT JSON of the form:\n"
                 "{\n"
                 '  "humans": {\n'
                 '    "human_a": {\n'
-                '      "summary_delta": "...",  # optional\n'
+                '      "summary_delta": "optional short summary of what changed",\n'
                 '      "trait_updates": {\n'
-                '        "leadership_preference": {"new_value": "emerging", "confidence_delta": 0.2},\n'
-                '        "trust_in_robot_plans": {"new_value": "low", "confidence_delta": 0.1}\n'
+                '        "leadership_preference": {\n'
+                '          "new_value": "emerging",\n'
+                '          "evidence_level": "medium",\n'
+                '          "evidence_notes": "brief justification"\n'
+                "        },\n"
+                '        "trust_in_robot_plans": {\n'
+                '          "new_value": "low",\n'
+                '          "evidence_level": "high"\n'
+                "        }\n"
                 "      }\n"
                 "    },\n"
-                "    \"human_b\": { ... }\n"
+                '    "human_b": { "summary_delta": "...", "trait_updates": { ... } }\n'
                 "  }\n"
                 "}\n"
             ),
         }
+
 
         payload_msg = {
             "role": "user",
@@ -1862,10 +2524,8 @@ class BrokerMediationMixin:
                 for key, val in upd.items():
                     if key in ("summary_delta", "trait_updates"):
                         continue
-                    trait_updates[key] = {
-                        "new_value": val,
-                        "confidence_delta": 0.0,
-                    }
+                    trait_updates[key] = {"new_value": val, "evidence_level": "very_low"}
+
 
             # 2) Get or init current profile
             cur = current_profiles.get(human_id) or {
@@ -1979,186 +2639,428 @@ class BrokerMediationMixin:
 
     # ---------- Speech routing into an active mediation ----------
 
-    def _llm_worker_mediation_init(self, session_id: str):
+    def _process_mediation_init_events(self, session_id: str, events: List[dict]):
         """
-        Run the FIRST PlanMediator.step() for a newly created session in a worker thread.
-        This prevents ROS callbacks from blocking on slow/hung LLM calls.
-
-        Expected buffered events:
-          - type="init" payload may contain {"ts": float}
+        Process init events for a newly created session.
+        Expects drained buffered events (type="init").
         """
-        b = self._llm_bucket("MEDIATION_INIT", session_id)
-
-        # Drain events
-        with self._llm_lock:
-            events = list(self._llm_buf[b])
-            self._llm_buf[b].clear()
-
         if not events:
             return
 
-        # Defensive: session may have been cancelled/cleared
-        sid = getattr(self, "_active_mediation_id", None)
-        sess = self._mediation_sessions.get(session_id)
-        if sid != session_id or not sess:
+        # Session-level single-flight
+        if not self._try_acquire_mediation_session_llm(session_id, "init"):
+            # If busy, just re-buffer by pushing next_run_ts slightly; dispatcher will retry
+            with self._llm_lock:
+                b = self._llm_bucket("MEDIATION_INIT", session_id)
+                for ev in events:
+                    self._llm_buf[b].append(ev)
+                self._llm_next_run_ts[b] = time.time() + 0.05
             return
 
-        # If someone already advanced it, don't init again
-        if getattr(sess, "turns_used", 0) not in (None, 0):
-            return
-        if getattr(sess, "status", None) in ("accept", "reject", "cancelled"):
-            return
-
-        # Use most recent ts if provided
-        last_ts = None
-        for ev in events:
-            last_ts = ev.get("ts") or last_ts
-        ts = float(last_ts or time.time())
-
-        # Run the first mediation step (ONE LLM call)
         try:
-            if not self.sim_mode:
-                # optional: already said "Let me think." in callback, so this can be omitted
-                pass
+            sid = getattr(self, "_active_mediation_id", None)
+            sess = self._mediation_sessions.get(session_id)
+            if sid != session_id or not sess:
+                return
 
-            self.get_logger().info(
-                f"[chat]  {sess.turns} {sess.interaction.recent_utterances}"
-            )
-            sess2, raw = self._plan_mediator.step(sess)
-        except Exception as e:
-            self.get_logger().warn(f"[mediation] init step failed: {e}")
+            if getattr(sess, "turns_used", 0) not in (None, 0):
+                return
+            if getattr(sess, "status", None) in ("accept", "reject", "cancelled"):
+                return
 
-            # Fail closed: keep baseline, unblock EventLayer
-            raw = {
-                "decision": "reject",
-                "planner_action": {"kind": "keep_baseline", "notes": f"init step failed: {e}"},
-                "robot_utterance": "Something went wrong while thinking—I'll keep the current plan for now.",
-                "log_tags": {"strategy": "init_error_fallback", "rationale": "LLM/step failed"},
-            }
-            raw = self._normalize_mediation_decision(raw)
-            sess.status = "reject"
-            self._mediation_sessions[session_id] = sess
-            self._finalize_mediation_session(session_id=session_id, session=sess, raw_decision=raw, ts=ts)
-            return
+            last_ts = None
+            for ev in events:
+                last_ts = ev.get("ts") or last_ts
+            ts = float(last_ts or time.time())
 
-        # Save updated session
-        self._mediation_sessions[session_id] = sess2
-
-        # If pending, publish pending and start deadlines (this is what used to happen inline)
-        if sess2.status == "pending":
-            self._publish_mediation_status(session_id, "pending")
-            self._start_pending_deadlines(ts)
-
-        # Speak any robot utterance
-        robot_utt = (raw.get("robot_utterance") or "").strip()
-        if robot_utt:
-            self.get_logger().info(f"[mediation] Bob says: {robot_utt}")
-            self._robot_say(robot_utt)
-
-        # If terminal immediately, finalize
-        if sess2.status in ("accept", "reject"):
-            self._finalize_mediation_session(
-                session_id=session_id,
-                session=sess2,
-                raw_decision=raw,
-                ts=ts,
-            )
-
-
-    def _llm_worker_mediation(self, session_id: str):
-        """
-        Drain buffered mediation turns for this session_id and do ONE mediator.step().
-        Coalescing rule: append all turns to state, call step once using the last turn.
-        """
-        b = self._llm_bucket("MEDIATION", session_id)
-
-        # Drain events
-        with self._llm_lock:
-            events = list(self._llm_buf[b])
-            self._llm_buf[b].clear()
-
-        if not events:
-            return
-
-        # Defensive: session may have ended
-        sid = getattr(self, "_active_mediation_id", None)
-        sess = self._mediation_sessions.get(session_id)
-        if sid != session_id or not sess or sess.status != "pending":
-            return
-
-        # Collect MediationTurn objects in order
-        turns = []
-        last_ts = None
-        for ev in events:
-            if ev.get("type") != "turn":
-                continue
-            t = ev.get("payload", {}).get("turn")
-            if t is not None:
-                turns.append(t)
-            last_ts = ev.get("ts")
-
-        if not turns:
-            return
-
-        # Bump pending deadline once (most recent time)
-        try:
-            if last_ts is not None:
-                self._bump_pending_deadline(float(last_ts))
-        except Exception:
-            pass
-
-
-
-        # Coalesce: append all but last directly into session history
-        for t in turns[:-1]:
             try:
-                sess.turns.append(t)
-                sess.interaction.recent_utterances.append(t)
+                sess2, raw = self._plan_mediator.step(sess)
+            except Exception as e:
+                self.get_logger().warn(f"[mediation] init step failed: {e}")
+
+                raw = {
+                    "decision": "reject",
+                    "planner_action": {"kind": "keep_baseline", "notes": f"init step failed: {e}"},
+                    "robot_utterance": "Something went wrong while thinking—I'll keep the current plan for now.",
+                    "log_tags": {"strategy": "init_error_fallback", "rationale": "LLM/step failed"},
+                }
+                raw = self._normalize_mediation_decision(raw)
+                sess.status = "reject"
+                self._mediation_sessions[session_id] = sess
+                self._finalize_mediation_session(session_id=session_id, session=sess, raw_decision=raw, ts=ts)
+                return
+
+            self._mediation_sessions[session_id] = sess2
+
+            robot_utt = (raw.get("robot_utterance") or "").strip()
+            if robot_utt:
+                self.get_logger().info(f"[mediation] Bob says: {robot_utt}")
+                self._robot_say(robot_utt)
+
+            # Start human response window only after we output something and remain pending
+            if getattr(sess2, "status", None) == "pending":
+                self._start_pending_deadlines(ts)
+                setattr(sess2, "_waiting_for_human", True)
+            else:
+                setattr(sess2, "_waiting_for_human", False)
+
+            # If init returned a terminal decision, we must check whether any human turns arrived
+            # while init was in-flight. If so, run ONE follow-up step with the latest turn
+            # before finalizing, otherwise we discard that turn.
+            if getattr(sess2, "status", None) in ("accept", "reject"):
+
+                late_turns = self._drain_buffered_mediation_turns(session_id)
+
+                if late_turns:
+                    last_turn = late_turns[-1]
+                    try:
+                        # Make sure the session has the last human turn recorded
+                        try:
+                            sess2.turns.append(last_turn)
+                            sess2.interaction.recent_utterances.append(last_turn)
+                        except Exception:
+                            pass
+
+                        # Convert this “init accepted too fast” case into an immediate follow-up turn-step
+                        # so the late human input is actually considered before commit.
+                        sess3, raw2 = self._plan_mediator.step(sess2, new_human_turn=last_turn)
+                        self._mediation_sessions[session_id] = sess3
+
+                        robot_utt2 = (raw2.get("robot_utterance") or "").strip()
+                        if robot_utt2:
+                            self._robot_say(robot_utt2)
+
+                        if getattr(sess3, "status", None) == "pending":
+                            self._start_pending_deadlines(ts)
+                            setattr(sess3, "_waiting_for_human", True)
+                            return  # do NOT finalize; we’re pending again
+
+                        # Terminal after the follow-up step
+                        self._finalize_mediation_session(
+                            session_id=session_id,
+                            session=sess3,
+                            raw_decision=raw2,
+                            ts=ts,
+                        )
+                        return
+
+                    except Exception as e:
+                        self.get_logger().warn(f"[mediation] late-turn follow-up after init failed: {e}")
+                        # Fall through to finalize using the init decision.
+
+                # No late turns => safe to finalize init decision
+                self._finalize_mediation_session(
+                    session_id=session_id,
+                    session=sess2,
+                    raw_decision=raw,
+                    ts=ts,
+                )
+                return
+
+
+        finally:
+            self._release_mediation_session_llm(session_id)
+
+
+    def _extract_plan_update_from_intent_event(self, trace_entry: dict) -> Optional[dict]:
+        """
+        If this trace_entry (speech_intent_inferred) contains agents_plan, rebuild:
+          - prefix_plan (from agents_plan)
+          - candidate_plan (optimizer extend)
+          - objective metrics (deadline risk / imbalance / suboptimality if desired)
+
+        Returns a dict you can stash into MediationTurn.meta["plan_update"], or None.
+        """
+        data = trace_entry.get("data") or {}
+
+        # 1) Parse the JSON payload produced by your intent LLM
+        plan_json = data.get("json")
+        if not isinstance(plan_json, dict):
+            jt = data.get("json_text") or data.get("text")
+            if isinstance(jt, str) and jt.strip():
+                try:
+                    plan_json = json.loads(jt)
+                except Exception:
+                    plan_json = None
+
+        if not isinstance(plan_json, dict):
+            return None
+
+        agents_plan = plan_json.get("agents_plan")
+        if not isinstance(agents_plan, dict):
+            return None
+
+        # 2) Build prefix from agents_plan
+        try:
+            new_prefix, parse_issues = build_plan_from_llm_agents_plan(
+                agents_plan,
+                allowed_agents=["robot", "human_a", "human_b"],
+                collect_issues=True,
+            )
+        except Exception:
+            return None
+
+        if not new_prefix:
+            # No robot actions -> not a meaningful plan update for mediation
+            return None
+
+        parse_issues_note = summarize_plan_parse_issues(parse_issues) if parse_issues else None
+
+        # 3) Build boxes/agents/current_time the same way you do in _handle_llm_speech_plan
+        try:
+            agents = self._build_agents_for_optimizer()
+            boxes = getattr(self, "_last_boxes_for_optimizer", None)
+            if boxes is None:
+                boxes, _ = self._build_boxes_for_optimizer(getattr(self, "_last_boxes_state", []) or [])
+        except Exception:
+            return {"prefix_plan": new_prefix, "parse_issues_note": parse_issues_note}
+
+        current_time = getattr(self, "_last_server_time", None) or time.time()
+        box_positions = getattr(self, "_last_box_positions", {}) or {}
+        agent_positions = self._snapshot_agent_positions()
+        travel_time_fn = self._make_travel_time_fn(agent_positions, box_positions)
+        horizon = self.optimizer_horizon_sec
+        weights = PlannerWeights()
+
+        impossible_note = self._summarize_impossible_actions(
+            plan=new_prefix,
+            boxes=boxes,
+            current_time=current_time,
+        )
+
+        # 4) Extend prefix -> candidate
+        try:
+            new_candidate = extend_plan_with_prefix(
+                prefix_plan=new_prefix,
+                agents=agents,
+                boxes=boxes,
+                current_time=current_time,
+                horizon=horizon,
+                travel_time_fn=travel_time_fn,
+                weights=weights,
+            )
+        except Exception:
+            new_candidate = None
+
+        out = {
+            "prefix_plan": new_prefix,
+            "candidate_plan": new_candidate,
+            "parse_issues_note": parse_issues_note,
+            "impossible_note": impossible_note,
+            "current_time": float(current_time),
+        }
+
+        # Optional: recompute objective summaries for *this updated candidate*
+        if new_candidate:
+            try:
+                xy_metrics = compute_xy_imbalance_for_plan(plan=new_candidate, boxes=boxes)
+                out["imbalance_XY"] = xy_metrics.get("imbalance")
             except Exception:
                 pass
 
-        self.get_logger().info(
-            f"[chat]  {turns}, {sess.turns}"
-        )
+            try:
+                out["deadline_risk"] = estimate_deadline_risk_for_plan(
+                    plan=new_candidate,
+                    boxes=boxes,
+                    current_time=current_time,
+                    travel_time_fn=travel_time_fn,
+                    horizon=horizon,
+                )
+            except Exception:
+                pass
 
-        # One mediator step with the last turn (ONE LLM call)
+        return out
+
+
+    def _process_mediation_events(self, session_id: str, events: List[dict]):
+        """
+        Process buffered mediation turns for a session_id.
+        Expects drained events (type="turn") with payload {"turn": MediationTurn}.
+        Routes last-call to autoresolve if (turns_used+1 >= max).
+        """
+        if not events:
+            return
+
+        if not self._try_acquire_mediation_session_llm(session_id, "turn"):
+            # Re-buffer and retry soon via dispatcher
+            with self._llm_lock:
+                b = self._llm_bucket("MEDIATION", session_id)
+                for ev in events:
+                    self._llm_buf[b].append(ev)
+                self._llm_next_run_ts[b] = time.time() + 0.02
+            return
+
         try:
-            sess, raw = self._plan_mediator.step(sess, new_human_turn=turns[-1])
-        except Exception as e:
-            self.get_logger().warn(f"[mediation] buffered step failed: {e}")
-            return
+            active_sid = getattr(self, "_active_mediation_id", None)
+            sess = self._mediation_sessions.get(session_id)
+            if active_sid != session_id or not sess:
+                return
+            if getattr(sess, "status", None) != "pending":
+                return
 
-        # Turn cap check (same logic you had)
-        turns_used = int(getattr(sess, "turns_used", 0) or 0)
-        if turns_used >= int(self.mediation_max_turns):
+            turns = []
+            last_ts = None
+            for ev in events:
+                if ev.get("type") != "turn":
+                    continue
+                t = (ev.get("payload") or {}).get("turn")
+                if t is not None:
+                    turns.append(t)
+                last_ts = ev.get("ts") or last_ts
+
+            if not turns:
+                return
+
             now_ts = float(last_ts or time.time())
-            self.get_logger().warn(
-                f"[mediation] max turns reached ({turns_used}); auto-resolving session {session_id}"
+
+            # Append all but last directly (coalesce)
+            for t in turns[:-1]:
+                try:
+                    sess.turns.append(t)
+                    sess.interaction.recent_utterances.append(t)
+                except Exception:
+                    pass
+
+            self._mediation_sessions[session_id] = sess
+
+            turns_used = int(getattr(sess, "turns_used", 0) or 0)
+            max_turns = int(getattr(self, "mediation_max_turns", 3) or 3)
+
+            # LAST-CALL policy -> autoresolve instead of another normal step
+            if (turns_used + 1) >= max_turns:
+                self.get_logger().warn(
+                    f"[mediation] last allowed call (turns_used={turns_used}, max={max_turns}); "
+                    f"routing to autoresolve for {session_id}"
+                )
+                try:
+                    setattr(sess, "_waiting_for_human", False)
+                except Exception:
+                    pass
+
+                # enqueue autoresolve (buffered)
+                self._llm_submit(
+                    channel="MEDIATION_AUTORESOLVE",
+                    key=session_id,
+                    ev_type="autoresolve",
+                    payload={"reason": "max_turns_last_call", "now_ts": now_ts},
+                    ts=now_ts,
+                )
+                return
+
+            last_turn = turns[-1]
+                        
+            try:
+                pu = (getattr(last_turn, "meta", None) or {}).get("plan_update")
+                if pu:
+                    sess = self._apply_plan_update_to_session(sess, pu)
+                    self._mediation_sessions[session_id] = sess
+            except Exception:
+                pass
+            
+            try:
+                sess2, raw = self._plan_mediator.step(sess, new_human_turn=last_turn)
+            except Exception as e:
+                self.get_logger().warn(f"[mediation] buffered step failed: {e}")
+                return
+
+            self._mediation_sessions[session_id] = sess2
+
+            robot_utt = (raw.get("robot_utterance") or "").strip()
+            if robot_utt:
+                self._robot_say(robot_utt)
+
+            if getattr(sess2, "status", None) == "pending":
+                self._start_pending_deadlines(now_ts)
+                setattr(sess2, "_waiting_for_human", True)
+            else:
+                setattr(sess2, "_waiting_for_human", False)
+
+            if getattr(sess2, "status", None) in ("accept", "reject"):
+                self._finalize_mediation_session(
+                    session_id=session_id,
+                    session=sess2,
+                    raw_decision=raw,
+                    ts=now_ts,
+                )
+
+        finally:
+            self._release_mediation_session_llm(session_id)
+
+
+    def _drain_buffered_mediation_turns(self, session_id: str) -> List[MediationTurn]:
+        """
+        Drain any queued MEDIATION turns that are waiting for this session_id.
+        This is used to avoid losing turns that arrive while MEDIATION_INIT is in-flight.
+        """
+        b = self._llm_bucket("MEDIATION", session_id)
+        turns: List[MediationTurn] = []
+
+        with self._llm_lock:
+            q = list(self._llm_buf.get(b, []))
+            if q:
+                self._llm_buf[b].clear()
+
+        for ev in q:
+            try:
+                if ev.get("type") != "turn":
+                    continue
+                t = (ev.get("payload") or {}).get("turn")
+                if t is not None:
+                    turns.append(t)
+            except Exception:
+                continue
+
+        return turns
+
+
+    def _apply_plan_update_to_session(self, sess: MediationState, plan_update: dict) -> MediationState:
+        """
+        Mutate the session so the planning_view reflects the latest human request.
+        """
+        if not isinstance(plan_update, dict):
+            return sess
+
+        committed = getattr(self, "_committed_plan", None) or {}
+
+        new_prefix = plan_update.get("prefix_plan")
+        if isinstance(new_prefix, dict) and new_prefix:
+            new_prefix_changes = self._subtract_committed_prefix_in_order_all_agents(
+                requested=new_prefix,
+                committed=committed,
+                agents=["robot", "human_a", "human_b"],
+                lookahead=12,
             )
-            self._llm_submit(
-                channel="MEDIATION_AUTORESOLVE",
-                key=sid,
-                ev_type="autoresolve",
-                payload={"reason": "turn_timeout", "now_ts": float(now_ts)},
-                ts=float(now_ts),
-            )
-            return
+
+            sess.prefix_plan = new_prefix_changes  # may become {}
 
 
-        self._mediation_sessions[session_id] = sess
 
-        robot_utt = (raw.get("robot_utterance") or "").strip()
-        if robot_utt:
-            self._robot_say(robot_utt)
+        new_candidate = plan_update.get("candidate_plan")
+        if isinstance(new_candidate, dict) and new_candidate:
+            sess.candidate_plan = new_candidate
 
-        if sess.status in ("accept", "reject"):
-            now_ts = float(last_ts or time.time())
-            self._finalize_mediation_session(
-                session_id=session_id,
-                session=sess,
-                raw_decision=raw,
-                ts=now_ts,
-            )
+        # Keep objective in sync (so mediator sees the real metrics for the updated candidate)
+        try:
+            if getattr(sess, "objective", None):
+                if "deadline_risk" in plan_update:
+                    sess.objective.deadline_risk = plan_update.get("deadline_risk")
+                if "imbalance_XY" in plan_update:
+                    sess.objective.imbalance_XY = plan_update.get("imbalance_XY")
+
+                # Also carry notes so the model can explain parse failures / impossible actions
+                notes_parts = []
+                if plan_update.get("parse_issues_note"):
+                    notes_parts.append(plan_update["parse_issues_note"])
+                if plan_update.get("impossible_note"):
+                    notes_parts.append(plan_update["impossible_note"])
+                if notes_parts:
+                    extra = "\n\n".join([p for p in notes_parts if p])
+                    prev = getattr(sess.objective, "notes", None) or ""
+                    sess.objective.notes = (prev + "\n\n" + extra).strip()
+        except Exception:
+            pass
+
+        return sess
 
 
     def _maybe_route_speech_to_mediation(self, rule: str, trace_entry: dict) -> bool:
@@ -2186,6 +3088,11 @@ class BrokerMediationMixin:
         # as a speech turn (using request_text / natural_summary).
         elif rule == "speech_intent_inferred":
             is_speech_rule = True
+
+        plan_update = None
+        if rule == "speech_intent_inferred":
+            plan_update = self._extract_plan_update_from_intent_event(trace_entry)
+
 
         if not is_speech_rule:
             return False
@@ -2223,19 +3130,29 @@ class BrokerMediationMixin:
             seen = set()
             setattr(sess, "_seen_turn_keys", seen)
         if dedup_key in seen:
-            return True
+            pass
+            #return True
         seen.add(dedup_key)
 
         self._mediation_sessions[sid] = sess  # persist mutation if you want
 
+        meta = {"ts": ts, "rule": rule}
+        if plan_update:
+            meta["plan_update"] = plan_update
+
         human_turn = MediationTurn(
             role=speaker_id,
             text=text,
-            meta={"ts": ts, "rule": rule},
+            meta=meta,
         )
 
-        # reset the “wait for next utterance” timer
-        self._bump_pending_deadline(ts)
+
+        # ✅ We got a human turn; we are no longer in 'waiting for human' mode.
+        try:
+            setattr(sess, "_waiting_for_human", False)
+        except Exception:
+            pass
+
 
 
         # Buffer the turn into the MEDIATION channel for this session.
@@ -2251,108 +3168,99 @@ class BrokerMediationMixin:
 
         return True
 
-    def _llm_worker_mediation_autoresolve(self, session_id: str):
+    def _process_mediation_autoresolve_events(self, session_id: str, events: List[dict]):
         """
-        Async autoresolve: do the LLM call in the background bucket worker,
-        then finalize. Never blocks watchdog / ROS callbacks.
+        Async autoresolve processor: performs the autoresolve LLM call and finalizes.
+        Expects drained events (type="autoresolve") payload includes {"reason","now_ts"}.
         """
-        b = self._llm_bucket("MEDIATION_AUTORESOLVE", session_id)
-
-        with self._llm_lock:
-            events = list(self._llm_buf[b])
-            self._llm_buf[b].clear()
-
         if not events:
             return
 
-        # Use the most recent autoresolve request
-        last = events[-1]
-        payload = last.get("payload") or {}
-        reason = (payload.get("reason") or "unknown")
-        now_ts = float(payload.get("now_ts") or last.get("ts") or time.time())
-
-        # Defensive: only act if still pending and active
-        sid = getattr(self, "_active_mediation_id", None)
-        sess = self._mediation_sessions.get(session_id)
-        if sid != session_id or not sess or sess.status != "pending":
+        if not self._try_acquire_mediation_session_llm(session_id, "autoresolve"):
+            with self._llm_lock:
+                b = self._llm_bucket("MEDIATION_AUTORESOLVE", session_id)
+                for ev in events:
+                    self._llm_buf[b].append(ev)
+                self._llm_next_run_ts[b] = time.time() + 0.05
             return
-
-        # NOTE: prevent duplicate autoresolves racing
-        if getattr(sess, "_autoresolving", False):
-            return
-        setattr(sess, "_autoresolving", True)
-        self._mediation_sessions[session_id] = sess
 
         try:
-            # Option A (simplest): don't change PlanMediator at all.
-            # Reuse the last normal step prompt if you have it, otherwise just call your existing method.
-            # If you DON'T have build_messages_for_autoresolve, you can just do keep_baseline fallback here.
-            try:
-                messages = self._plan_mediator.build_messages_for_autoresolve(sess, reason=reason)
-                raw = self._mediate_llm_call(messages)
-            except Exception as e:
-                self.get_logger().warn(f"[mediation] autoresolve LLM failed: {e}; falling back to keep_baseline")
-                raw = {
-                    "decision": "reject",
-                    "planner_action": {"kind": "keep_baseline", "notes": f"autoresolve fallback: {e}"},
-                    "robot_utterance": "No response in time—I'll keep the current plan for now.",
-                    "log_tags": {"strategy": "timeout_fallback", "rationale": "LLM autoresolve failed"},
-                }
+            last = events[-1]
+            payload = last.get("payload") or {}
+            reason = (payload.get("reason") or "unknown")
+            now_ts = float(payload.get("now_ts") or last.get("ts") or time.time())
 
-            raw = self._normalize_mediation_decision(raw)
+            sid = getattr(self, "_active_mediation_id", None)
+            sess = self._mediation_sessions.get(session_id)
+            if sid != session_id or not sess or sess.status != "pending":
+                return
 
-            # Force terminal
-            if (raw.get("decision") or "").strip() == "pending":
-                raw["decision"] = "reject"
-                raw["planner_action"] = {"kind": "keep_baseline", "notes": "autoresolve forced non-pending"}
-                raw["robot_utterance"] = "No response in time—I'll keep the current plan for now."
-                raw["log_tags"] = {"strategy": "timeout_forced", "rationale": "autoresolve must finalize"}
-
-            sess.status = "accept" if raw.get("decision") == "accept" else "reject"
+            if getattr(sess, "_autoresolving", False):
+                return
+            setattr(sess, "_autoresolving", True)
             self._mediation_sessions[session_id] = sess
 
-            # IMPORTANT: don't speak here if finalize() already composes a forced utterance
-            self._finalize_mediation_session(session_id=session_id, session=sess, raw_decision=raw, ts=now_ts)
+            try:
+                try:
+                    messages = self._plan_mediator.build_messages_for_autoresolve(sess, reason=reason)
+                    raw = self._mediate_llm_call(messages)
+                except Exception as e:
+                    self.get_logger().warn(f"[mediation] autoresolve LLM failed: {e}; falling back to keep_baseline")
+                    raw = {
+                        "decision": "reject",
+                        "planner_action": {"kind": "keep_baseline", "notes": f"autoresolve fallback: {e}"},
+                        "robot_utterance": "No response in time—I'll keep the current plan for now.",
+                        "log_tags": {"strategy": "timeout_fallback", "rationale": "LLM autoresolve failed"},
+                    }
+
+                raw = self._normalize_mediation_decision(raw)
+
+                if (raw.get("decision") or "").strip() == "pending":
+                    raw["decision"] = "reject"
+                    raw["planner_action"] = {"kind": "keep_baseline", "notes": "autoresolve forced non-pending"}
+                    raw["robot_utterance"] = "No response in time—I'll keep the current plan for now."
+                    raw["log_tags"] = {"strategy": "timeout_forced", "rationale": "autoresolve must finalize"}
+
+                sess.status = "accept" if raw.get("decision") == "accept" else "reject"
+                self._mediation_sessions[session_id] = sess
+
+                # finalize() will compose forced utterance if needed
+                self._finalize_mediation_session(session_id=session_id, session=sess, raw_decision=raw, ts=now_ts)
+
+            finally:
+                s2 = self._mediation_sessions.get(session_id)
+                if s2:
+                    try:
+                        setattr(s2, "_autoresolving", False)
+                    except Exception:
+                        pass
 
         finally:
-            # clear flag if session still exists
-            s2 = self._mediation_sessions.get(session_id)
-            if s2:
-                try:
-                    setattr(s2, "_autoresolving", False)
-                except Exception:
-                    pass
+            self._release_mediation_session_llm(session_id)
 
-
-    def _llm_worker_reflection(self, reflection_key: str):
-        """
-        Drain reflection triggers and run at most ONE reflection.
-        For periodic per-human reflection, key=human_id.
-        """
-        b = self._llm_bucket("REFLECTION", reflection_key)
-        with self._llm_lock:
-            events = list(self._llm_buf[b])
-            self._llm_buf[b].clear()
-
+    def _process_reflection_events(self, reflection_key: str, events: List[dict]):
         if not events:
             return
 
-        # Use the most recent trigger time
-        last_ts = None
-        mode = None
-        for ev in events:
-            mode = (ev.get("payload") or {}).get("mode") or mode
-            last_ts = ev.get("ts") or last_ts
+        last = events[-1]
+        payload = last.get("payload") or {}
+        mode = payload.get("mode") or "periodic"
+        ts = float(last.get("ts") or time.time())
 
-        ts = float(last_ts or time.time())
+        if mode == "periodic" and isinstance(reflection_key, str) and reflection_key.startswith("human_"):
+            self._run_periodic_profile_reflection_for(reflection_key, ts)
+            return
 
-        # Decide what reflection to run
-        if reflection_key.startswith("human_"):
-            # periodic per-human reflection
-            try:
-                self._run_periodic_profile_reflection_for(reflection_key, ts)
-            except Exception as e:
-                self.get_logger().warn(f"[reflection] periodic failed for {reflection_key}: {e}")
+        if mode == "mediation_session":
+            sid = payload.get("session_id")
+            sess = self._mediation_sessions.get(sid) if sid else None
+            if sess:
+                snap = copy.deepcopy(sess)
+                if self._should_run_reflection_for_session(snap):
+                    self._reflect_on_mediation_session(snap)
+                    self._reset_profile_msg_counts_for_session(snap)
+            return
+
 
 
     def _mediation_watchdog_tick(self):
@@ -2369,6 +3277,16 @@ class BrokerMediationMixin:
 
         now_ts = time.time()
 
+        # ✅ Do not trigger human-turn timeout while any mediation LLM call is running
+        if self._mediation_llm_busy.get(str(sid), False):
+            return
+
+        # ✅ Only count down when we are actually waiting for humans
+        waiting = bool(getattr(sess, "_waiting_for_human", False))
+        if not waiting:
+            return
+
+
         # Turn-wait timeout (no new utterance)
         dl = getattr(self, "_mediation_pending_deadline_ts", None)
         if dl is not None and now_ts >= float(dl):
@@ -2379,6 +3297,19 @@ class BrokerMediationMixin:
             self.get_logger().warn(
                 f"[mediation] turn timeout hit (no utterance); enqueue autoresolve {sid}"
             )
+            
+            self.get_logger().warn(f"[DEBUG] baseline_human_agreed_plan keys={list(getattr(self,'_baseline_human_agreed_plan',{}).keys())}")
+            try:
+                human_ids = getattr(sess, "human_ids", None)
+                proposer_id = (getattr(sess, "social", None) and sess.social.proposer_id) or None
+                self.get_logger().warn(f"[DEBUG] human_ids={human_ids}")
+                self.get_logger().warn(f"[DEBUG] proposer_id={proposer_id}")
+            except Exception:
+                pass
+
+            self.get_logger().warn(f"[DEBUG] chat_recent_roles={[t.get('role') for t in self._get_recent_chat_turns(6)]}")
+
+            
             self._llm_submit(
                 channel="MEDIATION_AUTORESOLVE",
                 key=sid,
