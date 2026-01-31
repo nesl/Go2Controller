@@ -263,7 +263,7 @@ class LLMPolicy(BasePolicy):
         scored.sort(key=lambda x: x[0])
         return [b for _, b in scored[:k]]
 
-    def _box_brief(self, agent: "SimHumanAgent", b: BoxSummary) -> Dict[str, Any]:
+    def _box_brief(self, agent: "SimHumanAgent", b: BoxSummary, now_sim: float) -> Dict[str, Any]:
         goal = agent.goal_property
         p_present = agent._belief_present_from_box(b, goal)
 
@@ -279,12 +279,13 @@ class LLMPolicy(BasePolicy):
             for sr in b.sense_results
         )
 
-
+        deadline_passed = float(now_sim) > float(b.deadline)
 
         return {
             "box_id": b.box_id,
             "pos": [round(b.x, 2), round(b.y, 2)],
             "deadline": round(b.deadline, 2),
+            "deadline_passed": bool(deadline_passed),
             "dist": round(agent._dist_to(b.x, b.y), 2),
             "disposed_goal": bool(b.disposed_X if goal == "X" else b.disposed_Y),
             "p_present_goal": round(float(p_present), 3),
@@ -368,7 +369,8 @@ class LLMPolicy(BasePolicy):
 
     def _user_prompt(self, agent: "SimHumanAgent", boxes: List[BoxSummary], now_sim: float) -> str:
         top = self._select_top_k_boxes(agent, boxes, agent.llm_top_k_boxes)
-        box_briefs = [self._box_brief(agent, b) for b in top]
+        box_briefs = [self._box_brief(agent, b, now_sim) for b in top]
+
 
         inbox = self._format_inbox(agent)  # implement helper below
 
@@ -596,6 +598,11 @@ class LLMPolicy(BasePolicy):
             prop = act.get("prop", None)
             requested_kind = act.get("kind", None)
 
+            # ✅ NEW: commitments should never be "dispose" by default for help
+            allowed_commitment_kinds = {"sense_self", "goto_only", "say"}
+            if requested_kind not in allowed_commitment_kinds:
+                requested_kind = "sense_self"
+
             # basic defer: wait a little before helping if LLM chose defer
             due_after = now_sim + 8.0 if decision == "defer" else now_sim
 
@@ -748,6 +755,19 @@ class LLMPolicy(BasePolicy):
             if b is None:
                 agent._complete_commitment(c, status="cancelled")
             else:
+            
+                # ✅ NEW: do not execute commitments on disposed targets
+                disposed_for_prop = (b.disposed_X if prop == "X" else b.disposed_Y)
+                if disposed_for_prop:
+                    agent._complete_commitment(c, status="done")
+                    return PolicyAction(
+                        kind="say",
+                        text=f"{agent._display_name(requester)}, box {box_id} is already disposed for {prop}.",
+                        target_speaker=requester,
+                        reason="commitment_fulfilled_already_disposed",
+                    )
+
+            
                 already_sensed = any(sr.get("status") == "completed" and sr.get("property") == prop for sr in b.sense_results)
                 if already_sensed and kind in ("sense_self", "goto_only"):
                     agent._complete_commitment(c, status="done")
@@ -918,6 +938,15 @@ class SimHumanAgent(Node):
         self.declare_parameter("llm_jitter_max_sec", 2.0)
 
         # ---------------------------
+        # Thinking simulation (delay before deciding next action)
+        # ---------------------------
+        self.declare_parameter("think_sim_enable", True)
+        self.declare_parameter("think_min_delay_sec", 10)
+        self.declare_parameter("think_max_delay_sec", 20)
+        self.declare_parameter("think_router_enable", False)  # optional: also delay in message-router decisions
+
+
+        # ---------------------------
         # Speech simulation (delay before publishing utterances)
         # ---------------------------
         self.declare_parameter("speech_sim_enable", True)
@@ -930,6 +959,12 @@ class SimHumanAgent(Node):
 
         self.declare_parameter("waiting_mode", "strict")  # strict | soft
         
+        
+        self.think_sim_enable = bool(self.get_parameter("think_sim_enable").value)
+        self.think_min_delay_sec = float(self.get_parameter("think_min_delay_sec").value)
+        self.think_max_delay_sec = float(self.get_parameter("think_max_delay_sec").value)
+        self.think_router_enable = bool(self.get_parameter("think_router_enable").value)
+
         
         self.speech_sim_enable = bool(self.get_parameter("speech_sim_enable").value)
         self.speech_rate_wpm = float(self.get_parameter("speech_rate_wpm").value)
@@ -1113,6 +1148,32 @@ class SimHumanAgent(Node):
             f"help_wait={self.help_wait_sec}s speed={self.speed_mps} timeout={self.timeout}s "
             f"llm_provider={self.llm_provider} llm_model={self.llm_model}"
         )
+
+    def _maybe_think(self, where: str = "") -> None:
+        """
+        Optional "thinking" delay before deciding what to do.
+        Sleeps in small increments so shutdown stays responsive.
+        """
+        if not getattr(self, "think_sim_enable", False):
+            return
+
+        lo = max(0.0, float(getattr(self, "think_min_delay_sec", 0.0)))
+        hi = max(lo, float(getattr(self, "think_max_delay_sec", lo)))
+
+        if hi <= 0.0:
+            return
+
+        dt = random.uniform(lo, hi)
+
+        # Log sparingly (you can remove if too chatty)
+        self._log("THINK", f"{where} pause {dt:.2f}s")
+
+        end = time.time() + dt
+        while time.time() < end:
+            if self._stop:
+                break
+            time.sleep(0.05)
+
 
     def _request_preempt(self, why: str = "") -> None:
         self._log("PREEMPT", why)
@@ -2330,6 +2391,16 @@ class SimHumanAgent(Node):
                 sr.get("status") == "completed" and sr.get("property") == action.prop
                 for sr in box.sense_results
             )
+            
+            
+            # Disallow sensing if the target property is already disposed
+            if self._is_disposed_for_goal(box, action.prop):
+                self._log("MEM", f"skip sense_self box={box.box_id} prop={action.prop} (already disposed)")
+                self._complete_active_commitment_if_any(status="done")
+                self._mark_done(box.box_id, action.prop, why="skip_sense_disposed")
+                return
+
+            
             if already_by_anyone:
                 self._log("MEM", f"skip self_sense box={box.box_id} prop={action.prop} (already sensed by someone)")
                 st["self_sensed"] = True
@@ -2380,6 +2451,14 @@ class SimHumanAgent(Node):
 
         if action.kind == "dispose":
             assert action.prop is not None
+
+            if self._is_disposed_for_goal(box, action.prop):
+                self._log("MEM", f"skip dispose box={box.box_id} prop={action.prop} (already disposed)")
+                self._complete_active_commitment_if_any(status="done")
+                self._mark_done(box.box_id, action.prop, why="already_disposed")
+                return
+
+            
             self._set_busy(True)
             try:
                 self._travel_to(box)
@@ -2445,8 +2524,10 @@ class SimHumanAgent(Node):
 
 
         # then normal planning action
+        self._maybe_think(where="action_decide")
         action = self.policy.decide(self, boxes, now_sim)
         self._execute(action, box_lookup, now_sim)
+
 
 
     def _tick(self) -> None:
@@ -2547,9 +2628,10 @@ class SimHumanAgent(Node):
                 evt["target_speaker"] = tgt
 
                 if self.policy_type == "llm":
-                    # IMPORTANT: decide_on_message should schedule commitments and publish replies.
-                    # It may return a PolicyAction; we IGNORE physical actions here.
+                    if self.think_router_enable:
+                        self._maybe_think(where="router_decide_on_message")
                     _ = self.llm_policy.decide_on_message(self, boxes, now_sim, evt)
+
 
                 handled += 1
 

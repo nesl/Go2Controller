@@ -47,6 +47,9 @@ from .skills_engine_v2 import (  # adjust to ".skills_engine_v2" if inside a pac
 )
 
 
+YELLOW = "\033[93m"
+RESET = "\033[0m"
+
 # ───────────────────────────────────────────────────────────────────────────────
 #                            Low-level helpers (quaternion)
 # ───────────────────────────────────────────────────────────────────────────────
@@ -873,7 +876,7 @@ class SkillsAgent(Node):
             self.get_logger().warn("[tts_immediate] empty text, ignoring.")
             return
 
-        self.get_logger().info(f"[tts_immediate] saying: {text!r}")
+        self.get_logger().info(f"{YELLOW}[tts_immediate] saying: {text!r}{RESET}")
         # This uses the existing normalization + publish to /tts
         self.say(text, True)
 

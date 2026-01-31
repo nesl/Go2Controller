@@ -322,7 +322,6 @@ class PlanMediator:
 
         # Apply plan deltas if provided
         candidate_delta = planner_action.get("candidate_plan_delta")
-        candidate_delta = planner_action.get("candidate_plan_delta")
         if candidate_delta:
             state.candidate_plan = self._apply_candidate_delta(
                 state=state,
@@ -446,6 +445,62 @@ class PlanMediator:
 
     '''
     
+    def _summarize_committed_plan_with_proposer(
+        self,
+        plan: Plan,
+        provenance: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        default_proposer_id: str = "optimizer",
+    ) -> Dict[str, Any]:
+        """
+        Summarize the committed plan for the LLM, adding proposer_id per action
+        using baseline_provenance when available.
+
+        baseline_provenance format you already use:
+          provenance[agent_id] = [
+            {"box_id": 2, "property": "Y", "kind": "sense", "origin": "...", "proposed_by": "..."},
+            ...
+          ]
+        """
+        prov = provenance or {}
+        summary: Dict[str, Any] = {}
+
+        for aid, actions in (plan or {}).items():
+            prov_actions = prov.get(aid) or []
+
+            # (box_id, property, kind) -> proposer_id
+            proposer_map: Dict[Tuple[int, str, str], str] = {}
+            for p in prov_actions:
+                try:
+                    k = (int(p.get("box_id")), p.get("property"), p.get("kind"))
+                except Exception:
+                    continue
+                if k[1] not in ("X", "Y") or k[2] not in ("sense", "dispose"):
+                    continue
+
+                proposed_by = p.get("proposed_by")
+                origin = (p.get("origin") or "").strip()
+
+                # Prefer explicit proposer; otherwise bucket to optimizer/system
+                proposer_id = proposed_by or (default_proposer_id if origin != "human" else "human")
+                proposer_map[k] = str(proposer_id)
+
+            out_actions = []
+            for (box_id, prop, kind) in actions:
+                k = (int(box_id), prop, kind)
+                out_actions.append(
+                    {
+                        "box_id": int(box_id),
+                        "property": prop,
+                        "kind": kind,
+                        "proposer_id": proposer_map.get(k, default_proposer_id),
+                    }
+                )
+
+            summary[aid] = out_actions
+
+        return summary
+
+    
     def _build_planning_view(self, state: MediationState) -> Dict[str, Any]:
         """
         New planning view (committed-plan based):
@@ -458,7 +513,11 @@ class PlanMediator:
         """
 
         # ✅ committed plan is the single baseline
-        committed_plan = self._summarize_plan(state.baseline_plan)
+        committed_plan = self._summarize_committed_plan_with_proposer(
+            state.baseline_plan,
+            provenance=state.baseline_provenance,
+            default_proposer_id="robot",
+        )
 
         # ✅ explicit human request in this session
         human_proposed_changes = self._summarize_plan(state.prefix_plan or {})
@@ -471,9 +530,14 @@ class PlanMediator:
 
         optimizer_suggestions_for_changes: Dict[str, Any] = {}
         for aid, actions in (candidate or {}).items():
-            sugg = [a for a in actions if a.get("source") == "optimizer_completion"]
+            sugg = [
+                {k: v for k, v in a.items() if k != "source"}
+                for a in actions
+                if a.get("source") == "optimizer_completion"
+            ]
             if sugg:
-                optimizer_suggestions_for_changes[aid] = sugg[0]
+                optimizer_suggestions_for_changes[aid] = sugg
+
 
         planning_view = {
             "committed_plan": committed_plan,
@@ -486,6 +550,9 @@ class PlanMediator:
         conflicts = self._detect_committed_conflicts(planning_view=planning_view, proposer_id=proposer)
         if conflicts:
             planning_view["direct_conflicts_with_committed_plan"] = conflicts
+
+        if not planning_view["human_proposed_changes"]:
+            planning_view["human_proposed_changes"] = "keep committed plan as it is, no changes"
 
         return planning_view
 

@@ -44,6 +44,10 @@ from .plan_mediator import (
     MediationTurn,
 )
 
+RED = "\033[31m"
+RESET = "\033[0m"
+CYAN = "\033[96m"
+
 
 # LLM reply must be STRICT JSON like: {"sql":"SELECT ...", "params": {...}, "purpose":"..."}
 LLM_SQL_SCHEMA = {
@@ -157,7 +161,7 @@ class BrokerNode(Node, BrokerMediationMixin):
         self.declare_parameter('iteration_limit', 2)
         self.declare_parameter('pull_limit', 2)
 
-        self.declare_parameter("plan_accept_policy", "normal")
+        self.declare_parameter("plan_accept_policy", "always_accept") #"normal")
 
         self.declare_parameter('sim_mode', False)
 
@@ -779,6 +783,129 @@ class BrokerNode(Node, BrokerMediationMixin):
         return f"{kind} box {box_id} ({prop})"
 
 
+    def _server_action_fulfilled(
+        self,
+        boxes_state: list,
+        *,
+        agent_id: Optional[str],
+        box_id: int,
+        prop: str,
+        kind: str,
+    ) -> bool:
+        """
+        Source of truth: /boxes/state.
+
+        - dispose: fulfilled if disposed_X / disposed_Y is true (agent_id irrelevant).
+        - sense: fulfilled if there exists a sense_results entry with
+                 status='completed', matching property, and (if agent_id provided) matching agent_id.
+        """
+        try:
+            box_id = int(box_id)
+        except Exception:
+            return False
+
+        prop = (prop or "").strip()
+        kind = (kind or "").strip()
+
+        if not isinstance(boxes_state, list):
+            return False
+
+        b = None
+        for bb in boxes_state:
+            try:
+                if int(bb.get("box_id")) == box_id:
+                    b = bb
+                    break
+            except Exception:
+                continue
+
+        if not isinstance(b, dict):
+            return False
+
+        if kind == "dispose":
+            if prop == "X":
+                return bool(b.get("disposed_X", False))
+            if prop == "Y":
+                return bool(b.get("disposed_Y", False))
+            # if prop unknown, treat any disposal as fulfilling something (optional)
+            return bool(b.get("disposed_X", False) or b.get("disposed_Y", False))
+
+        if kind == "sense":
+            srs = b.get("sense_results") or []
+            if not isinstance(srs, list):
+                return False
+
+            for sr in srs:
+                if not isinstance(sr, dict):
+                    continue
+                if sr.get("status") != "completed":
+                    continue
+                if sr.get("property") != prop:
+                    continue
+                if agent_id is not None:
+                    if str(sr.get("agent_id") or "") != str(agent_id):
+                        continue
+                return True
+
+        return False
+
+
+    def _prune_committed_plan_from_server_state(
+        self,
+        boxes_state: list,
+    ) -> bool:
+        """
+        Remove committed actions that are already fulfilled according to /boxes/state.
+
+        Returns True if the committed plan changed.
+        """
+        committed = getattr(self, "_committed_plan", None) or {}
+        if not committed:
+            return False
+
+        changed = False
+        new_plan: Plan = {}
+
+        for aid, actions in committed.items():
+            if not actions:
+                continue
+
+            kept = []
+            for a in actions:
+                # committed plan is (box_id, prop, kind) tuples in your system
+                try:
+                    box_id, prop, kind = a
+                except Exception:
+                    # keep malformed entries (or drop—your choice)
+                    kept.append(a)
+                    continue
+
+                done = self._server_action_fulfilled(
+                    boxes_state,
+                    agent_id=str(aid),
+                    box_id=int(box_id),
+                    prop=str(prop),
+                    kind=str(kind),
+                )
+
+                if done:
+                    changed = True
+                else:
+                    kept.append(a)
+
+            if kept:
+                new_plan[aid] = kept
+
+        if changed:
+            self._committed_plan = new_plan
+            self._has_committed_plan = bool(new_plan)
+
+            # Keep last_plan coherent if you rely on it downstream
+            self._last_plan = new_plan
+
+        return changed
+
+
     def _announce_idle_plan(self, plan: dict, current_time: float):
         """
         Called after a trigger_idle optimizer publish.
@@ -929,10 +1056,10 @@ class BrokerNode(Node, BrokerMediationMixin):
 
     
         if trace_entry and "data" in trace_entry and "request_text" in trace_entry["data"]:
-            info_utterance = "[on_basic_event] human utterance "
+            info_utterance = f"{RED}[on_basic_event] human utterance "
             if "speaker_id" in trace_entry["data"]:
                 info_utterance += f'spoken by {trace_entry["data"]["speaker_id"]} '
-            info_utterance += f'-> {trace_entry["data"]["request_text"]}'
+            info_utterance += f'-> {trace_entry["data"]["request_text"]}{RESET}'
             self.get_logger().info(info_utterance)
 
         self._event_trace.append(trace_entry)
@@ -2489,7 +2616,7 @@ class BrokerNode(Node, BrokerMediationMixin):
                 obj = self._swap_json(obj_display, rev)
 
                 self.get_logger().info(
-                    f"\n=== LLM RAW RESPONSE ({schema_name}) ===\n{content}\nLatency: {dt_ms}\n"
+                    f"\n=== LLM RAW RESPONSE ({schema_name}) ===\n{CYAN}{content}{RESET}\nLatency: {dt_ms}\n"
                 )
 
                 validate(instance=obj, schema=used_schema)
@@ -2546,44 +2673,46 @@ class BrokerNode(Node, BrokerMediationMixin):
 
 
     def _optimizer_tick(self):
-        """
-        Periodic tick: pull /boxes/state and /time from the box server.
-
-        If the world state fingerprint changed since last tick, recompute plan.
-        """
         if self._optimizer_running or not self.optimizer_enabled:
             return
 
+        # Always poll server state (used for pruning even if mediation is active)
+        try:
+            base = self.optimizer_base_url.rstrip("/")
+            r_state = requests.get(base + "/boxes/state", timeout=self.req_timeout)
+            r_time  = requests.get(base + "/time", timeout=self.req_timeout)
+            if r_state.status_code != 200 or r_time.status_code != 200:
+                self.get_logger().warn(
+                    f"[optimizer] box server unavailable: state={r_state.status_code}, time={r_time.status_code}"
+                )
+                return
+            boxes_state = r_state.json()
+            current_time = float((r_time.json() or {}).get("server_time", 0.0))
+            self._last_server_time = current_time
+            self._last_boxes_state = boxes_state
+        except Exception as e:
+            self.get_logger().warn(f"[optimizer] failed to contact box server: {e}")
+            return
 
-        # NEW: don't replan while a human–robot mediation is underway
+        # ✅ NEW: prune committed plan based on server truth
+        try:
+            if self._prune_committed_plan_from_server_state(boxes_state):
+                # publish updated remaining committed plan (no replan!)
+                try:
+                    box_positions = getattr(self, "_last_box_positions", {}) or {}
+                    self._publish_optimizer_plan(self._committed_plan, current_time, box_positions)
+                    self.get_logger().info("[commit] pruned fulfilled actions from committed plan and republished.")
+                except Exception as e:
+                    self.get_logger().warn(f"[commit] republish after prune failed: {e}")
+        except Exception as e:
+            self.get_logger().warn(f"[commit] prune failed: {e}")
+
+        # If mediation is in progress, stop here (no optimizer replanning)
         if self._mediation_in_progress():
             self.get_logger().info("[optimizer] mediation in progress; skipping replanning")
             return
 
-        try:
-            base = self.optimizer_base_url.rstrip("/")
-            url_state = base + "/boxes/state"
-            url_time  = base + "/time"
 
-            r_state = requests.get(url_state, timeout=self.req_timeout)
-            r_time  = requests.get(url_time, timeout=self.req_timeout)
-
-            if r_state.status_code != 200 or r_time.status_code != 200:
-                self.get_logger().warn(
-                    f"[optimizer] box server unavailable: "
-                    f"state={r_state.status_code}, time={r_time.status_code}"
-                )
-                return
-
-            boxes_state = r_state.json()   # list[BoxState-like dicts]
-            time_resp   = r_time.json()    # {"server_time": float}
-            current_time = float(time_resp.get("server_time", 0.0))
-            self._last_server_time = current_time
-
-
-        except Exception as e:
-            self.get_logger().warn(f"[optimizer] failed to contact box server: {e}")
-            return
 
         # Compute a cheap fingerprint of the *world state* that is
         # insensitive to time (server_time, deadlines).

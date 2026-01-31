@@ -126,9 +126,9 @@ rules:
     type: composite
     expr: >
       exists('skill_done_any', 86400000) and
-      not exists('skill_done_any', 30000)
-      and not exists('skill_started_any', 30000)
-      and not exists('stt_processing_any', 30000)
+      not exists('skill_done_any', 10000)
+      and not exists('skill_started_any', 10000)
+      and not exists('stt_processing_any', 10000)
       
 
   # in rules_init.yaml or dynamic rules
