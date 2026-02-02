@@ -93,6 +93,7 @@ class ScriptedHelpThenDisposePolicy(BasePolicy):
 
         # Build candidate list with scores
         best: Optional[Tuple[float, BoxSummary, float]] = None  # (score, box, p_present)
+
         for b in boxes:
             if agent._is_done_or_abandoned(b.box_id, goal):
                 continue
@@ -252,6 +253,7 @@ class LLMPolicy(BasePolicy):
 
     def _select_top_k_boxes(self, agent: "SimHumanAgent", boxes: List[BoxSummary], k: int) -> List[BoxSummary]:
         scored: List[Tuple[float, BoxSummary]] = []
+        #print(f'{boxes}, {k}', flush=True)
         for b in boxes:
             if agent._is_disposed_for_goal(b, agent.goal_property):
                 continue
@@ -922,7 +924,7 @@ class SimHumanAgent(Node):
         self.declare_parameter("llm_model", "gpt-4.1-mini")
         self.declare_parameter("llm_temperature", 0.2)
         self.declare_parameter("llm_max_tokens", 250)
-        self.declare_parameter("llm_top_k_boxes", 6)
+        self.declare_parameter("llm_top_k_boxes", 100)
         self.declare_parameter("llm_timeout_sec", 30.0)
 
         # human model traits (LLM prompt conditioning)
@@ -1277,7 +1279,7 @@ class SimHumanAgent(Node):
         return self._waiting_help_matches(box_id, prop) and self._waiting_help_active(now_sim)
 
 
-    def _dbg_llm(self, tag: str, txt: str, max_chars: int = 4000) -> None:
+    def _dbg_llm(self, tag: str, txt: str, max_chars: int = 100000) -> None:
         # keep logs readable
         s = txt if len(txt) <= max_chars else (txt[:max_chars] + f"...[trunc {len(txt)-max_chars} chars]")
         self._log("LLM_PROMPT", f"{tag}={s}")
@@ -1423,6 +1425,7 @@ class SimHumanAgent(Node):
         # urgency for OUR goal (if we're near missing a deadline, help less)
         # quick proxy: best candidate deadline for our goal minus now
         slack = 9999.0
+        
         for b in boxes:
             if self._is_done_or_abandoned(b.box_id, self.goal_property):
                 continue
@@ -2510,6 +2513,16 @@ class SimHumanAgent(Node):
 
         boxes = self._boxes_state()
         box_lookup = {b.box_id: b for b in boxes}
+
+        # ✅ SHUTDOWN: all deadlines passed
+        if boxes and all(float(now_sim) > float(b.deadline) for b in boxes):
+            self._request_shutdown_with_summary(
+                now_sim=now_sim,
+                time_limit=time_limit,
+                why="all_box_deadlines_passed",
+            )
+            return
+
 
         # expire waiting if time passed
         if self.plan_state.get("phase") == "waiting_help":

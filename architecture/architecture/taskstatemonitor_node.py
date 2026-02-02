@@ -30,6 +30,8 @@ from .optimizer_client import (
     Plan,
     PlannerWeights,
     extend_plan_with_prefix,
+    p_present_from_sense_results_fused,
+    info_level_from_p
 )
 
 from .broker_mediation import BrokerMediationMixin
@@ -137,7 +139,7 @@ class BrokerNode(Node, BrokerMediationMixin):
         # ---------- Optimizer / planner integration ----------
         self.declare_parameter("optimizer_enabled", True)
         self.declare_parameter("optimizer_base_url", "http://172.17.40.64:8080")
-        self.declare_parameter("optimizer_horizon_sec", 60.0)
+        self.declare_parameter("optimizer_horizon_sec", 120.0)
 
         # Time budgets per agent for this planning horizon (seconds)
         self.declare_parameter("optimizer_time_robot", 60.0)
@@ -161,7 +163,7 @@ class BrokerNode(Node, BrokerMediationMixin):
         self.declare_parameter('iteration_limit', 2)
         self.declare_parameter('pull_limit', 2)
 
-        self.declare_parameter("plan_accept_policy", "always_accept") #"normal")
+        self.declare_parameter("plan_accept_policy", "normal") #"normal")
 
         self.declare_parameter('sim_mode', False)
 
@@ -2803,6 +2805,10 @@ class BrokerNode(Node, BrokerMediationMixin):
             agent_positions = self._snapshot_agent_positions()
             travel_time_fn = self._make_travel_time_fn(agent_positions, box_positions)
 
+
+
+
+
             plan = plan_assignments_gurobi(
                 agents=agents,
                 boxes=boxes,
@@ -3108,6 +3114,13 @@ class BrokerNode(Node, BrokerMediationMixin):
             info_X = min(1.0, 0.3 * count_X)
             info_Y = min(1.0, 0.3 * count_Y)
 
+
+            pX = p_present_from_sense_results_fused(sense_results, "X", prior=0.5)
+            pY = p_present_from_sense_results_fused(sense_results, "Y", prior=0.5)
+            infoX = info_level_from_p(pX)
+            infoY = info_level_from_p(pY)
+
+
             box_info = BoxInfo(
                 box_id=box_id,
                 deadline=deadline,
@@ -3115,12 +3128,12 @@ class BrokerNode(Node, BrokerMediationMixin):
                 sense_time_Y=sense_time_Y,
                 dispose_time_X=dispose_time_X,
                 dispose_time_Y=dispose_time_Y,
-                p_true_X=p_true_X,
-                p_true_Y=p_true_Y,
+                p_true_X=float(pX),
+                p_true_Y=float(pY),
                 disposed_X=disposed_X,
                 disposed_Y=disposed_Y,
-                info_X=info_X,
-                info_Y=info_Y,
+                info_X=float(infoX),
+                info_Y=float(infoY),
                 already_sensed={
                     **already_sensed,
                     "__any__": already_sensed_any,   # << add this

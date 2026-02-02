@@ -10,7 +10,7 @@ sim_human_a:
     llm_model: "gpt-4.1-mini"
     llm_temperature: 0.2
     llm_max_tokens: 250
-    llm_top_k_boxes: 6
+    llm_top_k_boxes: 100
     llm_timeout_sec: 30.0
 
     # ✅ ROS2-safe: JSON strings (NOT nested YAML dict lists)
@@ -50,7 +50,7 @@ sim_human_b:
     llm_model: "gpt-4.1-mini"
     llm_temperature: 0.2
     llm_max_tokens: 250
-    llm_top_k_boxes: 6
+    llm_top_k_boxes: 100
     llm_timeout_sec: 30.0
 
     humans_json: >

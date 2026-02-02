@@ -45,6 +45,7 @@ from gurobipy import GRB
 import copy
 
 from gurobipy import quicksum
+import math
 
 Property = Literal["X", "Y"]
 TravelTimeFn = Callable[[str, int], float]  # (agent_id, box_id) -> seconds
@@ -54,6 +55,12 @@ TravelTimeFn = Callable[[str, int], float]  # (agent_id, box_id) -> seconds
 #     "human_a": [...],
 #     "human_b": [...], ... }
 Plan = Dict[str, List[Tuple[int, Property, str]]]
+
+DEBUG_MILP = True
+
+def dbg(msg: str):
+    if DEBUG_MILP:
+        print(f"[MILP-DBG] {msg}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +89,7 @@ class PlannerWeights:
 
     # deadline / risk aversion
     lambda_deadline_risk: float = 0.0  # extra penalty for disposals close to / past deadline
+    lambda_sense_slack: float = 0.001  # small like 0.001
 
 
 @dataclass
@@ -223,6 +231,48 @@ class PlanParseIssue:
     problem: str
 
 
+def clamp(p: float, lo: float = 1e-6, hi: float = 1.0 - 1e-6) -> float:
+    return max(lo, min(hi, float(p)))
+
+def _sr_status(sr: dict) -> str:
+    # server records imply completion; accept both styles
+    return sr.get("status") or ("completed" if "completed_at" in sr else "")
+
+def _sr_prop(sr: dict) -> str:
+    return sr.get("property") or sr.get("prop")
+
+def p_present_from_sense_results_fused(sense_results: List[dict], prop: Property, prior: float = 0.5) -> float:
+    prior = clamp(prior)
+    L = math.log(prior / (1.0 - prior))
+
+    for sr in sense_results or []:
+        if _sr_status(sr) != "completed":
+            continue
+        if _sr_prop(sr) != prop:
+            continue
+
+        detected = sr.get("detected", None)
+        prob = sr.get("probability", None)
+        if detected is None or not isinstance(prob, (int, float)):
+            continue
+
+        q = clamp(float(prob), 1e-4, 1.0 - 1e-4)
+        p_meas = q if bool(detected) else (1.0 - q)
+        p_meas = clamp(p_meas, 1e-4, 1.0 - 1e-4)
+
+        L += math.log(p_meas / (1.0 - p_meas))
+
+    p = 1.0 / (1.0 + math.exp(-L))
+    return clamp(p, 0.0, 1.0)
+
+
+def info_level_from_p(p_present: float) -> float:
+    p = clamp(p_present)
+    conf = max(p, 1.0 - p)       # [0.5, 1.0]
+    info = (conf - 0.5) / 0.5    # [0, 1]
+    return max(0.0, min(1.0, info))
+
+
 # ---------------------------------------------------------------------------
 # Main planner
 # ---------------------------------------------------------------------------
@@ -263,6 +313,13 @@ def plan_assignments_gurobi(
     if weights is None:
         weights = PlannerWeights()
 
+
+    for b in boxes:
+        dbg(f"BOX {b.box_id}: now={current_time:.2f} deadline={b.deadline:.2f} "
+            f"infoX={b.info_X:.3f} infoY={b.info_Y:.3f} "
+            f"disposedX={b.disposed_X} disposedY={b.disposed_Y}")
+
+
     info_threshold_for_dispose = weights.info_threshold_for_dispose
     reward_correct_X = weights.reward_correct_X
     reward_correct_Y = weights.reward_correct_Y
@@ -295,8 +352,15 @@ def plan_assignments_gurobi(
     d_vars: Dict[Tuple[str, int, Property], gp.Var] = {}
 
 
+
     for a in agents:
         for b in boxes:
+        
+            # Domain semantics: disposing for ANY property removes the object
+            if b.disposed_X or b.disposed_Y:
+                continue
+
+        
             for p in props:
 
                 # Skip properties already successfully disposed
@@ -339,10 +403,39 @@ def plan_assignments_gurobi(
                     base_disp_time = b.dispose_time_Y
 
                 if info_level < info_threshold_for_dispose:
+                    '''
+                    dbg(
+                        f"NO d_var: aid={a.agent_id} box={b.box_id} prop={p} "
+                        f"info={info_level:.3f} < thr={info_threshold_for_dispose:.3f}"
+                    )
+                    '''
                     continue
+
 
                 travel = travel_time_fn(a.agent_id, b.box_id)
                 total_disp_time = base_disp_time + travel
+
+                
+                if total_disp_time > horizon:
+                    '''
+                    dbg(
+                        f"NO d_var: aid={a.agent_id} box={b.box_id} prop={p} "
+                        f"disp_t={total_disp_time:.2f} > horizon={horizon:.2f}"
+                    )
+                    '''
+                    continue
+
+                if current_time + total_disp_time > b.deadline:
+                    '''
+                    dbg(
+                        f"NO d_var: aid={a.agent_id} box={b.box_id} prop={p} "
+                        f"finish={current_time+total_disp_time:.2f} > deadline={b.deadline:.2f} "
+                        f"(now={current_time:.2f} disp_t={total_disp_time:.2f})"
+                    )
+                    '''
+                    continue
+
+
 
                 # Must fit within horizon AND deadline
                 if (
@@ -358,20 +451,20 @@ def plan_assignments_gurobi(
     # Constraints
     # -----------------------------------------------------------------------
     BIG_M = 1000.0
-    # (1) At most one disposal for each (box, property)
+    # (1) At most one disposal per BOX total (object removed regardless of property)
     for b in boxes:
-        for p in props:
-            vars_bp = [
-                v
-                for (aid, bid, pp), v in d_vars.items()
-                if bid == b.box_id and pp == p
-            ]
-            if vars_bp:
-                model.addConstr(
-                    gp.quicksum(vars_bp) <= 1,
-                    name=f"one_disp_box{b.box_id}_{p}",
-                )
+        dvs_b = [v for (aid, bid, _pp), v in d_vars.items() if bid == b.box_id]
+        if dvs_b:
+            model.addConstr(
+                gp.quicksum(dvs_b) <= 1,
+                name=f"one_disp_box{b.box_id}",
+            )
 
+
+    dbg("=== DISPOSAL VARS (created) ===")
+    for (aid, bid, p), v in d_vars.items():
+        if bid == 2:
+            dbg(f"created d_var for aid={aid} box={bid} prop={p}")
 
 
     # -----------------------------------------------------------------------
@@ -414,34 +507,25 @@ def plan_assignments_gurobi(
 
 
 
-    # Indicator: did we dispose (box,prop) in this solve?
-    y_disp: Dict[Tuple[int, Property], gp.Var] = {}
+    # (1b) If we dispose a box in this solve, don't sense ANY prop for that box in this solve
+    y_disp: Dict[int, gp.Var] = {}
     for b in boxes:
-        for p in props:
-            y_disp[(b.box_id, p)] = model.addVar(vtype=GRB.BINARY, name=f"y_disp_{b.box_id}_{p}")
+        y_disp[b.box_id] = model.addVar(vtype=GRB.BINARY, name=f"y_disp_{b.box_id}")
 
-    # Link y_disp to disposal vars (you already have sum(d_vars) <= 1 per box/prop)
     for b in boxes:
-        for p in props:
-            disp_bp = [
-                v for (aid, bid, pp), v in d_vars.items()
-                if bid == b.box_id and pp == p
-            ]
-            if disp_bp:
-                model.addConstr(
-                    gp.quicksum(disp_bp) == y_disp[(b.box_id, p)],
-                    name=f"link_y_disp_{b.box_id}_{p}",
-                )
-            else:
-                model.addConstr(
-                    y_disp[(b.box_id, p)] == 0,
-                    name=f"link_y_disp_zero_{b.box_id}_{p}",
-                )
+        dvs_b = [v for (aid, bid, _pp), v in d_vars.items() if bid == b.box_id]
+        if dvs_b:
+            # since we already constrain sum(dvs_b) <= 1, equality is safe here
+            model.addConstr(
+                gp.quicksum(dvs_b) == y_disp[b.box_id],
+                name=f"link_y_disp_{b.box_id}",
+            )
+        else:
+            model.addConstr(y_disp[b.box_id] == 0, name=f"link_y_disp_zero_{b.box_id}")
 
-    # Gate sensing: if y_disp==1 then every sense var for (box,prop) must be 0
     for (aid, bid, p), s_var in s_vars.items():
         model.addConstr(
-            s_var <= 1 - y_disp[(bid, p)],
+            s_var <= 1 - y_disp[bid],
             name=f"no_sense_if_disp_{aid}_{bid}_{p}",
         )
 
@@ -491,6 +575,7 @@ def plan_assignments_gurobi(
                 gp.quicksum(disp_vars_a) <= BIG_M * z_dispose[a.agent_id],
                 name=f"disp_role_{a.agent_id}",
             )
+
 
     # -----------------------------------------------------------------------
     # Objective: expected correct disposals + info gain + style terms
@@ -550,6 +635,18 @@ def plan_assignments_gurobi(
 
         total_reward += weight_info * info_gain * s_var
 
+        if weights.lambda_sense_slack > 0.0 and b.deadline is not None:
+            travel = travel_time_fn(aid, bid)
+            base_sense_time = b.sense_time_X if p == "X" else b.sense_time_Y
+            finish_time = current_time + base_sense_time + travel
+            slack = float(b.deadline) - float(finish_time)
+
+            # Penalty for spending effort on boxes with lots of slack (normalized)
+            # Encourages prioritizing near-deadline sensing.
+            slack_norm = max(0.0, slack) / max(1.0, float(horizon))
+            total_reward -= weights.lambda_sense_slack * slack_norm * s_var
+
+
         if weights.prefer_exploration != 0.0:
             total_reward += weights.prefer_exploration * s_var
 
@@ -598,10 +695,18 @@ def plan_assignments_gurobi(
 
     model.setObjective(total_reward, GRB.MAXIMIZE)
 
+    dbg(f"counts: s_vars={len(s_vars)} d_vars={len(d_vars)}")
+
     # -----------------------------------------------------------------------
     # Solve and extract solution
     # -----------------------------------------------------------------------
     model.optimize()
+
+    dbg("=== DISPOSAL VARS (solution values) ===")
+    for (aid, bid, p), v in d_vars.items():
+        if bid == 2:
+            dbg(f" X={v.X:.3f} (aid={aid} box={bid} prop={p})")
+
 
     actions_by_agent: Plan = {}
 
@@ -784,22 +889,21 @@ def score_plan_objective(
     plan: Plan,
     agents: List[AgentState],
     boxes: List[BoxInfo],
+    travel_time_fn: TravelTimeFn,
+    *,
+    current_time: float,
+    horizon: float,
     weights: PlannerWeights | None = None,
 ) -> float:
     """
-    Compute a scalar score for a given plan using a simplified version of the
-    MILP objective:
+    Scalar score for a plan (no MILP solve). Includes:
+      - expected correct disposals
+      - info gain from sensing
+      - exploration bonus
+      - X/Y balance penalty
+      - OPTIONAL: sensing slack shaping (deadline-aware sensing preference)
 
-        total_reward
-          = expected correct disposals (X/Y)
-          + weight_info * info_gain_from_sensing
-          + prefer_exploration * (# senses)
-          - lambda_balance * |totalX - totalY|
-
-    This does NOT re-solve the MILP; it just evaluates the plan.
-    Time/horizon constraints are assumed to have been respected upstream.
-    Style terms that depend on detailed timing (fairness, load, deadline risk)
-    are not included here.
+    Note: This is a heuristic evaluator; it does not simulate full sequencing.
     """
     if weights is None:
         weights = PlannerWeights()
@@ -809,6 +913,7 @@ def score_plan_objective(
     weight_info = weights.weight_info
     lambda_balance = weights.lambda_balance
     prefer_exploration = weights.prefer_exploration
+    lambda_sense_slack = getattr(weights, "lambda_sense_slack", 0.0)
 
     agents_by_id = {a.agent_id: a for a in agents}
     box_by_id = {b.box_id: b for b in boxes}
@@ -823,37 +928,54 @@ def score_plan_objective(
             continue
 
         for (box_id, prop, kind) in actions:
-            b = box_by_id.get(box_id)
+            b = box_by_id.get(int(box_id))
             if b is None:
                 continue
 
             if kind == "dispose":
                 if prop == "X":
-                    p_true = b.p_true_X
+                    p_true = float(b.p_true_X)
                     totalX += p_true
                     total_reward += reward_correct_X * p_true
                 else:
-                    p_true = b.p_true_Y
+                    p_true = float(b.p_true_Y)
                     totalY += p_true
                     total_reward += reward_correct_Y * p_true
 
             elif kind == "sense":
                 if prop == "X":
-                    p_true = b.p_true_X
-                    info_level = b.info_X
-                    agent_quality = max(a.detect_present_X - a.detect_absent_X, 0.0)
+                    p_true = float(b.p_true_X)
+                    info_level = float(b.info_X)
+                    agent_quality = max(float(a.detect_present_X) - float(a.detect_absent_X), 0.0)
+                    base_sense_time = float(b.sense_time_X)
                 else:
-                    p_true = b.p_true_Y
-                    info_level = b.info_Y
-                    agent_quality = max(a.detect_present_Y - a.detect_absent_Y, 0.0)
+                    p_true = float(b.p_true_Y)
+                    info_level = float(b.info_Y)
+                    agent_quality = max(float(a.detect_present_Y) - float(a.detect_absent_Y), 0.0)
+                    base_sense_time = float(b.sense_time_Y)
 
                 entropy_like = 4.0 * p_true * (1.0 - p_true)
                 base_info_gain = (1.0 - info_level) * entropy_like
                 info_gain = agent_quality * base_info_gain
 
                 total_reward += weight_info * info_gain
+
+                # exploration bonus
                 if prefer_exploration != 0.0:
                     total_reward += prefer_exploration
+
+                # --- sensing slack shaping (deadline-aware) ---
+                # This mirrors the MILP term conceptually, but is purely numeric.
+                if lambda_sense_slack > 0.0 and getattr(b, "deadline", None) is not None:
+                    travel = float(travel_time_fn(aid, int(box_id)))
+                    finish_time = float(current_time) + base_sense_time + travel
+                    slack = float(b.deadline) - finish_time
+
+                    # Penalize sensing things with LOTS of slack (encourages near-deadline senses)
+                    slack_norm = max(0.0, slack) / max(1.0, float(horizon))
+                    total_reward -= lambda_sense_slack * slack_norm
+
+            # else: ignore unknown kinds
 
     imbalance = abs(totalX - totalY)
     return total_reward - lambda_balance * imbalance
@@ -1116,8 +1238,26 @@ def evaluate_candidate_plan(
       2) Candidate's scalar score must beat current by at least `margin`.
     """
     # Scalar scores
-    score_curr = score_plan_objective(current_plan, agents, boxes, weights=weights)
-    score_cand = score_plan_objective(candidate_plan, agents, boxes, weights=weights)
+    score_curr = score_plan_objective(
+        current_plan,
+        agents,
+        boxes,
+        travel_time_fn=travel_time_fn,
+        current_time=current_time,
+        horizon=horizon,
+        weights=weights,
+    )
+
+    score_cand = score_plan_objective(
+        candidate_plan,
+        agents,
+        boxes,
+        travel_time_fn=travel_time_fn,
+        current_time=current_time,
+        horizon=horizon,
+        weights=weights,
+    )
+
 
     # Constraint diagnostics
     constraints_curr = evaluate_plan_constraints(
@@ -1507,13 +1647,15 @@ if __name__ == "__main__":
         lambda_robot_overuse=0.0,
         lambda_human_overuse=0.0,
         lambda_deadline_risk=0.0,
+
+
     )
 
     plan = plan_assignments_gurobi(
         agents=agents,
         boxes=boxes,
         current_time=0.0,
-        horizon=30.0,
+        horizon=120.0,
         travel_time_fn=dummy_travel_time,
         weights=weights,
     )

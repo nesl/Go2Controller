@@ -3372,10 +3372,19 @@ class BrokerMediationMixin:
         plan_update = None
         if rule == "speech_intent_inferred":
             try:
-                plan_update = self._extract_plan_update_from_intent_event(trace_entry)
-                prefix_plan, speaker_id2 = self._prefix_plan_from_speech_intent_inferred(trace_entry)
+                try:
+                    plan_update = self._extract_plan_update_from_intent_event(trace_entry)
+                except Exception as e:
+                    self.get_logger().warn(f"Error in here 1")
+                try:
+                    prefix_plan, speaker_id2 = self._prefix_plan_from_speech_intent_inferred(trace_entry)
+                except Exception as e:
+                    self.get_logger().warn(f"Error in here 2")
                 if prefix_plan and self._prefix_plan_robot_already_fulfilled_server_truth(prefix_plan):
-                    self._say_already_done_for_prefix(speaker_id2, prefix_plan)
+                    try:
+                        self._say_already_done_for_prefix(speaker_id2, prefix_plan)
+                    except Exception as e:
+                        self.get_logger().warn(f"Error in here 3")
                     return True
             except Exception as e:
                 self.get_logger().warn(f"[routing] error in routing: {e}, {trace_entry}")

@@ -29,6 +29,10 @@ setup(
     entry_points={
         'console_scripts': [
         'sim_human_agent = sim_humans.sim_human_agent_node:main',
+        'sim_optimzed_agent = sim_humans.optimized_agent:main',
+        'sim_centralized_agent = sim_humans.plan_follower_agent_node:main',
+        'sim_centralized_optimizer = sim_humans.central_joint_optimizer_node:main',
+  
         ],
     },
 )
