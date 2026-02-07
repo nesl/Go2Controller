@@ -47,6 +47,8 @@ import copy
 from gurobipy import quicksum
 import math
 
+import itertools
+
 Property = Literal["X", "Y"]
 TravelTimeFn = Callable[[str, int], float]  # (agent_id, box_id) -> seconds
 
@@ -61,6 +63,24 @@ DEBUG_MILP = True
 def dbg(msg: str):
     if DEBUG_MILP:
         print(f"[MILP-DBG] {msg}", flush=True)
+
+
+
+
+def entropy(p: float) -> float:
+    p = clamp(p, 1e-9, 1-1e-9)
+    return -(p*math.log(p) + (1-p)*math.log(1-p))
+
+def expected_entropy_after_one(p: float, tpr: float, fpr: float) -> float:
+    p = clamp(p); tpr = clamp(tpr, 1e-6, 1-1e-6); fpr = clamp(fpr, 1e-6, 1-1e-6)
+    p_det1 = p*tpr + (1-p)*fpr
+    p_det0 = 1 - p_det1
+    p1 = (p*tpr) / max(1e-12, p*tpr + (1-p)*fpr)
+    p0 = (p*(1-tpr)) / max(1e-12, p*(1-tpr) + (1-p)*(1-fpr))
+    return p_det1*entropy(p1) + p_det0*entropy(p0)
+
+def expected_info_gain_one(p: float, tpr: float, fpr: float) -> float:
+    return entropy(p) - expected_entropy_after_one(p, tpr, fpr)
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +109,7 @@ class PlannerWeights:
 
     # deadline / risk aversion
     lambda_deadline_risk: float = 0.0  # extra penalty for disposals close to / past deadline
-    lambda_sense_slack: float = 0.001  # small like 0.001
+    lambda_sense_slack: float = 0.005  # small like 0.001
 
 
 @dataclass
@@ -136,6 +156,10 @@ class AgentState:
     max_time: float
     can_sense_X: bool
     can_sense_Y: bool
+
+    # NEW: disposal capabilities
+    can_dispose_X: bool = True
+    can_dispose_Y: bool = True
 
     # These defaults are just placeholders; you will override with real values
     detect_present_X: float = 0.8
@@ -186,9 +210,16 @@ class BoxInfo:
 
     info_X: float
     info_Y: float
-
     already_sensed: Dict[str, Dict[Property, bool]]
+    # NEW: how many agents are needed to carry/dispose (1 for light objects)
+    min_disposal_team: int = 1
 
+    # NEW: optional cap (e.g., you might not want >2 agents on a small box)
+    max_disposal_team: int = 3
+
+    
+    senseable_X: bool = True
+    senseable_Y: bool = True
 
 @dataclass
 class PlanConstraintMetrics:
@@ -265,12 +296,114 @@ def p_present_from_sense_results_fused(sense_results: List[dict], prop: Property
     p = 1.0 / (1.0 + math.exp(-L))
     return clamp(p, 0.0, 1.0)
 
+def p_present_from_sense_results_bayes(
+    sense_results: list[dict],
+    prop: Property,
+    agents_by_id: dict[str, AgentState],
+    prior: float = 0.5,
+) -> float:
+    prior = clamp(prior)
+    L = math.log(prior / (1.0 - prior))  # log-odds
+
+    for sr in sense_results or []:
+        if _sr_status(sr) != "completed":
+            continue
+        if _sr_prop(sr) != prop:
+            continue
+
+        detected = sr.get("detected", None)
+        if detected is None:
+            continue
+
+        aid = str(sr.get("agent_id") or "")
+        a = agents_by_id.get(aid)
+        if a is None:
+            # Unknown agent: skip or assume weak default
+            continue
+
+        if prop == "X":
+            p_det_given_present = clamp(a.detect_present_X, 1e-4, 1 - 1e-4)
+            p_det_given_absent  = clamp(a.detect_absent_X,  1e-4, 1 - 1e-4)
+        else:
+            p_det_given_present = clamp(a.detect_present_Y, 1e-4, 1 - 1e-4)
+            p_det_given_absent  = clamp(a.detect_absent_Y,  1e-4, 1 - 1e-4)
+
+        if bool(detected):
+            # LR for detected=True
+            lr = p_det_given_present / p_det_given_absent
+        else:
+            # LR for detected=False
+            lr = (1.0 - p_det_given_present) / (1.0 - p_det_given_absent)
+
+        L += math.log(lr)
+
+    p = 1.0 / (1.0 + math.exp(-L))
+    return clamp(p, 0.0, 1.0)
+
 
 def info_level_from_p(p_present: float) -> float:
     p = clamp(p_present)
     conf = max(p, 1.0 - p)       # [0.5, 1.0]
     info = (conf - 0.5) / 0.5    # [0, 1]
     return max(0.0, min(1.0, info))
+
+
+SPEEDUP_FACTOR = {1: 1.0, 2: 0.50, 3: 0.25}
+def speed_factor(k: int) -> float:
+    return SPEEDUP_FACTOR.get(k, 1.0 / float(k))
+
+
+import itertools
+
+def best_case_disposal_time_rel(
+    *,
+    agents: List[AgentState],
+    b: BoxInfo,
+    prop: Property,
+    travel_time_fn: TravelTimeFn,
+) -> Optional[float]:
+    """
+    Best-case (relative) time to complete disposal of (b, prop), assuming:
+      - disposal starts after sensing finishes (conservative)
+      - disposal team chosen among agents who can dispose prop
+      - team rendezvous arrival time = max travel among selected agents
+      - execution time = base_dispose_time * speed_factor(k)
+
+    Returns:
+      minimal time (seconds) from 'start disposal' to 'finish disposal',
+      or None if no feasible disposal team exists.
+    """
+    # eligible disposers for this prop
+    eligible = []
+    for a in agents:
+        if prop == "X" and not getattr(a, "can_dispose_X", True):
+            continue
+        if prop == "Y" and not getattr(a, "can_dispose_Y", True):
+            continue
+        eligible.append(a)
+
+    if not eligible:
+        return None
+
+    k_min = max(1, int(getattr(b, "min_disposal_team", 1)))
+    k_max = min(int(getattr(b, "max_disposal_team", len(eligible))), len(eligible))
+    if k_min > k_max:
+        return None
+
+    base = float(b.dispose_time_X if prop == "X" else b.dispose_time_Y)
+
+    best = None
+    # brute force combinations; with 3 agents this is tiny and safe
+    for k in range(k_min, k_max + 1):
+        for team in itertools.combinations(eligible, k):
+            max_travel = 0.0
+            for a in team:
+                max_travel = max(max_travel, float(travel_time_fn(a.agent_id, b.box_id)))
+            t = max_travel + base * float(speed_factor(k))
+            if best is None or t < best:
+                best = t
+
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -285,40 +418,15 @@ def plan_assignments_gurobi(
     travel_time_fn: TravelTimeFn,
     weights: Optional[PlannerWeights] = None,
 ) -> Plan:
-    """
-    Build and solve a Gurobi MILP that assigns sensing and disposal tasks.
-
-    Args:
-        agents: list of AgentState (human_a, human_b, robot, ...).
-        boxes: list of BoxInfo built from the current world state.
-        current_time: current sim time (seconds).
-        horizon: maximum time window (seconds) we plan over. Tasks must fit
-                 within this window for each agent.
-        travel_time_fn: function (agent_id, box_id) -> travel time (seconds).
-        weights: PlannerWeights encoding both objective coefficients and
-                 style/preferences (exploration, fairness, etc.).
-
-    Returns:
-        dict mapping each agent_id to a *sequential* list of actions:
-
-            {
-              "human_a": [(box_id, property, "sense"|"dispose"), ...],
-              "human_b": [...],
-              "robot":   [...],
-            }
-
-        Each list is ordered by (earliest box deadline, disposing before sensing
-        when tied), so you can execute them in sequence per agent.
-    """
     if weights is None:
         weights = PlannerWeights()
 
-
     for b in boxes:
-        dbg(f"BOX {b.box_id}: now={current_time:.2f} deadline={b.deadline:.2f} "
-            f"infoX={b.info_X:.3f} infoY={b.info_Y:.3f} "
-            f"disposedX={b.disposed_X} disposedY={b.disposed_Y}")
-
+        dbg(
+            f"BOX {b.box_id}: now={current_time:.2f} deadline={b.deadline:.2f} "
+            f"infoX={b.info_X:.3f} infoY={b.info_Y:.3f} p_true_X={b.p_true_X:.3f} p_true_Y={b.p_true_Y:.3f} "
+            f"disposedX={b.disposed_X} disposedY={b.disposed_Y}"
+        )
 
     info_threshold_for_dispose = weights.info_threshold_for_dispose
     reward_correct_X = weights.reward_correct_X
@@ -330,347 +438,429 @@ def plan_assignments_gurobi(
     model.Params.OutputFlag = 0  # silent
 
     agents_by_id = {a.agent_id: a for a in agents}
+    box_by_id = {b.box_id: b for b in boxes}  # <-- needed early
     props: List[Property] = ["X", "Y"]
 
-    # -----------------------------------------------------------------------
-    # Role decision variables: each agent chooses sensing or disposal (or idle)
-    # -----------------------------------------------------------------------
-    z_sense: Dict[str, gp.Var] = {}
-    z_dispose: Dict[str, gp.Var] = {}
-    for a in agents:
-        z_sense[a.agent_id] = model.addVar(vtype=GRB.BINARY, name=f"z_sense_{a.agent_id}")
-        z_dispose[a.agent_id] = model.addVar(vtype=GRB.BINARY, name=f"z_disp_{a.agent_id}")
-        model.addConstr(
-            z_sense[a.agent_id] + z_dispose[a.agent_id] <= 1,
-            name=f"role_choice_{a.agent_id}",
-        )
 
     # -----------------------------------------------------------------------
-    # Decision variables: sense and dispose
+    # Decision variables
     # -----------------------------------------------------------------------
     s_vars: Dict[Tuple[str, int, Property], gp.Var] = {}
-    d_vars: Dict[Tuple[str, int, Property], gp.Var] = {}
+
+    # (box,prop) disposal selected
+    y_disp_prop: Dict[Tuple[int, Property], gp.Var] = {}
+
+    # (agent,box,prop) participates in disposal
+    x_disp_part: Dict[Tuple[str, int, Property], gp.Var] = {}
+
+    # (box,prop,k) chosen team size if disposing that prop
+    z_team: Dict[Tuple[int, Property, int], gp.Var] = {}
+
+    # (agent,box,prop,k) = x_part AND z_team  (linearization)
+    w_part_k: Dict[Tuple[str, int, Property, int], gp.Var] = {}
+
+    # NEW: team arrival (max travel) and finish time for (box,prop,k)
+    t_arrive: Dict[Tuple[int, Property, int], gp.Var] = {}
+    t_finish: Dict[Tuple[int, Property, int], gp.Var] = {}
+
+    # NEW: linearization for per-agent budget: u_finish = t_finish * w_part_k
+    u_finish: Dict[Tuple[str, int, Property, int], gp.Var] = {}
 
 
+    max_team_overall = max(1, len(agents))
+    BIG_M = 1000.0
 
+
+    # -----------------------------------------------------------------------
+    # Create vars
+    # -----------------------------------------------------------------------
     for a in agents:
         for b in boxes:
-        
-            # Domain semantics: disposing for ANY property removes the object
+            # Domain semantics: disposal removes object; if already disposed, ignore box
             if b.disposed_X or b.disposed_Y:
                 continue
 
-        
             for p in props:
-
-                # Skip properties already successfully disposed
                 if p == "X" and b.disposed_X:
                     continue
                 if p == "Y" and b.disposed_Y:
                     continue
 
-                # ---------- SENSING VARIABLES ----------
-                if p == "X" and not a.can_sense_X:
-                    can_sense = False
-                elif p == "Y" and not a.can_sense_Y:
-                    can_sense = False
-                else:
-                    can_sense = True
-
+                # ---------- SENSING VARS ----------
+                can_sense = (a.can_sense_X if p == "X" else a.can_sense_Y)
                 already = b.already_sensed.get(a.agent_id, {}).get(p, False)
+
+                # right now, if it is not senseable it will not be disposable as well
+                if p == "X" and not getattr(b, "senseable_X", True):
+                    continue
+                if p == "Y" and not getattr(b, "senseable_Y", True):
+                    continue
+
 
                 if can_sense and not already:
                     base_sense_time = b.sense_time_X if p == "X" else b.sense_time_Y
                     travel = travel_time_fn(a.agent_id, b.box_id)
-                    total_sense_time = base_sense_time + travel
+                    total_sense_time = float(base_sense_time) + float(travel)
 
-                    # NEW: respect horizon and deadline for sensing too
-                    if (
-                        total_sense_time <= horizon
-                        and (b.deadline is None or current_time + total_sense_time <= b.deadline)
-                    ):
+                    # --- NEW: require that disposal is still feasible afterward (best-case team) ---
+                    disp_best_rel = best_case_disposal_time_rel(
+                        agents=agents,
+                        b=b,
+                        prop=p,
+                        travel_time_fn=travel_time_fn,
+                    )
+
+                    # If nobody eligible can dispose this prop with required team size, don't sense it.
+                    if disp_best_rel is None:
+                        continue
+
+                    # Conservative: disposal can only start after sensing finishes.
+                    total_sense_plus_best_disp = total_sense_time + float(disp_best_rel)
+
+                    # Gate by horizon + deadline
+                    if total_sense_time <= float(horizon):
+                        if b.deadline is None:
+                            # If no deadline, you may still want to require it fits in horizon,
+                            # but your statement is about deadlines; keep horizon check as-is.
+                            pass
+                        else:
+                            # Must be able to sense AND then still dispose before deadline
+                            if float(current_time) + total_sense_plus_best_disp > float(b.deadline):
+                                continue
+
+                        # Optional: also require the combined sense+dispose fits in horizon.
+                        # If you want strictly "within planning horizon" feasibility too, uncomment:
+                        # if total_sense_plus_best_disp > float(horizon):
+                        #     continue
+
                         s_vars[(a.agent_id, b.box_id, p)] = model.addVar(
                             vtype=GRB.BINARY,
                             name=f"sense_{a.agent_id}_{b.box_id}_{p}",
                         )
 
-                # ---------- DISPOSAL VARIABLES ----------
-                if p == "X":
-                    info_level = b.info_X
-                    base_disp_time = b.dispose_time_X
-                else:
-                    info_level = b.info_Y
-                    base_disp_time = b.dispose_time_Y
 
+                # ---------- TEAM DISPOSAL VARS ----------
+                # capability gate
+                if p == "X" and not getattr(a, "can_dispose_X", True):
+                    continue
+                if p == "Y" and not getattr(a, "can_dispose_Y", True):
+                    continue
+
+                # info gate
+                info_level = b.info_X if p == "X" else b.info_Y
                 if info_level < info_threshold_for_dispose:
-                    '''
-                    dbg(
-                        f"NO d_var: aid={a.agent_id} box={b.box_id} prop={p} "
-                        f"info={info_level:.3f} < thr={info_threshold_for_dispose:.3f}"
-                    )
-                    '''
                     continue
 
-
-                travel = travel_time_fn(a.agent_id, b.box_id)
-                total_disp_time = base_disp_time + travel
-
-                
-                if total_disp_time > horizon:
-                    '''
-                    dbg(
-                        f"NO d_var: aid={a.agent_id} box={b.box_id} prop={p} "
-                        f"disp_t={total_disp_time:.2f} > horizon={horizon:.2f}"
-                    )
-                    '''
-                    continue
-
-                if current_time + total_disp_time > b.deadline:
-                    '''
-                    dbg(
-                        f"NO d_var: aid={a.agent_id} box={b.box_id} prop={p} "
-                        f"finish={current_time+total_disp_time:.2f} > deadline={b.deadline:.2f} "
-                        f"(now={current_time:.2f} disp_t={total_disp_time:.2f})"
-                    )
-                    '''
-                    continue
-
-
-
-                # Must fit within horizon AND deadline
-                if (
-                    total_disp_time <= horizon
-                    and current_time + total_disp_time <= b.deadline
-                ):
-                    d_vars[(a.agent_id, b.box_id, p)] = model.addVar(
+                # (box,prop) disposal var once
+                if (b.box_id, p) not in y_disp_prop:
+                    y_disp_prop[(b.box_id, p)] = model.addVar(
                         vtype=GRB.BINARY,
-                        name=f"disp_{a.agent_id}_{b.box_id}_{p}",
+                        name=f"y_disp_{b.box_id}_{p}",
                     )
+
+                    # team size choice vars once
+                    k_min = max(1, int(getattr(b, "min_disposal_team", 1)))
+                    k_max = min(int(getattr(b, "max_disposal_team", max_team_overall)), max_team_overall)
+                    for k in range(k_min, k_max + 1):
+                        z_team[(b.box_id, p, k)] = model.addVar(
+                            vtype=GRB.BINARY,
+                            name=f"z_team_{b.box_id}_{p}_{k}",
+                        )
+
+                # (agent,box,prop) participation var once
+                if (a.agent_id, b.box_id, p) not in x_disp_part:
+                    x_disp_part[(a.agent_id, b.box_id, p)] = model.addVar(
+                        vtype=GRB.BINARY,
+                        name=f"x_part_{a.agent_id}_{b.box_id}_{p}",
+                    )
+
+                # linearization vars once per k
+                k_min = max(1, int(getattr(b, "min_disposal_team", 1)))
+                k_max = min(int(getattr(b, "max_disposal_team", max_team_overall)), max_team_overall)
+                for k in range(k_min, k_max + 1):
+                    key = (a.agent_id, b.box_id, p, k)
+                    if key not in w_part_k:
+                        w_part_k[key] = model.addVar(
+                            vtype=GRB.BINARY,
+                            name=f"w_{a.agent_id}_{b.box_id}_{p}_{k}",
+                        )
+
+
+
+
+    # -----------------------------------------------------------------------
+    # NEW: Create team max-travel and finish-time vars for each (bid,p,k)
+    # -----------------------------------------------------------------------
+    # Choose a time Big-M that safely dominates any plausible time expression.
+    # This should be >= max(horizon, agent.max_time, deadline slack) + max travel + max base time.
+    max_travel = 0.0
+    max_disp_base = 0.0
+    max_deadline_slack = 0.0
+    for b in boxes:
+        # travel upper bound across agents (coarse but safe)
+        for a in agents:
+            try:
+                max_travel = max(max_travel, float(travel_time_fn(a.agent_id, b.box_id)))
+            except Exception:
+                pass
+        max_disp_base = max(max_disp_base, float(b.dispose_time_X), float(b.dispose_time_Y))
+        if b.deadline is not None:
+            max_deadline_slack = max(max_deadline_slack, float(b.deadline) - float(current_time))
+
+    max_agent_time = max([float(a.max_time) for a in agents] + [0.0])
+    BIG_M_TIME = max(float(horizon), max_agent_time, max_deadline_slack, 0.0) + max_travel + max_disp_base + 10.0
+
+    # Create t_arrive and t_finish per (bid,p,k) that exists in z_team
+    for (bid, p, k), z in z_team.items():
+        t_arrive[(bid, p, k)] = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name=f"t_arrive_{bid}_{p}_{k}")
+        t_finish[(bid, p, k)] = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name=f"t_finish_{bid}_{p}_{k}")
+
+        b = box_by_id[bid]
+        base = b.dispose_time_X if p == "X" else b.dispose_time_Y
+
+        base_k = float(base) * float(speed_factor(k))
+        z = z_team[(bid, p, k)]
+        tf = t_finish[(bid, p, k)]
+        ta = t_arrive[(bid, p, k)]
+
+        # Only enforce when z=1; relax when z=0
+        model.addConstr(tf - ta - base_k <= BIG_M_TIME * (1.0 - z),
+                        name=f"def_t_finish_ub_{bid}_{p}_{k}")
+        model.addConstr(tf - ta - base_k >= -BIG_M_TIME * (1.0 - z),
+                        name=f"def_t_finish_lb_{bid}_{p}_{k}")
+
+
+        # If z=0, force times to 0 (prevents "free" time vars floating)
+        model.addConstr(t_arrive[(bid, p, k)] <= BIG_M_TIME * z, name=f"arrive_zero_if_not_{bid}_{p}_{k}")
+        model.addConstr(t_finish[(bid, p, k)] <= BIG_M_TIME * z, name=f"finish_zero_if_not_{bid}_{p}_{k}")
+
+
+    # -----------------------------------------------------------------------
+    # NEW: Horizon/deadline feasibility for chosen team size
+    # Enforce these only when z_team(b,p,k)=1
+    # -----------------------------------------------------------------------
+    for (bid, p, k), z in z_team.items():
+        b = box_by_id[bid]
+        tf = t_finish[(bid, p, k)]
+
+        # Within horizon (relative time)
+        model.addConstr(tf <= float(horizon) + BIG_M_TIME * (1.0 - z), name=f"team_horizon_{bid}_{p}_{k}")
+
+        # Meet absolute deadline if present: current_time + tf <= deadline
+        if b.deadline is not None:
+            model.addConstr(
+                float(current_time) + tf <= float(b.deadline) + BIG_M_TIME * (1.0 - z),
+                name=f"team_deadline_{bid}_{p}_{k}",
+            )
+
 
     # -----------------------------------------------------------------------
     # Constraints
     # -----------------------------------------------------------------------
-    BIG_M = 1000.0
-    # (1) At most one disposal per BOX total (object removed regardless of property)
+
+    # (A) At most one disposal total per box across props (object removed)
     for b in boxes:
-        dvs_b = [v for (aid, bid, _pp), v in d_vars.items() if bid == b.box_id]
-        if dvs_b:
-            model.addConstr(
-                gp.quicksum(dvs_b) <= 1,
-                name=f"one_disp_box{b.box_id}",
-            )
+        ys = [y_disp_prop.get((b.box_id, pp)) for pp in props]
+        ys = [v for v in ys if v is not None]
+        if ys:
+            model.addConstr(gp.quicksum(ys) <= 1, name=f"one_disp_total_{b.box_id}")
 
+    # (B) If dispose (box,prop), choose exactly one team size k
+    for (bid, p), y in y_disp_prop.items():
+        ks = [k for (_bid, _p, k) in z_team.keys() if _bid == bid and _p == p]
+        model.addConstr(gp.quicksum(z_team[(bid, p, k)] for k in ks) == y, name=f"choose_k_{bid}_{p}")
 
-    dbg("=== DISPOSAL VARS (created) ===")
-    for (aid, bid, p), v in d_vars.items():
-        if bid == 2:
-            dbg(f"created d_var for aid={aid} box={bid} prop={p}")
-
-
-    # -----------------------------------------------------------------------
-    # (1a) Disposal allowed ONLY if this (box,prop) has been sensed before
-    # -----------------------------------------------------------------------
-    sensed_before: Dict[Tuple[int, Property], int] = {}
-
-    for b in boxes:
-        for p in props:
-            # True if ANY agent has already sensed this (box,prop) in the past
-            sb = 0
-            if b.already_sensed:
-                for _aid, amap in b.already_sensed.items():
-                    if isinstance(amap, dict) and amap.get(p, False):
-                        sb = 1
-                        break
-            sensed_before[(b.box_id, p)] = sb
-
-    for b in boxes:
-        for p in props:
-            disp_bp = [
-                v for (aid, bid, pp), v in d_vars.items()
-                if bid == b.box_id and pp == p
-            ]
-            if disp_bp:
-                # if sensed_before == 0 -> RHS=0 -> forces all disp vars to 0
-                model.addConstr(
-                    gp.quicksum(disp_bp) <= sensed_before[(b.box_id, p)],
-                    name=f"disp_requires_prior_sense_{b.box_id}_{p}",
-                )
-
-
-
-    # -----------------------------------------------------------------------
-    # (1b) Option A: For each (box,prop) in *this optimizer solve*:
-    #   - allow many senses OR
-    #   - allow a single disposal
-    #   but NOT both.
-    # -----------------------------------------------------------------------
-
-
-
-    # (1b) If we dispose a box in this solve, don't sense ANY prop for that box in this solve
-    y_disp: Dict[int, gp.Var] = {}
-    for b in boxes:
-        y_disp[b.box_id] = model.addVar(vtype=GRB.BINARY, name=f"y_disp_{b.box_id}")
-
-    for b in boxes:
-        dvs_b = [v for (aid, bid, _pp), v in d_vars.items() if bid == b.box_id]
-        if dvs_b:
-            # since we already constrain sum(dvs_b) <= 1, equality is safe here
-            model.addConstr(
-                gp.quicksum(dvs_b) == y_disp[b.box_id],
-                name=f"link_y_disp_{b.box_id}",
-            )
-        else:
-            model.addConstr(y_disp[b.box_id] == 0, name=f"link_y_disp_zero_{b.box_id}")
-
-    for (aid, bid, p), s_var in s_vars.items():
+    # (C) Team size match: sum participants == sum(k * z_k)
+    for (bid, p), y in y_disp_prop.items():
+        parts = [x_disp_part[(aid, bid, p)] for (aid, _bid, _p) in x_disp_part.keys() if _bid == bid and _p == p]
+        ks = [k for (_bid, _p, k) in z_team.keys() if _bid == bid and _p == p]
         model.addConstr(
-            s_var <= 1 - y_disp[bid],
-            name=f"no_sense_if_disp_{aid}_{bid}_{p}",
+            gp.quicksum(parts) == gp.quicksum(k * z_team[(bid, p, k)] for k in ks),
+            name=f"team_size_match_{bid}_{p}",
         )
 
+    # (D) Linearize w = x_part AND z_team
+    for (aid, bid, p, k), w in w_part_k.items():
+        x = x_disp_part[(aid, bid, p)]
+        z = z_team[(bid, p, k)]
+        model.addConstr(w <= x, name=f"w_le_x_{aid}_{bid}_{p}_{k}")
+        model.addConstr(w <= z, name=f"w_le_z_{aid}_{bid}_{p}_{k}")
+        model.addConstr(w >= x + z - 1, name=f"w_ge_and_{aid}_{bid}_{p}_{k}")
+
+    # -----------------------------------------------------------------------
+    # NEW: Max-travel rendezvous constraints
+    # t_arrive(b,p,k) >= travel(a,b) for all participating agents (w=1)
+    # -----------------------------------------------------------------------
+    for (aid, bid, p, k), w in w_part_k.items():
+        T = t_arrive[(bid, p, k)]
+        travel = float(travel_time_fn(aid, bid))
+        # If w=1, T >= travel; if w=0, constraint becomes T >= 0
+        model.addConstr(T >= travel * w, name=f"arrive_lb_{aid}_{bid}_{p}_{k}")
 
 
-    # (2) Agent time budget (travel + base action times)
+    # (E) Build a box-level disposal indicator y_disp_box[bid] from y_disp_prop
+    y_disp_box: Dict[int, gp.Var] = {}
+    for b in boxes:
+        y_disp_box[b.box_id] = model.addVar(vtype=GRB.BINARY, name=f"y_disp_box_{b.box_id}")
+        ys = [y_disp_prop.get((b.box_id, pp)) for pp in props]
+        ys = [v for v in ys if v is not None]
+        if ys:
+            model.addConstr(gp.quicksum(ys) == y_disp_box[b.box_id], name=f"link_y_disp_box_{b.box_id}")
+        else:
+            model.addConstr(y_disp_box[b.box_id] == 0, name=f"link_y_disp_box_zero_{b.box_id}")
+
+    # (F) Sense XOR dispose at the box level (your original semantics)
+    y_sense: Dict[int, gp.Var] = {}
+    for b in boxes:
+        y_sense[b.box_id] = model.addVar(vtype=GRB.BINARY, name=f"y_sense_{b.box_id}")
+
+        svs_b = [v for (aid, bid, _pp), v in s_vars.items() if bid == b.box_id]
+        if svs_b:
+            model.addConstr(gp.quicksum(svs_b) >= y_sense[b.box_id], name=f"link_y_sense_lb_{b.box_id}")
+            model.addConstr(gp.quicksum(svs_b) <= BIG_M * y_sense[b.box_id], name=f"link_y_sense_ub_{b.box_id}")
+        else:
+            model.addConstr(y_sense[b.box_id] == 0, name=f"link_y_sense_zero_{b.box_id}")
+
+        model.addConstr(
+            y_disp_box[b.box_id] + y_sense[b.box_id] <= 1,
+            name=f"sense_xor_dispose_{b.box_id}",
+        )
+
+    # also block any sense vars if disposing that box
+    for (aid, bid, p), s_var in s_vars.items():
+        model.addConstr(s_var <= 1 - y_disp_box[bid], name=f"no_sense_if_disp_{aid}_{bid}_{p}")
+
+    # -----------------------------------------------------------------------
+    # (2) Agent time budget
+    # -----------------------------------------------------------------------
     agent_load_expr: Dict[str, gp.LinExpr] = {}
     for a in agents:
         expr = gp.LinExpr()
-        for b in boxes:
-            for p in props:
-                s_var = s_vars.get((a.agent_id, b.box_id, p))
-                d_var = d_vars.get((a.agent_id, b.box_id, p))
 
-                if s_var is not None:
-                    base_sense_time = b.sense_time_X if p == "X" else b.sense_time_Y
-                    travel = travel_time_fn(a.agent_id, b.box_id)
-                    total_sense_time = base_sense_time + travel
-                    expr += total_sense_time * s_var
+        # sensing time
+        for (aid, bid, p), s_var in s_vars.items():
+            if aid != a.agent_id:
+                continue
+            b = box_by_id[bid]
+            base_sense_time = b.sense_time_X if p == "X" else b.sense_time_Y
+            travel = travel_time_fn(aid, bid)
+            expr += (base_sense_time + travel) * s_var
 
-                if d_var is not None:
-                    base_disp_time = b.dispose_time_X if p == "X" else b.dispose_time_Y
-                    travel = travel_time_fn(a.agent_id, b.box_id)
-                    total_disp_time = base_disp_time + travel
-                    expr += total_disp_time * d_var
+        # NEW: disposal busy time for participants = t_finish(b,p,k)
+        # Need linearization u_finish = t_finish * w
+        for (aid, bid, p, k), w in w_part_k.items():
+            if aid != a.agent_id:
+                continue
 
-        model.addConstr(
-            expr <= a.max_time,
-            name=f"time_budget_{a.agent_id}",
-        )
+            tf = t_finish[(bid, p, k)]
+
+            key = (aid, bid, p, k)
+            if key not in u_finish:
+                u_finish[key] = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name=f"u_finish_{aid}_{bid}_{p}_{k}")
+
+                u = u_finish[key]
+                # u = tf * w  (standard big-M linearization)
+                model.addConstr(u <= tf, name=f"u_le_tf_{aid}_{bid}_{p}_{k}")
+                model.addConstr(u <= BIG_M_TIME * w, name=f"u_le_Mw_{aid}_{bid}_{p}_{k}")
+                model.addConstr(u >= tf - BIG_M_TIME * (1.0 - w), name=f"u_ge_tf_M_{aid}_{bid}_{p}_{k}")
+                model.addConstr(u >= 0.0, name=f"u_ge_0_{aid}_{bid}_{p}_{k}")
+
+            expr += u_finish[key]
+
+
+        model.addConstr(expr <= a.max_time, name=f"time_budget_{a.agent_id}")
         agent_load_expr[a.agent_id] = expr
 
-    # (3) Role coupling: if agent is sensing, it cannot dispose (and vice versa)
-
-
-    for a in agents:
-        sense_vars_a = [v for (aid, _bid, _p), v in s_vars.items() if aid == a.agent_id]
-        if sense_vars_a:
-            model.addConstr(
-                gp.quicksum(sense_vars_a) <= BIG_M * z_sense[a.agent_id],
-                name=f"sense_role_{a.agent_id}",
-            )
-
-        disp_vars_a = [v for (aid, _bid, _p), v in d_vars.items() if aid == a.agent_id]
-        if disp_vars_a:
-            model.addConstr(
-                gp.quicksum(disp_vars_a) <= BIG_M * z_dispose[a.agent_id],
-                name=f"disp_role_{a.agent_id}",
-            )
-
-
     # -----------------------------------------------------------------------
-    # Objective: expected correct disposals + info gain + style terms
+    # Objective
     # -----------------------------------------------------------------------
-
     total_reward = gp.LinExpr()
     totalX = gp.LinExpr()
     totalY = gp.LinExpr()
 
-    # Disposal reward (expected correct) + deadline risk
-    for (aid, bid, p), d_var in d_vars.items():
-        b = next(bb for bb in boxes if bb.box_id == bid)
-
+    # Disposal reward counted ONCE per (box,prop)
+    for (bid, p), y in y_disp_prop.items():
+        b = box_by_id[bid]
         if p == "X":
-            p_true = b.p_true_X
-            val = reward_correct_X
-            base_disp_time = b.dispose_time_X
+            p_true = float(b.p_true_X)
+            val = float(reward_correct_X)
+            totalX += p_true * y
         else:
-            p_true = b.p_true_Y
-            val = reward_correct_Y
-            base_disp_time = b.dispose_time_Y
+            p_true = float(b.p_true_Y)
+            val = float(reward_correct_Y)
+            totalY += p_true * y
 
-        total_reward += val * p_true * d_var
+        total_reward += val * p_true * y
 
-        if p == "X":
-            totalX += p_true * d_var
-        else:
-            totalY += p_true * d_var
-
-        # deadline risk penalty (approximate)
         if weights.lambda_deadline_risk > 0.0 and b.deadline is not None:
-            travel = travel_time_fn(aid, bid)
-            finish_time = current_time + base_disp_time + travel
-            slack = float(b.deadline) - float(finish_time)
-            # Penalize negative slack (expected lateness)
-            risk_coeff = max(0.0, -slack)
-            if risk_coeff > 0.0:
-                total_reward -= weights.lambda_deadline_risk * risk_coeff * d_var
+            base_disp_time = b.dispose_time_X if p == "X" else b.dispose_time_Y
 
-    # Sensing reward (information gain, only for new senses)
+            # conservative/best-case: smallest travel among agents that *could* participate
+            feasible_travels = []
+            for a in agents:
+                if p == "X" and not getattr(a, "can_dispose_X", True):
+                    continue
+                if p == "Y" and not getattr(a, "can_dispose_Y", True):
+                    continue
+                feasible_travels.append(float(travel_time_fn(a.agent_id, bid)))
+            travel_min = min(feasible_travels) if feasible_travels else 0.0
+
+            # use the actually-chosen team size k via z_team[(bid,p,k)]
+            ks = [k for (_bid, _p, k) in z_team.keys() if _bid == bid and _p == p]
+            for k in ks:
+                finish_time_k = float(current_time) + float(travel_min) + float(base_disp_time) * float(speed_factor(k))
+                slack_k = float(b.deadline) - float(finish_time_k)
+                risk_coeff_k = max(0.0, -slack_k)  # constant given (bid,p,k)
+
+                if risk_coeff_k > 0.0:
+                    total_reward -= float(weights.lambda_deadline_risk) * float(risk_coeff_k) * z_team[(bid, p, k)]
+
+
+    # Sensing reward (unchanged)
     for (aid, bid, p), s_var in s_vars.items():
-        b = next(bb for bb in boxes if bb.box_id == bid)
+        b = box_by_id[bid]
         a = agents_by_id[aid]
 
         if p == "X":
-            p_true = b.p_true_X
-            info_level = b.info_X
-            agent_quality = max(a.detect_present_X - a.detect_absent_X, 0.0)
+            p_prior = float(b.p_true_X)
+            tpr, fpr = float(a.detect_present_X), float(a.detect_absent_X)
         else:
-            p_true = b.p_true_Y
-            info_level = b.info_Y
-            agent_quality = max(a.detect_present_Y - a.detect_absent_Y, 0.0)
+            p_prior = float(b.p_true_Y)
+            tpr, fpr = float(a.detect_present_Y), float(a.detect_absent_Y)
 
-        entropy_like = 4.0 * p_true * (1.0 - p_true)  # max at p_true=0.5
-        base_info_gain = (1.0 - info_level) * entropy_like
-        info_gain = agent_quality * base_info_gain
+        ig = expected_info_gain_one(p_prior, tpr, fpr)
 
-        total_reward += weight_info * info_gain * s_var
+        total_reward += weights.weight_info * ig * s_var
 
         if weights.lambda_sense_slack > 0.0 and b.deadline is not None:
-            travel = travel_time_fn(aid, bid)
-            base_sense_time = b.sense_time_X if p == "X" else b.sense_time_Y
-            finish_time = current_time + base_sense_time + travel
+            travel = float(travel_time_fn(aid, bid))
+            base_sense_time = float(b.sense_time_X if p == "X" else b.sense_time_Y)
+            finish_time = float(current_time) + base_sense_time + travel
             slack = float(b.deadline) - float(finish_time)
-
-            # Penalty for spending effort on boxes with lots of slack (normalized)
-            # Encourages prioritizing near-deadline sensing.
             slack_norm = max(0.0, slack) / max(1.0, float(horizon))
-            total_reward -= weights.lambda_sense_slack * slack_norm * s_var
-
+            total_reward -= float(weights.lambda_sense_slack) * slack_norm * s_var
 
         if weights.prefer_exploration != 0.0:
-            total_reward += weights.prefer_exploration * s_var
+            total_reward += float(weights.prefer_exploration) * s_var
 
-    # X/Y balance penalty: penalize |totalX - totalY|
+    # X/Y balance penalty: |totalX - totalY|
     d_imb = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name="d_imbalance")
     model.addConstr(totalX - totalY <= d_imb, name="balance_pos")
     model.addConstr(totalY - totalX <= d_imb, name="balance_neg")
-    total_reward -= lambda_balance * d_imb
+    total_reward -= float(lambda_balance) * d_imb
 
-    # Load fairness between humans
+    # fairness / load terms (unchanged from your original)
     human_ids = [a.agent_id for a in agents if a.agent_id.startswith("human_")]
     if weights.lambda_load_fairness > 0.0 and len(human_ids) >= 2:
-        avg_human_load = (1.0 / len(human_ids)) * gp.quicksum(
-            agent_load_expr[aid] for aid in human_ids
-        )
+        avg_human_load = (1.0 / len(human_ids)) * gp.quicksum(agent_load_expr[aid] for aid in human_ids)
         for aid in human_ids:
             diff = agent_load_expr[aid] - avg_human_load
             d_pos = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name=f"fair_pos_{aid}")
             d_neg = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name=f"fair_neg_{aid}")
             model.addConstr(diff <= d_pos)
             model.addConstr(-diff <= d_neg)
-            total_reward -= weights.lambda_load_fairness * (d_pos + d_neg)
+            total_reward -= float(weights.lambda_load_fairness) * (d_pos + d_neg)
 
-    # Robot vs human load preferences
     robot_id = "robot"
     if robot_id in agent_load_expr and human_ids:
         robot_load = agent_load_expr[robot_id]
@@ -679,59 +869,71 @@ def plan_assignments_gurobi(
         if weights.lambda_robot_overuse > 0.0:
             avg_human = total_human_load / len(human_ids)
             diff_robot = robot_load - avg_human
-            d_robot_over = model.addVar(
-                lb=0.0, vtype=GRB.CONTINUOUS, name="robot_overuse"
-            )
+            d_robot_over = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name="robot_overuse")
             model.addConstr(diff_robot <= d_robot_over)
-            total_reward -= weights.lambda_robot_overuse * d_robot_over
+            total_reward -= float(weights.lambda_robot_overuse) * d_robot_over
 
         if weights.lambda_human_overuse > 0.0:
             diff_humans = total_human_load - robot_load
-            d_hum_over = model.addVar(
-                lb=0.0, vtype=GRB.CONTINUOUS, name="human_overuse"
-            )
+            d_hum_over = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name="human_overuse")
             model.addConstr(diff_humans <= d_hum_over)
-            total_reward -= weights.lambda_human_overuse * d_hum_over
+            total_reward -= float(weights.lambda_human_overuse) * d_hum_over
 
     model.setObjective(total_reward, GRB.MAXIMIZE)
 
-    dbg(f"counts: s_vars={len(s_vars)} d_vars={len(d_vars)}")
+    dbg(f"counts: s_vars={len(s_vars)} y_disp_prop={len(y_disp_prop)} x_disp_part={len(x_disp_part)} z_team={len(z_team)} w_part_k={len(w_part_k)}")
 
     # -----------------------------------------------------------------------
-    # Solve and extract solution
+    # Solve
     # -----------------------------------------------------------------------
     model.optimize()
 
-    dbg("=== DISPOSAL VARS (solution values) ===")
-    for (aid, bid, p), v in d_vars.items():
-        if bid == 2:
-            dbg(f" X={v.X:.3f} (aid={aid} box={bid} prop={p})")
+    '''
+    for (bid,p,k), z in z_team.items():
+        if z.X > 0.5:
+            dbg(f"CHOSEN TEAM box={bid} prop={p} k={k} t_arrive={t_arrive[(bid,p,k)].X:.2f} t_finish={t_finish[(bid,p,k)].X:.2f}")
+    '''
 
-
+    # -----------------------------------------------------------------------
+    # Extract plan
+    # -----------------------------------------------------------------------
     actions_by_agent: Plan = {}
 
     if model.Status == GRB.OPTIMAL:
-        # collect chosen senses/disposals
+        # senses
         for (aid, bid, p), v in s_vars.items():
             if v.X > 0.5:
                 actions_by_agent.setdefault(aid, []).append((bid, p, "sense"))
 
-        for (aid, bid, p), v in d_vars.items():
-            if v.X > 0.5:
+        # disposals: any participating agent gets a dispose action on that (box,prop)
+        for (aid, bid, p), x in x_disp_part.items():
+            if x.X > 0.5:
                 actions_by_agent.setdefault(aid, []).append((bid, p, "dispose"))
 
-        # impose a simple per-agent sequence
-        box_by_id = {b.box_id: b for b in boxes}
-
+        # sort per agent
         for aid, actions in actions_by_agent.items():
             def sort_key(act: Tuple[int, Property, str]):
                 box_id, prop, kind = act
                 b = box_by_id.get(box_id)
                 deadline = b.deadline if b is not None else 1e12
-                kind_rank = 0 if kind == "dispose" else 1  # dispose before sense
+                kind_rank = 0 if kind == "dispose" else 1
                 return (deadline, kind_rank, box_id, 0 if prop == "X" else 1)
 
             actions.sort(key=sort_key)
+            
+    dbg(f"solve status = {model.Status} ({model.Status})")
+    if model.Status == GRB.INFEASIBLE:
+        dbg("Model infeasible; computing IIS...")
+        model.computeIIS()
+        dbg("IIS constraints:")
+        for c in model.getConstrs():
+            if c.IISConstr:
+                dbg(f"  {c.ConstrName}")
+        dbg("IIS variable bounds:")
+        for v in model.getVars():
+            if v.IISLB or v.IISUB:
+                dbg(f"  {v.VarName}  IISLB={v.IISLB} IISUB={v.IISUB}")
+
 
     return actions_by_agent
 
@@ -1130,6 +1332,7 @@ def compute_disposal_metrics(
 
 def evaluate_plan_constraints(
     plan: Plan,
+    agents: List[AgentState],
     boxes: List[BoxInfo],
     current_time: float,
     travel_time_fn: TravelTimeFn,
@@ -1137,6 +1340,8 @@ def evaluate_plan_constraints(
     weights: PlannerWeights,
 ) -> PlanConstraintMetrics:
     box_by_id = {b.box_id: b for b in boxes}
+
+    agents_by_id = {a.agent_id: a for a in agents}
 
     total_actions = 0
     num_sense = 0
@@ -1174,6 +1379,16 @@ def evaluate_plan_constraints(
                     num_deadline_viol += 1
 
                 continue
+
+            # --- DISPOSE ---
+            # NEW: capability check
+            if prop == "X" and not getattr(agents_by_id.get(aid, None), "can_dispose_X", True):
+                num_info_viol += 1  # or better: add a new counter "num_capability_violations"
+                continue
+            if prop == "Y" and not getattr(agents_by_id.get(aid, None), "can_dispose_Y", True):
+                num_info_viol += 1
+                continue
+
 
             # --- DISPOSE ---
             num_disp += 1
@@ -1262,6 +1477,7 @@ def evaluate_candidate_plan(
     # Constraint diagnostics
     constraints_curr = evaluate_plan_constraints(
         plan=current_plan,
+        agents=agents, 
         boxes=boxes,
         current_time=current_time,
         travel_time_fn=travel_time_fn,
@@ -1270,6 +1486,7 @@ def evaluate_candidate_plan(
     )
     constraints_cand = evaluate_plan_constraints(
         plan=candidate_plan,
+        agents=agents, 
         boxes=boxes,
         current_time=current_time,
         travel_time_fn=travel_time_fn,
@@ -1609,9 +1826,9 @@ if __name__ == "__main__":
         return 1.0
 
     agents = [
-        AgentState(agent_id="human_a", max_time=30.0, can_sense_X=True,  can_sense_Y=False),
-        AgentState(agent_id="human_b", max_time=30.0, can_sense_X=False, can_sense_Y=True),
-        AgentState(agent_id="robot",   max_time=30.0, can_sense_X=True,  can_sense_Y=True),
+        AgentState(agent_id="human_a", max_time=30.0, can_sense_X=True,  can_sense_Y=False, can_dispose_X=True,  can_dispose_Y=False),
+        AgentState(agent_id="human_b", max_time=30.0, can_sense_X=False, can_sense_Y=True, can_dispose_X=False, can_dispose_Y=True),
+        AgentState(agent_id="robot",   max_time=30.0, can_sense_X=True,  can_sense_Y=True, can_dispose_X=True,  can_dispose_Y=True),
     ]
 
     boxes = [

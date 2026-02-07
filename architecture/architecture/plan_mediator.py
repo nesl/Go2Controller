@@ -528,6 +528,8 @@ class PlanMediator:
             state.prefix_plan,
         )
 
+        MAX_OPT_SUGG_PER_AGENT = 2
+
         optimizer_suggestions_for_changes: Dict[str, Any] = {}
         for aid, actions in (candidate or {}).items():
             sugg = [
@@ -536,8 +538,8 @@ class PlanMediator:
                 if a.get("source") == "optimizer_completion"
             ]
             if sugg:
-                optimizer_suggestions_for_changes[aid] = sugg
-
+                #optimizer_suggestions_for_changes[aid] = sugg
+                optimizer_suggestions_for_changes[aid] = sugg[:MAX_OPT_SUGG_PER_AGENT]
 
         planning_view = {
             "committed_plan": committed_plan,
@@ -809,7 +811,7 @@ class PlanMediator:
             "content": (
                 "You are Bob's planning mediator in a mixed human-robot team. Bob is the robot.\n"
                 "- You receive a planning view with three groups:\n"
-                "  - committed_plan = tasks the team/robot is currently committed to execute\n"
+                "  - committed_plan = tasks the team/robot is currently committed to execute or executing at the moment\n"
                 "  - human_proposed_changes = explicit tasks requested by the CURRENT proposer\n"
                 "  - optimizer_suggestions_for_changes = extra optimizer tasks supporting those changes (suggestions only)\n"
                 "- Treat human_proposed_changes as explicit wishes of the proposer.\n"
@@ -994,7 +996,7 @@ class PlanMediator:
             "content": (
                 "You are Bob's planning mediator in a mixed human-robot team.\n"
                 "- You receive a planning view with three groups:\n"
-                "  - committed_plan = tasks the team/robot is currently committed to execute\n"
+                "  - committed_plan = tasks the team/robot is currently committed to execute or executing at the moment\n"
                 "  - human_proposed_changes = explicit tasks requested by the CURRENT proposer\n"
                 "  - optimizer_suggestions_for_changes = extra optimizer tasks supporting those changes (suggestions only)\n"
                 "- Treat human_proposed_changes as explicit wishes of the proposer.\n"
@@ -1027,6 +1029,7 @@ class PlanMediator:
                 "- In robot_utterance, you MUST explicitly mention at least one concrete task (agent, box_id, property, kind).\n"
                 "- Avoid abstract phrases like 'some optimizer suggestions' unless tied to specific actions.\n"
                 "- Always be explicit on who has to perform what.\n"
+                "- If optimizer_suggestions_for_changes contains ANY action with kind=\"dispose\": you MUST spend this step trying to get agreement from both humans.\n"
                 f"{negotiation_suffix}"
             ),
         }

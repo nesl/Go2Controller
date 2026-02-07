@@ -1084,6 +1084,10 @@ class BrokerMediationMixin:
         Send one-shot TTS utterance to SkillsAgent.
         Applies display-name filter so humans never hear canonical ids.
         """
+        
+        if getattr(self, "no_communication_mode", False):
+            self.get_logger().info(f"[no-comms] suppress TTS: {text}")
+            return
         text = (text or "").strip()
         if not text:
             return
@@ -1284,9 +1288,19 @@ class BrokerMediationMixin:
                 return (False, "already disposed for Y")
 
         if kind == "sense":
+            # NEW: senseability gates sensing ONLY (does not affect disposal)
+            senseable = True
+            if prop == "X":
+                senseable = bool(getattr(b, "senseable_X", True))
+            elif prop == "Y":
+                senseable = bool(getattr(b, "senseable_Y", True))
+            if not senseable:
+                return (False, "not senseable for this property")
+
             already = (getattr(b, "already_sensed", None) or {}).get(aid, {}).get(prop, False)
             if already:
                 return (False, "already sensed by this agent")
+
 
         return (True, None)
 
@@ -1522,10 +1536,19 @@ class BrokerMediationMixin:
                             reasons.append("already disposed for Y")
 
                     elif kind == "sense":
-                        # already sensed by this agent?
+                        # NEW: senseability reason (sense-only)
+                        senseable = True
+                        if prop == "X":
+                            senseable = bool(getattr(b, "senseable_X", True))
+                        elif prop == "Y":
+                            senseable = bool(getattr(b, "senseable_Y", True))
+                        if not senseable:
+                            reasons.append("not senseable for that property")
+
                         already = (b.already_sensed or {}).get(aid, {}).get(prop, False)
                         if already:
                             reasons.append("already sensed by this agent")
+
 
                 if reasons:
                     reason_str = " and ".join(reasons)

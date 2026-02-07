@@ -178,7 +178,7 @@ def _normalize_tts_text(text: str) -> str:
     out = _INT_TOKEN_RE.sub(repl_int, out)
     return out
 
-
+'''
 def _box_id_from_node_id(node_id: str) -> Optional[int]:
     s = str(node_id or "").strip()
     if not s:
@@ -195,7 +195,21 @@ def _box_id_from_node_id(node_id: str) -> Optional[int]:
         return int(s)
     except Exception:
         return None
+'''
 
+def _box_id_from_node_id(nid: str) -> int | None:
+    s = str(nid).strip()
+    if s.lower().startswith("cnode"):
+        s = s[5:]  # remove 'CNode'
+
+    # expect format: '1##'
+    if len(s) >= 3 and s[0] == "1":
+        s = s[1:]  # drop the fixed '1' prefix
+
+    try:
+        return int(s)
+    except Exception:
+        return None
 
 # ───────────────────────────────────────────────────────────────────────────────
 #                               Skills YAML fallback

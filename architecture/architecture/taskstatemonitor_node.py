@@ -31,7 +31,8 @@ from .optimizer_client import (
     PlannerWeights,
     extend_plan_with_prefix,
     p_present_from_sense_results_fused,
-    info_level_from_p
+    info_level_from_p,
+    p_present_from_sense_results_bayes
 )
 
 from .broker_mediation import BrokerMediationMixin
@@ -139,12 +140,12 @@ class BrokerNode(Node, BrokerMediationMixin):
         # ---------- Optimizer / planner integration ----------
         self.declare_parameter("optimizer_enabled", True)
         self.declare_parameter("optimizer_base_url", "http://172.17.40.64:8080")
-        self.declare_parameter("optimizer_horizon_sec", 120.0)
+        self.declare_parameter("optimizer_horizon_sec", 600.0)
 
         # Time budgets per agent for this planning horizon (seconds)
-        self.declare_parameter("optimizer_time_robot", 60.0)
-        self.declare_parameter("optimizer_time_human_a", 60.0)
-        self.declare_parameter("optimizer_time_human_b", 60.0)
+        self.declare_parameter("optimizer_time_robot", 300.0)
+        self.declare_parameter("optimizer_time_human_a", 300.0)
+        self.declare_parameter("optimizer_time_human_b", 300.0)
 
         # Nominal walking speeds (m/s) used to turn distances into travel times
         self.declare_parameter("optimizer_speed_robot_mps", 0.2)
@@ -183,6 +184,10 @@ class BrokerNode(Node, BrokerMediationMixin):
         self.declare_parameter('llm_mock_json', '')
         
         self.declare_parameter("model", "gpt-4.1-mini")
+        self.declare_parameter("no_communication_mode", False)
+        self.no_communication_mode = bool(self.get_parameter("no_communication_mode").value)
+
+
 
         self.model = self.get_parameter("model").get_parameter_value().string_value
 
@@ -293,6 +298,12 @@ class BrokerNode(Node, BrokerMediationMixin):
             .get_parameter_value()
             .bool_value
         )
+
+        self._pending_frontier_check = False
+        self._pending_frontier_check_fp = None
+
+
+
 
         # Async running event summary state
         self._event_summary_text: Optional[str] = None      # last full running summary
@@ -548,8 +559,21 @@ class BrokerNode(Node, BrokerMediationMixin):
             return {}, default_cfg
 
 
-    # ------------------------------ Perf topic discovery ------------------------------
-    
+    def _trigger_optimizer_once_nopub(self, reason: str, *, boxes_state: list, current_time: float, boxes_fp: Optional[str] = None):
+
+
+        # Optional: store fp so we can match the returned plan to the correct state
+        if boxes_fp is not None:
+            self._pending_frontier_check_fp = boxes_fp
+
+        self.get_logger().info(f"[optimizer] {reason}: forcing optimizer run (no publish)")
+        self._optimizer_running = True
+        threading.Thread(
+            target=self._run_optimizer_thread,
+            args=(boxes_state, current_time),
+            kwargs={"publish": False, "publish_reason": reason},
+            daemon=True,
+        ).start()
 
 
     # ------------------------------ Dynamic param handling ------------------------------
@@ -587,12 +611,19 @@ class BrokerNode(Node, BrokerMediationMixin):
 
             if p.name == "plan_accept_policy":
                 self.plan_accept_policy = str(p.value)
+                
+                
+            if p.name == "no_communication_mode" and p.type_ == Parameter.Type.BOOL:
+                self.no_communication_mode = bool(p.value)
+                self.get_logger().info(f"[broker] no_communication_mode = {self.no_communication_mode}")
 
 
 
         return SetParametersResult(successful=True, reason="ok")
 
 
+    def _comms_disabled(self) -> bool:
+        return bool(getattr(self, "no_communication_mode", False))
 
 
     def _publish_context_capsule(self, summary_only: bool = False):
@@ -890,6 +921,10 @@ class BrokerNode(Node, BrokerMediationMixin):
                     kind=str(kind),
                 )
 
+                #self.get_logger().info(
+                #    f"[commit-prune] check aid={aid} step={(box_id,prop,kind)} done={done}"
+                #)
+
                 if done:
                     changed = True
                 else:
@@ -914,6 +949,9 @@ class BrokerNode(Node, BrokerMediationMixin):
         Announces what the robot will do + proposes human assignments.
         Debounced to avoid spam.
         """
+        if self._comms_disabled():
+            return
+        
         # --- debounce identical plans ---
         fp = self._plan_fingerprint(plan)
         now = time.time()
@@ -955,9 +993,9 @@ class BrokerNode(Node, BrokerMediationMixin):
 
         # 1) announce robot intent
         if robot_next:
-            parts.append(f"I’m going to {self._format_one_action(robot_next)}.")
+            parts.append(f"I'm going to {self._format_one_action(robot_next)}.")
         else:
-            parts.append("I don’t have a robot action queued right now.")
+            parts.append("I don't have a robot action queued right now.")
 
         # 2) propose human parts
         proposals = []
@@ -1070,10 +1108,17 @@ class BrokerNode(Node, BrokerMediationMixin):
         self._record_event_for_summary(trace_entry, ts)
 
 
+
+
         try:
-            if self._maybe_route_speech_to_mediation(rule, trace_entry):
-                self.get_logger().info("returned route speech mediation")
-                return
+            # in _on_basic_event, before routing:
+            if self._comms_disabled():
+                # still log events / update trace if you want, but DO NOT route to mediation
+                pass
+            else:
+                if self._maybe_route_speech_to_mediation(rule, trace_entry):
+                    self.get_logger().info("returned route speech mediation")
+                    return
         except Exception as e:
             self.get_logger().warn(f"[mediation] routing speech turn failed: {e}")
 
@@ -1134,6 +1179,8 @@ class BrokerNode(Node, BrokerMediationMixin):
 
         # --- LLM multi-agent speech plans (COMMANDS ONLY) ---
         try:
+            if self._comms_disabled():
+                return  
             d = trace_entry.get("data") or {}
             # We stored the request id under "request_id" in the trace
             req_id = d.get("request_id", "")
@@ -2255,42 +2302,50 @@ class BrokerNode(Node, BrokerMediationMixin):
                 except Exception:
                     continue
 
-        # 3) Split current plan into:
-        #    - agreed_plan: actions originally proposed by humans/robot
-        #    - optimizer_suggestions: actions added by the optimizer
-        current_plan: Plan = getattr(self, "_last_plan", {}) or {}
-        prov = getattr(self, "_last_plan_provenance", {}) or {}
+        # 3) Plan view for chat:
+        #    - agreed_plan: the committed plan (what we're actually doing)
+        #    - optimizer_suggestions: optimizer plan minus committed plan
+        committed: Plan = getattr(self, "_committed_plan", {}) or {}
+        opt: Plan = getattr(self, "_last_optimizer_plan", {}) or {}
 
-        agreed_plan: dict = {}
+        def to_entries(plan: Plan) -> dict:
+            out: dict = {}
+            if not isinstance(plan, dict):
+                return out
+            for aid, actions in plan.items():
+                out[str(aid)] = []
+                for a in (actions or []):
+                    try:
+                        if isinstance(a, dict):
+                            box_id = int(a.get("box_id"))
+                            prop = str(a.get("property"))
+                            kind = str(a.get("kind"))
+                        else:
+                            box_id, prop, kind = a
+                            box_id = int(box_id); prop = str(prop); kind = str(kind)
+                        out[str(aid)].append({"box_id": box_id, "property": prop, "kind": kind})
+                    except Exception:
+                        continue
+            return out
+
+        committed_set = self._plan_actions_set(committed)
+        opt_set = self._plan_actions_set(opt)
+
+        # optimizer suggestions are optimizer actions not already committed
+        sugg_set = opt_set - committed_set
+
         optimizer_suggestions: dict = {}
+        for (aid, box_id, prop, kind) in sorted(sugg_set, key=lambda x: (x[0], x[3], x[1], x[2])):
+            optimizer_suggestions.setdefault(aid, []).append(
+                {"box_id": int(box_id), "property": prop, "kind": kind}
+            )
 
-        for aid, actions in current_plan.items():
-            agreed_plan[aid] = []
-            optimizer_suggestions[aid] = []
+        agreed_plan = to_entries(committed)
 
-            for (box_id, prop, kind) in actions:
-                origin = "optimizer"
-
-                # Look up provenance if available
-                for meta in prov.get(aid, []):
-                    if (
-                        int(meta.get("box_id", -1)) == int(box_id)
-                        and meta.get("property") == prop
-                        and meta.get("kind") == kind
-                    ):
-                        origin = meta.get("origin", origin) or origin
-                        break
-
-                entry = {
-                    "box_id": int(box_id),
-                    "property": prop,
-                    "kind": kind,
-                }
-
-                if origin in ("human", "robot"):
-                    agreed_plan[aid].append(entry)
-                else:
-                    optimizer_suggestions[aid].append(entry)
+        # Optional: ensure keys exist for all agents (keeps prompt stable)
+        for aid in ("robot", "human_a", "human_b"):
+            agreed_plan.setdefault(aid, [])
+            optimizer_suggestions.setdefault(aid, [])
 
 
         # 4) Running event summary if available.
@@ -2670,7 +2725,92 @@ class BrokerNode(Node, BrokerMediationMixin):
 
   
 
+    def _plan_actions_set(self, plan: dict) -> set:
+        """
+        Normalize plan dict into a set of (agent_id, box_id, prop, kind).
+        Supports both tuple-style (box_id, prop, kind) and dict-style actions.
+        """
+        out = set()
+        if not isinstance(plan, dict):
+            return out
 
+        for aid, actions in (plan or {}).items():
+            for a in (actions or []):
+                try:
+                    if isinstance(a, dict):
+                        box_id = int(a.get("box_id"))
+                        prop = str(a.get("property"))
+                        kind = str(a.get("kind"))
+                    else:
+                        box_id, prop, kind = a
+                        box_id = int(box_id)
+                        prop = str(prop)
+                        kind = str(kind)
+                    out.add((str(aid), box_id, prop, kind))
+                except Exception:
+                    continue
+        return out
+
+
+
+    def _find_missing_frontier_disposals_from_optimizer(self) -> list:
+        """
+        Look ONLY at the FIRST action for each agent in _last_optimizer_plan.
+        If any of those first actions is a 'dispose' and it's NOT already in the committed plan
+        (and not already fulfilled), return it.
+
+        Returns list of dicts: {"agent_id","box_id","property","kind"}.
+        """
+        opt = getattr(self, "_last_optimizer_plan", None) or {}
+        committed = getattr(self, "_committed_plan", None) or {}
+        boxes_state = getattr(self, "_last_boxes_state", None)
+
+        if not isinstance(opt, dict):
+            return []
+
+        com_set = self._plan_actions_set(committed)
+
+        missing = []
+        for aid, actions in opt.items():
+            if not actions:
+                continue
+
+            first = actions[0]
+
+            try:
+                if isinstance(first, dict):
+                    box_id = int(first.get("box_id"))
+                    prop = str(first.get("property"))
+                    kind = str(first.get("kind"))
+                else:
+                    box_id, prop, kind = first
+                    box_id = int(box_id)
+                    prop = str(prop)
+                    kind = str(kind)
+            except Exception:
+                continue
+
+            if kind != "dispose":
+                continue
+
+            # Already in committed plan?
+            if (str(aid), box_id, prop, kind) in com_set:
+                continue
+
+            # Already fulfilled in server truth?
+            if isinstance(boxes_state, list) and self._server_action_fulfilled(
+                boxes_state,
+                agent_id=str(aid),
+                box_id=box_id,
+                prop=prop,
+                kind="dispose",
+            ):
+                continue
+
+            missing.append({"agent_id": str(aid), "box_id": box_id, "property": prop, "kind": "dispose"})
+
+        missing.sort(key=lambda x: (x["box_id"], x["agent_id"], x["property"]))
+        return missing
 
 
 
@@ -2696,18 +2836,73 @@ class BrokerNode(Node, BrokerMediationMixin):
             self.get_logger().warn(f"[optimizer] failed to contact box server: {e}")
             return
 
+
         # ✅ NEW: prune committed plan based on server truth
         try:
+        
+            cp_before = getattr(self, "_committed_plan", None) or {}
+            robot_before = list(cp_before.get("robot") or [])
+            head_before = robot_before[0] if robot_before else None
+            n_before = len(robot_before)
+            pruned = False
             if self._prune_committed_plan_from_server_state(boxes_state):
-                # publish updated remaining committed plan (no replan!)
+                pruned = True
                 try:
-                    box_positions = getattr(self, "_last_box_positions", {}) or {}
-                    self._publish_optimizer_plan(self._committed_plan, current_time, box_positions)
-                    self.get_logger().info("[commit] pruned fulfilled actions from committed plan and republished.")
+                    if self._committed_plan:
+                        box_positions = getattr(self, "_last_box_positions", {}) or {}
+                        self._publish_optimizer_plan(self._committed_plan, current_time, box_positions)
+                        self.get_logger().info("[commit] pruned fulfilled actions from committed plan and republished.")
+                        self.get_logger().info(f"[commit] publishing committed plan after prune: {self._committed_plan}")
+                        self.get_logger().info(f"[commit] current_action={self._current_action_brief()}")
+                    else:
+                        self.get_logger().info("[commit] prune emptied committed plan; skipping publish of empty plan")
                 except Exception as e:
                     self.get_logger().warn(f"[commit] republish after prune failed: {e}")
+
+            # after prune snapshot
+            cp_after = getattr(self, "_committed_plan", None) or {}
+            robot_after = list(cp_after.get("robot") or [])
+            n_after = len(robot_after)
+            
+            advanced = (head_before is not None) and (head_before != (robot_after[0] if robot_after else None))
+
+
+            # If we still have committed robot steps, check optimizer for *missing disposals*
+            # and surface them (mediation path) instead of doing auto-commit fallback.
+            if not self._mediation_in_progress():
+                committed_now = getattr(self, "_committed_plan", None) or {}
+                robot_has_committed = bool(committed_now.get("robot"))
+                missing_frontier_disposals = None
+                
+                if advanced and not self._mediation_in_progress():
+                    # We need a fresh optimizer plan *for the new frontier*
+                    self._pending_frontier_check = True
+                    self._trigger_optimizer_once_nopub(
+                        reason="post_commit_advance",
+                        boxes_state=boxes_state,
+                        current_time=current_time,
+                    )
+
+                if getattr(self, "_pending_frontier_check", False):
+                    # We intentionally wait for the fresh optimizer plan.
+                    self.get_logger().info("[commit] pending frontier replan; skipping empty-plan fallback this tick")
+                    return  # or just skip the fallback block
+
+
+                # ✅ existing fallback: only when committed plan is empty (and not in mediation)
+                if (not committed_now) or (not self._has_committed_plan):
+                    step = self._take_next_robot_action_from_last_optimizer()
+                    self.get_logger().info(
+                        f"[commit] committed empty? {not bool(self._committed_plan)} "
+                        f"has={self._has_committed_plan} last_opt_has={bool(self._last_optimizer_plan)}"
+                    )
+                    if step is not None:
+                        self._commit_robot_single_step(step, current_time)
+                    else:
+                        self.get_logger().info("[commit] committed plan empty and no optimizer remainder; staying idle.")
         except Exception as e:
             self.get_logger().warn(f"[commit] prune failed: {e}")
+
 
         # If mediation is in progress, stop here (no optimizer replanning)
         if self._mediation_in_progress():
@@ -2739,6 +2934,9 @@ class BrokerNode(Node, BrokerMediationMixin):
                         "sense_results": b.get("sense_results") or [],
                         "disposed_X": bool(b.get("disposed_X", False)),
                         "disposed_Y": bool(b.get("disposed_Y", False)),
+                        "senseable_X": bool(b.get("senseable_X", True)),
+                        "senseable_Y": bool(b.get("senseable_Y", True)),
+
                     }
                 )
 
@@ -2791,7 +2989,8 @@ class BrokerNode(Node, BrokerMediationMixin):
             self._sync_box_state_from_server(boxes_state)
 
             agents = self._build_agents_for_optimizer()
-            boxes, box_positions = self._build_boxes_for_optimizer(boxes_state)
+            agents_by_id = {a.agent_id: a for a in agents}
+            boxes, box_positions = self._build_boxes_for_optimizer(boxes_state, agents_by_id)
 
             self._last_boxes_state = boxes_state
             self._last_boxes_for_optimizer = boxes
@@ -2819,6 +3018,28 @@ class BrokerNode(Node, BrokerMediationMixin):
 
             self._last_optimizer_plan = plan
 
+
+
+
+            self.get_logger().info(f"[optimizer] plan {plan}")
+            
+            # If we advanced the committed plan recently, now is the right time to check.
+            if getattr(self, "_pending_frontier_check", False):
+                self._pending_frontier_check = False
+
+                missing = self._find_missing_frontier_disposals_from_optimizer()
+                if missing:
+                    self.get_logger().info(f"[frontier] missing disposals suggested by optimizer: {missing}")
+
+                    step = self._take_next_robot_action_from_last_optimizer()
+                    self.get_logger().info(
+                        f"[commit2] committed empty? {not bool(self._committed_plan)} "
+                        f"has={self._has_committed_plan} last_opt_has={bool(self._last_optimizer_plan)}"
+                    )
+                    if step is not None:
+                        self._commit_robot_single_step(step, current_time)
+
+            
 
             # ✅ Publish ONLY if this run came from a trigger callback
             if publish:
@@ -2934,6 +3155,8 @@ class BrokerNode(Node, BrokerMediationMixin):
                 max_time=self.optimizer_time_human_a,
                 can_sense_X=True,
                 can_sense_Y=False,
+                can_dispose_X=True,
+                can_dispose_Y=False,
                 detect_present_X=hA_pX,
                 detect_absent_X=hA_aX,
                 detect_present_Y=hA_pY,
@@ -2944,6 +3167,8 @@ class BrokerNode(Node, BrokerMediationMixin):
                 max_time=self.optimizer_time_human_b,
                 can_sense_X=False,
                 can_sense_Y=True,
+                can_dispose_X=False,
+                can_dispose_Y=True,                
                 detect_present_X=hB_pX,
                 detect_absent_X=hB_aX,
                 detect_present_Y=hB_pY,
@@ -2954,6 +3179,8 @@ class BrokerNode(Node, BrokerMediationMixin):
                 max_time=self.optimizer_time_robot,
                 can_sense_X=True,
                 can_sense_Y=True,
+                can_dispose_X=True,
+                can_dispose_Y=True,                
                 detect_present_X=r_pX,
                 detect_absent_X=r_aX,
                 detect_present_Y=r_pY,
@@ -3018,6 +3245,7 @@ class BrokerNode(Node, BrokerMediationMixin):
     def _build_boxes_for_optimizer(
         self,
         boxes_state: list,
+        agents: List[AgentState]
     ) -> Tuple[List[BoxInfo], Dict[int, Tuple[float, float]]]:
         """
         Convert /boxes/state payload into List[BoxInfo] + box positions.
@@ -3052,6 +3280,10 @@ class BrokerNode(Node, BrokerMediationMixin):
                     f"[optimizer] missing duration field {e} in box {box_id}; skipping"
                 )
                 continue
+
+            senseable_X = bool(b.get("senseable_X", True))
+            senseable_Y = bool(b.get("senseable_Y", True))
+
 
             disposed_X = bool(b.get("disposed_X", False))
             disposed_Y = bool(b.get("disposed_Y", False))
@@ -3107,16 +3339,11 @@ class BrokerNode(Node, BrokerMediationMixin):
                     return 0.2
                 return 0.5
 
-            p_true_X = belief_from_counts(last_det_X, count_X)
-            p_true_Y = belief_from_counts(last_det_Y, count_Y)
-
-            # info_X/Y: just saturating with #completed senses
-            info_X = min(1.0, 0.3 * count_X)
-            info_Y = min(1.0, 0.3 * count_Y)
 
 
-            pX = p_present_from_sense_results_fused(sense_results, "X", prior=0.5)
-            pY = p_present_from_sense_results_fused(sense_results, "Y", prior=0.5)
+
+            pX = p_present_from_sense_results_bayes(sense_results, "X", agents, prior=0.5)
+            pY = p_present_from_sense_results_bayes(sense_results, "Y", agents, prior=0.5)
             infoX = info_level_from_p(pX)
             infoY = info_level_from_p(pY)
 
@@ -3134,6 +3361,8 @@ class BrokerNode(Node, BrokerMediationMixin):
                 disposed_Y=disposed_Y,
                 info_X=float(infoX),
                 info_Y=float(infoY),
+                senseable_X=senseable_X,
+                senseable_Y=senseable_Y,
                 already_sensed={
                     **already_sensed,
                     "__any__": already_sensed_any,   # << add this
@@ -3143,6 +3372,117 @@ class BrokerNode(Node, BrokerMediationMixin):
             boxes.append(box_info)
 
         return boxes, positions
+
+    def _take_next_agent_action_from_last_optimizer(self, agent_id: str) -> Optional[tuple]:
+        """
+        Returns the next (box_id, prop, kind) tuple for `agent_id` from the last optimizer plan,
+        skipping actions already fulfilled per latest /boxes/state.
+        """
+        opt = getattr(self, "_last_optimizer_plan", None) or {}
+        if not isinstance(opt, dict):
+            return None
+
+        actions = opt.get(agent_id) or []
+        if not actions:
+            return None
+
+        boxes_state = getattr(self, "_last_boxes_state", None)
+        for a in actions:
+            try:
+                box_id, prop, kind = a
+            except Exception:
+                continue
+
+            if isinstance(boxes_state, list) and self._server_action_fulfilled(
+                boxes_state,
+                agent_id=str(agent_id),
+                box_id=int(box_id),
+                prop=str(prop),
+                kind=str(kind),
+            ):
+                continue
+
+            return (int(box_id), str(prop), str(kind))
+
+        return None
+
+
+    def _take_next_robot_action_from_last_optimizer(self) -> Optional[tuple]:
+        """
+        Returns the next (box_id, prop, kind) tuple for robot from the last optimizer plan,
+        skipping actions that are already fulfilled per latest /boxes/state.
+        """
+        opt = getattr(self, "_last_optimizer_plan", None) or {}
+        if not isinstance(opt, dict):
+            return None
+
+        robot_actions = opt.get("robot") or []
+        if not robot_actions:
+            return None
+
+        boxes_state = getattr(self, "_last_boxes_state", None)
+        for a in robot_actions:
+            try:
+                box_id, prop, kind = a
+            except Exception:
+                continue
+
+            # Skip if already fulfilled in server truth
+            if isinstance(boxes_state, list) and self._server_action_fulfilled(
+                boxes_state,
+                agent_id="robot",
+                box_id=int(box_id),
+                prop=str(prop),
+                kind=str(kind),
+            ):
+                continue
+
+            return (int(box_id), str(prop), str(kind))
+
+        return None
+
+
+    def _commit_robot_single_step(self, step: tuple, current_time: float, *, fill_other_agents: bool = True):
+        """
+        Commit a single robot step as the new committed plan and publish it.
+
+        NEW:
+          - If fill_other_agents is True, and the committed plan would otherwise contain
+            no actions for other agents, attach their next unfulfilled actions from the optimizer.
+          - This is intended ONLY for the existing auto-commit fallback conditions
+            (empty committed plan, no mediation, etc.) controlled by the caller.
+        """
+        plan: Plan = {"robot": [step]}
+
+        # Only fill other agents when:
+        #  - caller requested it (auto-commit fallback path)
+        #  - comms are enabled (so we are allowed to "assign" humans)
+        if fill_other_agents and not self._comms_disabled():
+            for aid in ("human_a", "human_b"):
+                # Only if we currently have none for that agent in the plan we’re committing
+                if plan.get(aid):
+                    continue
+
+                nxt = self._take_next_agent_action_from_last_optimizer(aid)
+                if nxt is not None:
+                    plan[aid] = [nxt]
+
+        self._committed_plan = plan
+        self._has_committed_plan = True
+        self._last_plan = self._committed_plan
+
+        box_positions = getattr(self, "_last_box_positions", {}) or {}
+        self._publish_optimizer_plan(self._committed_plan, current_time, box_positions)
+        self.get_logger().info(f"[commit] committed next steps from optimizer: {self._committed_plan}")
+
+        # Announce (same as before)
+        try:
+            opt_plan = getattr(self, "_last_optimizer_plan", None) or {}
+            plan_to_announce = opt_plan if isinstance(opt_plan, dict) and opt_plan else self._committed_plan
+            self._announce_idle_plan(plan_to_announce, current_time)
+        except Exception as e:
+            self.get_logger().warn(f"[commit] announce/propose failed after auto-commit: {e}")
+
 
     def _publish_optimizer_plan(
         self,
@@ -3207,7 +3547,7 @@ class BrokerNode(Node, BrokerMediationMixin):
             self.get_logger().info(
                 f"[optimizer] published plan with "
                 f"{sum(len(v) for v in agents_block.values())} actions across "
-                f"{len(agents_block)} agents."
+                f"{len(agents_block)} agents. {plan}"
             )
         except Exception as e:
             self.get_logger().warn(f"[optimizer] failed to publish plan: {e}")
