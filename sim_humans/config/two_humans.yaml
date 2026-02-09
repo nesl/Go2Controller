@@ -8,35 +8,37 @@ sim_human_a:
     policy_type: "llm"
     llm_provider: "openai"
     llm_model: "gpt-4.1-mini"
-    llm_temperature: 0.2
+    llm_temperature: 0.25
     llm_max_tokens: 250
     llm_top_k_boxes: 100
     llm_timeout_sec: 30.0
 
-    # ✅ ROS2-safe: JSON strings (NOT nested YAML dict lists)
     humans_json: >
       [{"id":"human_a","name":"Sam"},{"id":"human_b","name":"Jacob"}]
     robots_json: >
       [{"id":"robot","name":"Bob"}]
 
-
-    # optional: override trust (0..1)
     trust_overrides_json: >
-      {"human_b": 0.60}
+      {"human_b": 0.55, "robot": 0.65}
 
-    help_target_speaker: "human_b"
+    help_target_speaker: "robot"
     decision_period_sec: 1.0
-    speed_mps: 1.0
-    dispose_threshold: 0.80
-    giveup_threshold: 0.20
-    help_wait_sec: 20.0
-    dist_weight: 2.0
+    speed_mps: 1.15
+    dist_weight: 2.4
     log_actions: true
 
-    # traits (optional)
-    risk_aversion: 0.7
-    stubbornness: 0.5
-    fairness_sensitivity: 0.3
+    # --- more decisive / self-focused ---
+    risk_aversion: 0.30
+    stubbornness: 0.70
+    fairness_sensitivity: 0.20
+
+    # willing to act sooner
+    dispose_threshold: 0.74
+    giveup_threshold: 0.30
+    help_wait_sec: 28.0
+    help_cooldown_sec: 14.0
+
+
 
 sim_human_b:
   ros__parameters:
@@ -48,7 +50,7 @@ sim_human_b:
     policy_type: "llm"
     llm_provider: "openai"
     llm_model: "gpt-4.1-mini"
-    llm_temperature: 0.2
+    llm_temperature: 0.10
     llm_max_tokens: 250
     llm_top_k_boxes: 100
     llm_timeout_sec: 30.0
@@ -59,18 +61,24 @@ sim_human_b:
       [{"id":"robot","name":"Bob"}]
 
     trust_overrides_json: >
-      {"human_a": 0.60}
+      {"human_a": 0.70, "robot": 0.70}
 
     help_target_speaker: "human_a"
     decision_period_sec: 1.0
-    speed_mps: 1.0
-    dispose_threshold: 0.80
-    giveup_threshold: 0.20
-    help_wait_sec: 20.0
-    dist_weight: 2.0
+    speed_mps: 0.95
+    dist_weight: 1.6
     log_actions: true
 
-    risk_aversion: 0.7
-    stubbornness: 0.5
-    fairness_sensitivity: 0.3
+    # --- cautious / cooperative ---
+    risk_aversion: 0.90
+    stubbornness: 0.20
+    fairness_sensitivity: 0.85
+
+    # demands more certainty, but doesn't give up quickly
+    dispose_threshold: 0.88
+    giveup_threshold: 0.12
+    help_wait_sec: 14.0
+    help_cooldown_sec: 6.0
+
+
 

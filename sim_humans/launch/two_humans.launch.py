@@ -27,7 +27,8 @@ def generate_launch_description():
             executable="sim_human_agent",
             name="sim_human_a",
             output="screen",
-            parameters=[params_file],
+            parameters=[params_file,
+            {"agent_id": "human_a", "goal_property": "X", "prior_X": 0.75, "prior_Y": 0.40},],
         ),
 
         Node(
@@ -35,7 +36,7 @@ def generate_launch_description():
             executable="sim_human_agent",
             name="sim_human_b",
             output="screen",
-            parameters=[params_file],
+            parameters=[params_file,{"prior_Y": 0.75, "prior_X": 0.40}],
         ),
     ])
 

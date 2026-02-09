@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import os, json, math, sqlite3, threading, time, re, hashlib
-from typing import Optional, Tuple, Dict, Set, List, Any
+from typing import Optional, Tuple, Dict, Set, List, Any, Literal
 from collections import deque
 
 import rclpy
@@ -45,6 +45,16 @@ from .plan_mediator import (
     MediationSocialContext,
     MediationInteractionContext,
     MediationTurn,
+)
+
+
+Property = Literal["X", "Y"]
+
+# Reuse optimizer primitives
+from .optimizer_client import (
+    AgentState, BoxInfo,
+    best_case_disposal_time_rel,  # we’ll wrap it to force robot in team
+    speed_factor,
 )
 
 RED = "\033[31m"
@@ -164,7 +174,7 @@ class BrokerNode(Node, BrokerMediationMixin):
         self.declare_parameter('iteration_limit', 2)
         self.declare_parameter('pull_limit', 2)
 
-        self.declare_parameter("plan_accept_policy", "normal") #"normal")
+        self.declare_parameter("plan_accept_policy", "always_accept") #"normal")
 
         self.declare_parameter('sim_mode', False)
 
@@ -186,7 +196,6 @@ class BrokerNode(Node, BrokerMediationMixin):
         self.declare_parameter("model", "gpt-4.1-mini")
         self.declare_parameter("no_communication_mode", False)
         self.no_communication_mode = bool(self.get_parameter("no_communication_mode").value)
-
 
 
         self.model = self.get_parameter("model").get_parameter_value().string_value
@@ -2971,6 +2980,178 @@ class BrokerNode(Node, BrokerMediationMixin):
         ).start()
 
 
+
+    @staticmethod
+    def _best_case_disposal_time_rel_must_include(
+        *,
+        agents: list[AgentState],
+        b: BoxInfo,
+        prop: Property,
+        travel_time_fn,
+        must_include_agent_id: str,
+    ) -> Optional[float]:
+        """
+        Same as best_case_disposal_time_rel, but only considers teams that include
+        `must_include_agent_id` (e.g., "robot").
+        """
+        # eligible disposers for this prop
+        eligible = []
+        for a in agents:
+            if prop == "X" and not getattr(a, "can_dispose_X", True):
+                continue
+            if prop == "Y" and not getattr(a, "can_dispose_Y", True):
+                continue
+            eligible.append(a)
+
+        if not eligible:
+            return None
+
+        # must-include must be eligible
+        if not any(a.agent_id == must_include_agent_id for a in eligible):
+            return None
+
+        k_min = max(1, int(getattr(b, "min_disposal_team", 1)))
+        k_max = min(int(getattr(b, "max_disposal_team", len(eligible))), len(eligible))
+        if k_min > k_max:
+            return None
+
+        base = float(b.dispose_time_X if prop == "X" else b.dispose_time_Y)
+
+        best = None
+        import itertools
+        for k in range(k_min, k_max + 1):
+            for team in itertools.combinations(eligible, k):
+                if not any(a.agent_id == must_include_agent_id for a in team):
+                    continue
+
+                max_travel = 0.0
+                for a in team:
+                    max_travel = max(max_travel, float(travel_time_fn(a.agent_id, b.box_id)))
+
+                t = max_travel + base * float(speed_factor(k))
+                if best is None or t < best:
+                    best = t
+
+        return best
+
+
+    def _robot_action_deadline_feasible(
+        self,
+        boxes_state: list,
+        current_time: float,
+        step: Tuple[int, str, str],  # (box_id, prop, kind)
+    ) -> bool:
+        """
+        Return True iff executing this robot step *now* can still meet the box deadline,
+        using the same conservative "best-case" reasoning as the optimizer.
+
+        Semantics:
+          - sense:
+              travel + sense_time + best_case_dispose_time <= deadline
+          - dispose:
+              best_case_dispose_time <= deadline
+
+        The best-case disposal team MUST include the robot.
+        """
+
+        # ---- unpack + sanity ----
+        try:
+            box_id, prop, kind = step
+            box_id = int(box_id)
+            prop = str(prop)
+            kind = str(kind)
+        except Exception:
+            return True
+
+        if prop not in ("X", "Y"):
+            return True
+        if kind not in ("sense", "dispose"):
+            return True
+        if not isinstance(boxes_state, list):
+            return True
+
+        # ---- build agents exactly like optimizer ----
+        agents: List[AgentState] = self._build_agents_for_optimizer()
+        if not agents:
+            return True
+
+        robot = next((a for a in agents if a.agent_id == "robot"), None)
+        if robot is None:
+            return True
+
+        # ---- build BoxInfo list and select target box ----
+        boxes, box_positions = self._build_boxes_for_optimizer(boxes_state, agents)
+        b = next((bx for bx in boxes if int(bx.box_id) == box_id), None)
+        if b is None:
+            return True
+
+        # ---- no deadline => always feasible ----
+        if b.deadline is None:
+            return True
+
+        # ---- already disposed => nothing to block ----
+        if prop == "X" and getattr(b, "disposed_X", False):
+            return True
+        if prop == "Y" and getattr(b, "disposed_Y", False):
+            return True
+
+        # ---- travel time fn identical to optimizer ----
+        agent_positions = self._snapshot_agent_positions()
+        travel_time_fn = self._make_travel_time_fn(agent_positions, box_positions)
+
+        # ============================================================
+        # SENSE feasibility
+        # ============================================================
+        if kind == "sense":
+            # senseability gating (same as MILP)
+            if prop == "X" and not b.senseable_X:
+                return False
+            if prop == "Y" and not b.senseable_Y:
+                return False
+
+            # robot must be able to sense this property
+            if prop == "X" and not robot.can_sense_X:
+                return False
+            if prop == "Y" and not robot.can_sense_Y:
+                return False
+
+            base_sense = b.sense_time_X if prop == "X" else b.sense_time_Y
+            travel = travel_time_fn("robot", box_id)
+            sense_total = float(base_sense) + float(travel)
+
+            # after sensing, we MUST still be able to dispose in best case
+            disp_best = self._best_case_disposal_time_rel_must_include(
+                agents=agents,
+                b=b,
+                prop=prop,
+                travel_time_fn=travel_time_fn,
+                must_include_agent_id="robot",
+            )
+
+            if disp_best is None:
+                return False
+
+            finish_time = float(current_time) + sense_total + float(disp_best)
+            return finish_time <= float(b.deadline)
+
+        # ============================================================
+        # DISPOSE feasibility
+        # ============================================================
+        disp_best = self._best_case_disposal_time_rel_must_include(
+            agents=agents,
+            b=b,
+            prop=prop,
+            travel_time_fn=travel_time_fn,
+            must_include_agent_id="robot",
+        )
+
+        if disp_best is None:
+            return False
+
+        finish_time = float(current_time) + float(disp_best)
+        return finish_time <= float(b.deadline)
+
+
     def _run_optimizer_thread(
         self,
         boxes_state: list,
@@ -3026,18 +3207,54 @@ class BrokerNode(Node, BrokerMediationMixin):
             # If we advanced the committed plan recently, now is the right time to check.
             if getattr(self, "_pending_frontier_check", False):
                 self._pending_frontier_check = False
-
+                need_fallback = False
+                # Optional logging you already had
                 missing = self._find_missing_frontier_disposals_from_optimizer()
                 if missing:
                     self.get_logger().info(f"[frontier] missing disposals suggested by optimizer: {missing}")
+                else:
+                    committed = getattr(self, "_committed_plan", None) or {}
+                    robot_steps = list(committed.get("robot") or [])
+                    head = robot_steps[0] if robot_steps else None
 
-                    step = self._take_next_robot_action_from_last_optimizer()
+                    head_ok = True
+                    head_step = None
+                    if head is not None:
+                        try:
+                            box_id, prop, kind = head
+                            head_step = (int(box_id), str(prop), str(kind))
+                            if head_step[2] in ("sense", "dispose"):
+                                head_ok = self._robot_action_deadline_feasible(boxes_state, current_time, head_step)
+                        except Exception:
+                            head_ok = True  # don't block on malformed
+
+
+                    need_fallback = not head_ok
+
                     self.get_logger().info(
-                        f"[commit2] committed empty? {not bool(self._committed_plan)} "
-                        f"has={self._has_committed_plan} last_opt_has={bool(self._last_optimizer_plan)}"
+                        f"[commit2] committed_empty={not bool(committed)} has={self._has_committed_plan} "
+                        f"robot_head={head_step} head_ok={head_ok} last_opt_has={bool(self._last_optimizer_plan)} "
+                        f"need_fallback={need_fallback}"
                     )
+
+                if need_fallback or missing:
+                    # IMPORTANT: pass current_time so this skips infeasible optimizer steps too
+                    step = self._take_next_robot_action_from_last_optimizer()
+
                     if step is not None:
+                        # If we had an infeasible committed head, you can either:
+                        # A) replace just the head (keep tail), or
+                        # B) nuke robot plan and commit a clean single step (safer).
+                        #
+                        # I strongly recommend (B) during frontier recovery.
                         self._commit_robot_single_step(step, current_time)
+                    else:
+                        self.get_logger().info("[frontier] no feasible optimizer robot step found; staying idle.")
+
+                else:
+                    # Optional: if you want to republish committed plan after frontier replan (usually not needed)
+                    pass
+
 
             
 

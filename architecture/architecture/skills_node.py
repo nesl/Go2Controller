@@ -127,6 +127,9 @@ class SkillsAgent(Node):
         self._sim_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
         self._sim_pose_lock = threading.Lock()
 
+
+        self.boxop_status_pub = self.create_publisher(StringMsg, "/box/op_status", 10)
+
         
         self.turn_speed = float(self.get_parameter("turn_speed_rad_s").value)
         self.fwd_speed  = float(self.get_parameter("fwd_speed_m_s").value)
@@ -278,6 +281,28 @@ class SkillsAgent(Node):
 
     def _sim_is_on(self) -> bool:
         return bool(self.get_parameter("sim_mode").value) and bool(self.get_parameter("sim_move_enable").value)
+
+    def _publish_boxop(self, *, phase: str, op: str, box_id: int, prop: str,
+                       req_id: str = "", status: str = "", success=None, detected=None,
+                       probability=None, why: str = "", extra: dict | None = None):
+        evt = {
+            "phase": phase,          # start|finish|cancel|skip
+            "op": op,                # sense|dispose
+            "agent_id": self.agent_id,
+            "box_id": int(box_id),
+            "prop": str(prop),
+            "req_id": str(req_id),
+            "status": status,
+            "success": success,
+            "detected": detected,
+            "probability": probability,
+            "why": why,
+            "ts": float(self.get_clock().now().nanoseconds * 1e-9),
+        }
+        if extra:
+            evt["extra"] = extra
+        self.boxop_status_pub.publish(StringMsg(data=json.dumps(evt)))
+
 
 
     def _send_nav_goal_handle(self, frame: str, x: float, y: float, yaw: float,
@@ -1563,6 +1588,14 @@ class SkillsAgent(Node):
                 "property": prop,
             }
 
+            req_id = f"sense:{self.agent_id}:{box_id}:{prop}:{int(time.time()*1000)}"
+
+            self._publish_boxop(
+                phase="start", op="sense", box_id=box_id, prop=prop,
+                req_id=req_id, status="starting"
+            )
+
+
             self.get_logger().info(f"[box.sense] POST {url} {payload}")
 
             result = {
@@ -1607,8 +1640,17 @@ class SkillsAgent(Node):
                     f"prob={result.get('probability')}"
                 )
 
-                if same_canonical_box_action(self._current_box_action, {"kind":"dispose","node_id":node_id,"property":prop}):
+                if same_canonical_box_action(self._current_box_action, {"kind":"sense","node_id":node_id,"property":prop}):
                     self._current_box_action = None
+
+                self._publish_boxop(
+                    phase="finish", op="sense", box_id=box_id, prop=prop,
+                    req_id=req_id,
+                    status=result.get("status") or "",
+                    detected=result.get("detected"),
+                    probability=result.get("probability"),
+                    why="completed"
+                )
 
 
                 h.mark_done()
@@ -1634,6 +1676,11 @@ class SkillsAgent(Node):
                 except Exception as e:
                     self.get_logger().warn(f"[box.sense] /sense/cancel failed: {e}")
                 finally:
+                    self._publish_boxop(
+                        phase="cancel", op="sense", box_id=box_id, prop=prop,
+                        req_id=req_id, status="cancelled", why="explicit_cancel"
+                    )
+
                     self._announce_box_op("sensing", "cancel", box_id, prop, status="cancel")
                     self._call_soon(_finish)
 
@@ -1728,6 +1775,11 @@ class SkillsAgent(Node):
                 "property": prop,
             }
 
+            req_id = f"dispose:{self.agent_id}:{box_id}:{prop}:{int(time.time()*1000)}"
+            self._publish_boxop(phase="start", op="dispose", box_id=box_id, prop=prop,
+                                req_id=req_id, status="starting")
+
+
             self.get_logger().info(f"[box.dispose] POST {url} {payload}")
 
             result = {
@@ -1770,8 +1822,14 @@ class SkillsAgent(Node):
                     f"status={result.get('status')}, success={result.get('success')}"
                 )
 
-                if same_canonical_box_action(self._current_box_action, {"kind":"sense","node_id":node_id,"property":prop}):
+                if same_canonical_box_action(self._current_box_action, {"kind":"dispose","node_id":node_id,"property":prop}):
                     self._current_box_action = None
+
+                self._publish_boxop(phase="finish", op="dispose", box_id=box_id, prop=prop,
+                                    req_id=req_id,
+                                    status=result.get("status") or "",
+                                    success=result.get("success"),
+                                    why="completed")
 
 
                 h.mark_done()
@@ -1789,6 +1847,8 @@ class SkillsAgent(Node):
                     cancel_payload = dict(payload)
                     self.get_logger().info(f"[box.dispose] POST {cancel_url} {cancel_payload} (cancel)")
                     resp_c = requests.post(cancel_url, json=cancel_payload, timeout=self.box_cancel_timeout)
+                    
+     
                     self.get_logger().info(
                         f"[box.dispose] cancel response code={resp_c.status_code} body={resp_c.text[:160]!r}"
                     )
@@ -1796,6 +1856,9 @@ class SkillsAgent(Node):
                 except Exception as e:
                     self.get_logger().warn(f"[box.dispose] /dispose/cancel failed: {e}")
                 finally:
+                    self._publish_boxop(phase="cancel", op="dispose", box_id=box_id, prop=prop,
+                                        req_id=req_id, status="cancelled", why="explicit_cancel")
+
                     self._announce_box_op("disposal", "cancel", node_id, prop)
                     self._call_soon(_finish)
 

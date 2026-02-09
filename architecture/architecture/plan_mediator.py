@@ -133,7 +133,7 @@ class MediationObjectiveMetrics:
             "deadline_risk": dr,
             "imbalance_level": _level_3(self.imbalance_XY),
             "fulfillment_history_ok": bool(self.fulfillment_history_ok),
-            "notes": self.notes,
+            "warnings": self.notes,
         }
 
 
@@ -214,6 +214,13 @@ class PlanMediator:
     """
 
     def __init__(self, config: MediationLLMConfig):
+        self.capabilities =  {
+          "Sam": {"sense": ["X"], "dispose": ["X"]},
+          "Jacob": {"sense": ["Y"], "dispose": ["Y"]},
+          "robot": {"sense": ["X","Y"], "dispose": ["X","Y"]}
+        }
+
+    
         if config.llm_call is None:
             raise ValueError("MediationLLMConfig.llm_call must be provided")
         self.config = config
@@ -839,6 +846,7 @@ class PlanMediator:
 
         # User payload: identical + only reason field
         user_payload = {
+            "capabilities": self.capabilities,
             "planning_view": planning_view,
             "phase": phase,
             "autoresolve_reason": reason,  # --- DIFF #3 ---
@@ -1037,6 +1045,7 @@ class PlanMediator:
 
 
         user_payload = {
+            "capabilities": self.capabilities,
             "planning_view": planning_view,
             "phase": phase,
             "objective_metrics": state.objective.for_llm(),

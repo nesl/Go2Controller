@@ -94,7 +94,7 @@ class PlannerWeights:
     reward_correct_Y: float = 1.0
     weight_info: float = 0.2
     lambda_balance: float = 0.5
-    info_threshold_for_dispose: float = 0.6
+    info_threshold_for_dispose: float = 0.4
 
     # “style” knobs
     # how much we prefer exploration (sensing) vs exploitation (disposal)
@@ -111,6 +111,7 @@ class PlannerWeights:
     lambda_deadline_risk: float = 0.0  # extra penalty for disposals close to / past deadline
     lambda_sense_slack: float = 0.005  # small like 0.001
 
+    pmin_for_dispose: float = 0.6
 
 @dataclass
 class DisposalOutcome:
@@ -545,6 +546,13 @@ def plan_assignments_gurobi(
                     continue
                 if p == "Y" and not getattr(a, "can_dispose_Y", True):
                     continue
+
+                # probability gate (box-level: any property sufficiently likely)
+                p_box = max(float(b.p_true_X), float(b.p_true_Y))
+                if p_box < float(weights.pmin_for_dispose):
+                    continue
+
+
 
                 # info gate
                 info_level = b.info_X if p == "X" else b.info_Y
