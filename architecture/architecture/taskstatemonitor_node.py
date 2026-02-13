@@ -174,7 +174,7 @@ class BrokerNode(Node, BrokerMediationMixin):
         self.declare_parameter('iteration_limit', 2)
         self.declare_parameter('pull_limit', 2)
 
-        self.declare_parameter("plan_accept_policy", "always_accept") #"normal")
+        self.declare_parameter("plan_accept_policy", "always_accept_no_proactive")  # or "normal"
 
         self.declare_parameter('sim_mode', False)
 
@@ -271,6 +271,9 @@ class BrokerNode(Node, BrokerMediationMixin):
             .get_parameter_value()
             .bool_value
         )
+        
+        self.ask_for_plan = True
+        self.ask_for_plan_timer = time.time()
         
         # NEW: task registry path so we can subscribe to perf topics
         
@@ -464,9 +467,15 @@ class BrokerNode(Node, BrokerMediationMixin):
             f"enable_server={self.enable_server}"
         )
 
-
     def _always_accept(self) -> bool:
-        return (getattr(self, "plan_accept_policy", "normal") == "always_accept")
+        return ("always_accept" in getattr(self, "plan_accept_policy", "normal"))
+
+    def _no_proactive(self) -> bool:
+        """
+        If true, the broker should NEVER proactively suggest new plans to humans.
+        (Still allowed to react when explicitly asked, unless you also gate that.)
+        """
+        return ("no_proactive" in getattr(self, "plan_accept_policy", "normal"))
 
 
     def _swap_str(self, s: str, mapping: dict) -> str:
@@ -959,6 +968,10 @@ class BrokerNode(Node, BrokerMediationMixin):
         Debounced to avoid spam.
         """
         if self._comms_disabled():
+            return
+        
+        if self._no_proactive():
+            #self._robot_say("What should I do?")
             return
         
         # --- debounce identical plans ---
@@ -2371,6 +2384,10 @@ class BrokerNode(Node, BrokerMediationMixin):
         except Exception:
             human_profiles = {}
 
+        # after you compute optimizer_suggestions ...
+        if self._no_proactive():
+            optimizer_suggestions = {aid: [] for aid in ("robot", "human_a", "human_b")}
+
 
         # 5) Build payload for the LLM.
         context_payload = {
@@ -2865,6 +2882,8 @@ class BrokerNode(Node, BrokerMediationMixin):
                         self.get_logger().info(f"[commit] current_action={self._current_action_brief()}")
                     else:
                         self.get_logger().info("[commit] prune emptied committed plan; skipping publish of empty plan")
+                        self.ask_for_plan = True
+                        self.ask_for_plan_timer = time.time()
                 except Exception as e:
                     self.get_logger().warn(f"[commit] republish after prune failed: {e}")
 
@@ -2883,7 +2902,7 @@ class BrokerNode(Node, BrokerMediationMixin):
                 robot_has_committed = bool(committed_now.get("robot"))
                 missing_frontier_disposals = None
                 
-                if advanced and not self._mediation_in_progress():
+                if not self._no_proactive() and advanced and not self._mediation_in_progress():
                     # We need a fresh optimizer plan *for the new frontier*
                     self._pending_frontier_check = True
                     self._trigger_optimizer_once_nopub(
@@ -2899,16 +2918,25 @@ class BrokerNode(Node, BrokerMediationMixin):
 
 
                 # ✅ existing fallback: only when committed plan is empty (and not in mediation)
-                if (not committed_now) or (not self._has_committed_plan):
-                    step = self._take_next_robot_action_from_last_optimizer()
-                    self.get_logger().info(
-                        f"[commit] committed empty? {not bool(self._committed_plan)} "
-                        f"has={self._has_committed_plan} last_opt_has={bool(self._last_optimizer_plan)}"
-                    )
-                    if step is not None:
-                        self._commit_robot_single_step(step, current_time)
-                    else:
-                        self.get_logger().info("[commit] committed plan empty and no optimizer remainder; staying idle.")
+                if (not committed_now) or (not self._has_committed_plan and not self._no_proactive()):
+                
+                    if not self._no_proactive():
+                        step = self._take_next_robot_action_from_last_optimizer()
+                        self.get_logger().info(
+                            f"[commit] committed empty? {not bool(self._committed_plan)} "
+                            f"has={self._has_committed_plan} last_opt_has={bool(self._last_optimizer_plan)}"
+                        )
+                        if step is not None:
+                            self._commit_robot_single_step(step, current_time)
+                        else:
+                            self.get_logger().info("[commit] committed plan empty and no optimize remainder; staying idle.")
+                    elif self.ask_for_plan:
+                        self.get_logger().info(f"[commit] {committed_now} {self._has_committed_plan}")
+                        self.ask_for_plan = False
+                        self._robot_say("What should I do?")
+                    elif time.time() - self.ask_for_plan_timer > 30:
+                        self.ask_for_plan = True
+                        self.ask_for_plan_timer = time.time()
         except Exception as e:
             self.get_logger().warn(f"[commit] prune failed: {e}")
 
@@ -3373,7 +3401,7 @@ class BrokerNode(Node, BrokerMediationMixin):
                 can_sense_X=True,
                 can_sense_Y=False,
                 can_dispose_X=True,
-                can_dispose_Y=False,
+                can_dispose_Y=True,
                 detect_present_X=hA_pX,
                 detect_absent_X=hA_aX,
                 detect_present_Y=hA_pY,
@@ -3384,7 +3412,7 @@ class BrokerNode(Node, BrokerMediationMixin):
                 max_time=self.optimizer_time_human_b,
                 can_sense_X=False,
                 can_sense_Y=True,
-                can_dispose_X=False,
+                can_dispose_X=True,
                 can_dispose_Y=True,                
                 detect_present_X=hB_pX,
                 detect_absent_X=hB_aX,
@@ -3694,9 +3722,10 @@ class BrokerNode(Node, BrokerMediationMixin):
 
         # Announce (same as before)
         try:
-            opt_plan = getattr(self, "_last_optimizer_plan", None) or {}
-            plan_to_announce = opt_plan if isinstance(opt_plan, dict) and opt_plan else self._committed_plan
-            self._announce_idle_plan(plan_to_announce, current_time)
+            if not self._no_proactive():
+                opt_plan = getattr(self, "_last_optimizer_plan", None) or {}
+                plan_to_announce = opt_plan if isinstance(opt_plan, dict) and opt_plan else self._committed_plan
+                self._announce_idle_plan(plan_to_announce, current_time)
         except Exception as e:
             self.get_logger().warn(f"[commit] announce/propose failed after auto-commit: {e}")
 

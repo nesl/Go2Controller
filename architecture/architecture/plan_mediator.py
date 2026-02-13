@@ -215,8 +215,8 @@ class PlanMediator:
 
     def __init__(self, config: MediationLLMConfig):
         self.capabilities =  {
-          "Sam": {"sense": ["X"], "dispose": ["X"]},
-          "Jacob": {"sense": ["Y"], "dispose": ["Y"]},
+          "Sam": {"sense": ["X"], "dispose": ["X","Y"]},
+          "Jacob": {"sense": ["Y"], "dispose": ["X","Y"]},
           "robot": {"sense": ["X","Y"], "dispose": ["X","Y"]}
         }
 

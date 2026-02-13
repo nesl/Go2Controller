@@ -976,6 +976,8 @@ class SkillsAgent(Node):
             else:
                 self._cancel_all_active(why=f"before_execute:{name}")
 
+            self._current_box_action = new_sig
+
             # orchestrator explicitly requested this skill → reset quarantine for it
             if hasattr(self.skill_engine, "bad_skills"):
                 if name in self.skill_engine.bad_skills:
@@ -1575,7 +1577,7 @@ class SkillsAgent(Node):
                 prop = "X"
 
             # Track "current action" for cancel gating
-            self._current_box_action = {"kind": "sense", "node_id": node_id, "property": prop}
+            #self._current_box_action = {"kind": "sense", "node_id": node_id, "property": prop}
 
 
             base_url   = self.box_server_url.rstrip("/")
@@ -1762,7 +1764,7 @@ class SkillsAgent(Node):
             if prop not in ("X", "Y"):
                 self.get_logger().warn(f"[box.dispose] invalid property={property!r}; forcing 'X'.")
                 prop = "X"
-            self._current_box_action = {"kind": "dispose", "node_id": node_id, "property": prop}
+            #self._current_box_action = {"kind": "dispose", "node_id": node_id, "property": prop}
 
 
             base_url   = self.box_server_url.rstrip("/")

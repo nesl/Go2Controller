@@ -1,6 +1,8 @@
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import OpaqueFunction
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from ament_index_python.packages import get_package_share_directory
 import os
 
@@ -27,8 +29,15 @@ def _clear_runtime_files(context, *args, **kwargs):
     return []
 
 def generate_launch_description():
+    plan_accept_policy = LaunchConfiguration("plan_accept_policy")
     return LaunchDescription([
         OpaqueFunction(function=_clear_runtime_files),
+
+        DeclareLaunchArgument(
+            "plan_accept_policy",
+            default_value="normal",
+            description="Policy for plan acceptance"
+        ),
 
         Node(
             package='architecture',
@@ -73,6 +82,7 @@ def generate_launch_description():
             parameters=[{
                 'task_registry_path': os.path.join(pkg_share, 'config', 'task_registry.yaml'),
                 'sim_mode': True,
+                "plan_accept_policy": plan_accept_policy
             }]
         ),
         Node(

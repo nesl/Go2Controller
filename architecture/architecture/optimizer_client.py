@@ -111,7 +111,7 @@ class PlannerWeights:
     lambda_deadline_risk: float = 0.0  # extra penalty for disposals close to / past deadline
     lambda_sense_slack: float = 0.005  # small like 0.001
 
-    pmin_for_dispose: float = 0.6
+    pmin_for_dispose: float = 0.8
 
 @dataclass
 class DisposalOutcome:
@@ -491,14 +491,15 @@ def plan_assignments_gurobi(
                 can_sense = (a.can_sense_X if p == "X" else a.can_sense_Y)
                 already = b.already_sensed.get(a.agent_id, {}).get(p, False)
 
-                # right now, if it is not senseable it will not be disposable as well
-                if p == "X" and not getattr(b, "senseable_X", True):
-                    continue
-                if p == "Y" and not getattr(b, "senseable_Y", True):
-                    continue
+
+                senseable = True
+                if p == "X":
+                    senseable = getattr(b, "senseable_X", True)
+                else:
+                    senseable = getattr(b, "senseable_Y", True)
 
 
-                if can_sense and not already:
+                if senseable and can_sense and not already:
                     base_sense_time = b.sense_time_X if p == "X" else b.sense_time_Y
                     travel = travel_time_fn(a.agent_id, b.box_id)
                     total_sense_time = float(base_sense_time) + float(travel)
@@ -1647,6 +1648,8 @@ def extend_plan_with_prefix(
                 max_time=remaining,
                 can_sense_X=a.can_sense_X,
                 can_sense_Y=a.can_sense_Y,
+                can_dispose_X=getattr(a, "can_dispose_X", True),
+                can_dispose_Y=getattr(a, "can_dispose_Y", True),
                 detect_present_X=a.detect_present_X,
                 detect_absent_X=a.detect_absent_X,
                 detect_present_Y=a.detect_present_Y,
