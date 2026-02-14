@@ -2877,7 +2877,7 @@ class BrokerNode(Node, BrokerMediationMixin):
                     if self._committed_plan:
                         box_positions = getattr(self, "_last_box_positions", {}) or {}
                         self._publish_optimizer_plan(self._committed_plan, current_time, box_positions)
-                        self.get_logger().info("[commit] pruned fulfilled actions from committed plan and republished.")
+
                         self.get_logger().info(f"[commit] publishing committed plan after prune: {self._committed_plan}")
                         self.get_logger().info(f"[commit] current_action={self._current_action_brief()}")
                     else:
@@ -2894,6 +2894,7 @@ class BrokerNode(Node, BrokerMediationMixin):
             
             advanced = (head_before is not None) and (head_before != (robot_after[0] if robot_after else None))
 
+            self.get_logger().info(f"[commit] what  happens {self._mediation_in_progress()} {self._committed_plan}.")
 
             # If we still have committed robot steps, check optimizer for *missing disposals*
             # and surface them (mediation path) instead of doing auto-commit fallback.
@@ -2918,7 +2919,7 @@ class BrokerNode(Node, BrokerMediationMixin):
 
 
                 # ✅ existing fallback: only when committed plan is empty (and not in mediation)
-                if (not committed_now) or (not self._has_committed_plan and not self._no_proactive()):
+                if (not robot_has_committed) or (not self._has_committed_plan and not self._no_proactive()):
                 
                     if not self._no_proactive():
                         step = self._take_next_robot_action_from_last_optimizer()

@@ -112,6 +112,8 @@ class PlannerWeights:
     lambda_sense_slack: float = 0.005  # small like 0.001
 
     pmin_for_dispose: float = 0.8
+    
+    egoistic_goal_property: Optional[str] = None
 
 @dataclass
 class DisposalOutcome:
@@ -836,6 +838,12 @@ def plan_assignments_gurobi(
         else:
             p_prior = float(b.p_true_Y)
             tpr, fpr = float(a.detect_present_Y), float(a.detect_absent_Y)
+
+        # Egoistic gating: only reward sensing for my goal property
+        if weights.egoistic_goal_property is not None:
+            if str(p) != str(weights.egoistic_goal_property):
+                continue
+
 
         ig = expected_info_gain_one(p_prior, tpr, fpr)
 
@@ -1869,7 +1877,7 @@ if __name__ == "__main__":
         reward_correct_Y=1.0,
         weight_info=0.2,
         lambda_balance=0.5,
-        info_threshold_for_dispose=0.6,
+        info_threshold_for_dispose=0.4,
         prefer_exploration=0.0,
         lambda_load_fairness=0.0,
         lambda_robot_overuse=0.0,

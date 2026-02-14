@@ -21,6 +21,11 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String as StringMsg
 
+from architecture.optimizer_client import (
+    AgentState, BoxInfo, PlannerWeights, plan_assignments_gurobi, info_level_from_p
+)
+
+
 Property = Literal["X", "Y"]
 
 RED = "\033[31m"
@@ -442,7 +447,7 @@ class LLMPolicy(BasePolicy):
             f"You are {agent.agent_id} ({agent._display_name(agent.agent_id)}), a simulated human.\n"
             f"Your personal objective: maximize disposals of property {agent.goal_property} before deadlines.\n\n"
             "You act in discrete steps. Each step you decide what YOU will do now.\n"
-            "You may ALSO propose what other agents should do, but you cannot control them directly.\n\n"
+            "You are the team lead for this session. Your job is to coordinate the robot (Bob) and align the team on what to do next.\n\n"
             "NEW OUTPUT STYLE:\n"
             "- Output a TEAM PLAN dictionary keyed by agent_id.\n"
             f"- Only the FIRST step under team_plan['{agent.agent_id}'] will be executed by you this tick.\n"
@@ -493,6 +498,11 @@ class LLMPolicy(BasePolicy):
             "- assist_dispose: requires box_id (prop omitted)\n"
             "- goto_only: requires box_id\n"
             "- idle: no other fields\n\n"
+
+
+            "Candidate plans are suggestions, not commands.\n"
+            "- egoistic_team_plan: a self-interested plan that prioritizes YOUR goal_property (X or Y) and your own progress.\n"
+            "- prosocial_team_plan: a team-interested plan that prioritizes overall team success (deadlines, safety, coordination).\n\n"
 
             "Output FORMAT (strict): output ONLY valid JSON matching this schema:\n"
             "{\n"
@@ -769,7 +779,10 @@ class LLMPolicy(BasePolicy):
             reason=reason,
         )
 
-    def decide_on_message(self, agent: "SimHumanAgent", boxes: List[BoxSummary], now_sim: float, msg_evt: Dict[str, Any]) -> Optional[PolicyAction]:
+    def decide_on_message(self, agent: "SimHumanAgent", boxes: List[BoxSummary], now_sim: float, msg_evts) -> Optional[PolicyAction]:
+    
+        msg_evt = msg_evts[-1]
+    
         if agent.llm_provider != "openai":
             return None
         client = self._get_client(agent)
@@ -782,7 +795,7 @@ class LLMPolicy(BasePolicy):
         # User prompt includes: world, plan_state, trust, the message
         obs = json.loads(self._user_prompt(agent, boxes, now_sim))
         obs["mode"] = "handle_message"
-        obs["incoming_message"] = {"speaker_id": msg_evt["speaker_id"], "text": msg_evt["text"]}
+        #obs["incoming_message"] = {"speaker_id": msg_evt["speaker_id"], "text": msg_evt["text"]}
         ps = dict(agent.plan_state or {})
         ps["commitments"] = [] #agent._current_commitments(now_sim=now_sim, limit=10)
         obs["plan_state"] = ps
@@ -833,7 +846,7 @@ class LLMPolicy(BasePolicy):
             agent.plan_state["last_message_decision"] = parsed.get("message_decision")
             agent.plan_state["last_message_reason"] = parsed.get("reason", "")
             agent.plan_state["last_message_from"] = msg_evt.get("speaker_id")
-            agent.plan_state["last_message_text"] = msg_evt.get("text")
+            agent.plan_state["last_message_text"] = "" #msg_evt.get("text")
             agent.plan_state["last_message_time"] = now_sim
 
         decision = parsed.get("message_decision")
@@ -973,6 +986,7 @@ class LLMPolicy(BasePolicy):
         return (
             f"You are the decision-making policy for {agent.agent_id} ({agent._display_name(agent.agent_id)}).\n"
             f"Goal: dispose boxes with property {agent.goal_property} before deadlines.\n"
+            "You are the team lead for this session. Your job is to coordinate the robot (Bob) and align the team on what to do next.\n"
             "You receive ONE incoming message and must decide how to respond.\n\n"
 
             #"IMPORTANT: You will receive a 'you.traits' object with qualitative levels.\n"
@@ -997,6 +1011,10 @@ class LLMPolicy(BasePolicy):
             "- If the incoming message is a help request, decide accept/reject/negotiate/defer based on your current plan_state.\n"
             "- If the incoming message asks you to sense/dispose a box, include box_id and prop in the action.\n\n"
 
+            "Candidate plans are suggestions, not commands.\n"
+            "- egoistic_team_plan: a self-interested plan that prioritizes YOUR goal_property (X or Y) and your own progress.\n"
+            "- prosocial_team_plan: a team-interested plan that prioritizes overall team success (deadlines, safety, coordination).\n\n"
+
             "Decision guidance (apply traits!):\n"
             #"- If risk_aversion_level is high, do NOT accept dispose unless confidence is clearly above threshold; prefer defer/negotiate/sense.\n"
             #"- If stubbornness_level is high, negotiate when the request conflicts with your imminent plan or repeats something already in progress.\n"
@@ -1014,7 +1032,7 @@ class LLMPolicy(BasePolicy):
             '  "urgent_override": boolean,\n'
             '  "priority": number,\n'
             '  "action": {\n'
-            '    "kind": "idle|ask_help|sense_self|dispose|assist_dispose|say|goto_only",\n'
+            '    "kind": "idle|ask_help|sense_self|dispose|say|goto_only",\n'
             '    "box_id": number|null,\n'
             '    "prop": "X|Y|null",\n'
             '    "target_speaker": string|null,\n'
@@ -1151,7 +1169,7 @@ class LLMPolicy(BasePolicy):
 
 
         # ✅ commitments override: if we promised to help someone, do that first
-        c = agent._next_executable_commitment(now_sim)
+        c = None # agent._next_executable_commitment(now_sim)
         if c is not None:
             box_id = int(c["box_id"])
             prop = str(c["prop"]).upper()
@@ -1368,7 +1386,7 @@ class SimHumanAgent(Node):
         # motion + timing
         self.declare_parameter("speed_mps", 1.0)
         self.declare_parameter("decision_period_sec", 1.0)
-        self.declare_parameter("request_timeout_sec", 120.0)
+        self.declare_parameter("request_timeout_sec", 300.0)
 
         # policy knobs
         self.declare_parameter("policy_type", "scripted")  # scripted | llm
@@ -1433,7 +1451,12 @@ class SimHumanAgent(Node):
         self.declare_parameter("prior_temperature", 1.0)
         self.declare_parameter("prior_clip_min", 0.02)
         self.declare_parameter("prior_clip_max", 0.98)
+        self.declare_parameter("no_target_speaker", True)
 
+
+        self._stop = False
+        
+        
         self.prior_default_X = float(self.get_parameter("prior_default_X").value)
         self.prior_default_Y = float(self.get_parameter("prior_default_Y").value)
         self.prior_temperature = float(self.get_parameter("prior_temperature").value)
@@ -1446,7 +1469,7 @@ class SimHumanAgent(Node):
         except Exception:
             self.prior_field = {}
 
-
+        self.no_target_speaker = bool(self.get_parameter("no_target_speaker").value)
         
         # ---- communication master switch ----
         self.declare_parameter("comm_enable", True)
@@ -1483,7 +1506,7 @@ class SimHumanAgent(Node):
 
 
 
-        self.declare_parameter("infer_target_use_llm", True)
+        self.declare_parameter("infer_target_use_llm", False)
         self.declare_parameter("infer_target_max_history", 8)
 
         self.infer_target_use_llm = bool(self.get_parameter("infer_target_use_llm").value)
@@ -1565,6 +1588,9 @@ class SimHumanAgent(Node):
             self.sub_stt = None
             self.speech_sim_enable = False
 
+        self._router_wakeup = threading.Event()
+        self._router_thread = threading.Thread(target=self._router_worker_main, daemon=True)
+        self._router_thread.start()
 
         # timers: action always; router only if comm enabled
         self._action_timer = self.create_timer(self.decision_period, self._tick)
@@ -1632,7 +1658,7 @@ class SimHumanAgent(Node):
         # threading
         self._action_lock = threading.Lock()
         self._action_thread: Optional[threading.Thread] = None
-        self._stop = False
+
 
         # participants/profiles
         self.participants: Dict[str, Dict[str, Any]] = {}
@@ -1796,21 +1822,83 @@ class SimHumanAgent(Node):
         )
 
 
-
     def _compute_candidate_plans(self, boxes: List[BoxSummary], now_sim: float, k: int = 6) -> Dict[str, Any]:
         include_all = bool(getattr(self, "candidate_plans_include_all_agents", True))
 
-        ego = self._build_team_plan_candidate(boxes, now_sim, k=k, mode="egoistic", include_all_agents=include_all)
-        pro = self._build_team_plan_candidate(boxes, now_sim, k=k, mode="prosocial", include_all_agents=include_all)
+        # 1) Build MILP inputs (AgentState/BoxInfo) from current world
+        agents, box_infos, travel_time_fn, horizon = self._build_milp_inputs_for_candidates(
+            boxes=boxes,
+            now_sim=now_sim,
+            k=k,
+            include_all_agents=include_all,
+        )
 
-        # basic “dilemma” signal: do the top recommended *self* actions differ?
+        
+
+        # 2) Two weight profiles
+        my_goal = str(self.goal_property).upper()
+        #self.get_logger().info(f"{agents} {box_infos} {my_goal}")
+        
+        ego_w = PlannerWeights(
+            reward_correct_X=1.0 if my_goal == "X" else 0.0,
+            reward_correct_Y=1.0 if my_goal == "Y" else 0.0,
+            lambda_balance=0.0,         # egoistic: no X/Y balancing pressure
+            weight_info=0.2,           # optional: egoist explores less
+            # keep your existing gates:
+            info_threshold_for_dispose=0.4,
+            pmin_for_dispose=0.7,
+            egoistic_goal_property=my_goal,
+        )
+
+        non_goal = "Y" if str(my_goal).upper() == "X" else "X"
+
+        pro_w = PlannerWeights(
+            reward_correct_X=1.0 if not my_goal == "X" else 0.0,
+            reward_correct_Y=1.0 if not my_goal == "Y" else 0.0,
+            lambda_balance=0.5,         # prosocial: balanced team progress
+            weight_info=0.2,
+            info_threshold_for_dispose=0.4,
+            pmin_for_dispose=0.7,
+            egoistic_goal_property=non_goal
+        )
+
+        # 3) Solve twice
+        ego_plan = plan_assignments_gurobi(
+            agents=agents,
+            boxes=box_infos,
+            current_time=float(now_sim),
+            horizon=float(horizon),
+            travel_time_fn=travel_time_fn,
+            weights=ego_w,
+
+        )
+        
+        
+        pro_plan = plan_assignments_gurobi(
+            agents=agents,
+            boxes=box_infos,
+            current_time=float(now_sim),
+            horizon=float(horizon),
+            travel_time_fn=travel_time_fn,
+            weights=pro_w,
+        )
+
+        # 4) Convert optimizer Plan tuples -> your dict-of-dicts schema
+        ego = self._plan_tuples_to_candidate_schema(ego_plan)
+        pro = self._plan_tuples_to_candidate_schema(pro_plan)
+
+        max_actions = int(getattr(self, "candidate_plans_max_actions_per_agent", 2))  # e.g., 2
+        ego = self._limit_actions_per_agent(ego, max_actions_per_agent=max_actions)
+        pro = self._limit_actions_per_agent(pro, max_actions_per_agent=max_actions)
+
+
+        # 5) dilemma signal (unchanged)
         def top_self_step(tp: Dict[str, List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
             steps = (tp or {}).get(self.agent_id, []) or []
             return steps[0] if steps else None
 
         ego_top = top_self_step(ego)
         pro_top = top_self_step(pro)
-
         conflict = (ego_top != pro_top) and (ego_top is not None) and (pro_top is not None)
 
         return {
@@ -1824,30 +1912,35 @@ class SimHumanAgent(Node):
             },
         }
 
-
-    def _build_team_plan_candidate(
+    def _limit_actions_per_agent(
         self,
-        boxes: List[BoxSummary],
-        now_sim: float,
+        plan: Dict[str, List[Dict[str, Any]]],
         *,
-        k: int,
-        mode: str,  # "egoistic" | "prosocial"
-        include_all_agents: bool,
+        max_actions_per_agent: int,
+        always_keep_self_top: bool = True,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Greedy single-step assignment per agent.
-        - egoistic: maximize MY goal_property value (others are assigned only if include_all_agents=True, but scored for helping my goal)
-        - prosocial: maximize TEAM expected hazard value (X+Y)
-        """
+        if max_actions_per_agent <= 0:
+            return {aid: [] for aid in (plan or {}).keys()}
 
-        # who are we planning for?
-        agent_ids = list(self.participants.keys()) if include_all_agents else [self.agent_id]
+        out: Dict[str, List[Dict[str, Any]]] = {}
 
-        # initialize plan dict with idle
-        plan: Dict[str, List[Dict[str, Any]]] = {aid: [] for aid in agent_ids}
+        for aid, steps in (plan or {}).items():
+            steps = list(steps or [])
+            if not steps:
+                out[aid] = []
+                continue
 
-        # choose a small candidate set of boxes (reuse your existing urgency scoring)
-        # You can reuse _select_top_k_boxes() if it’s on policy; here do a simple filter:
+            if always_keep_self_top and aid == self.agent_id:
+                # keep top step + next N-1
+                out[aid] = steps[:max_actions_per_agent]
+            else:
+                out[aid] = steps[:max_actions_per_agent]
+
+        return out
+
+
+    def _build_milp_inputs_for_candidates(self, boxes: List[BoxSummary], now_sim: float, k: int, include_all_agents: bool):
+        # pick candidate boxes similar to your current deadline filtering
         cand = []
         for b in boxes:
             if self._disposed_any(b):
@@ -1857,183 +1950,121 @@ class SimHumanAgent(Node):
             cand.append(b)
         cand = sorted(cand, key=lambda b: float(b.deadline))[: max(1, int(k))]
 
-        # reserve boxes so two agents don’t pick the exact same solo task
-        reserved: set[tuple[int, str, str]] = set()  # (box_id, kind, prop_or_blank)
+        # agents to include
+        agent_ids = list(self.participants.keys()) if include_all_agents else [self.agent_id]
 
+        # ---- build AgentState list ----
+        agents: List[AgentState] = []
         for aid in agent_ids:
-            step = self._best_step_for_agent(aid, cand, now_sim, mode=mode, reserved=reserved)
-            if step is None:
-                continue
-            plan[aid] = [step]
-            #reserved.add((int(step.get("box_id", -1)), str(step.get("kind")), str(step.get("prop") or "")))
+            # TODO: plug your real max_time/horizon choices
+            max_time = float(getattr(self, "planner_horizon_sec", 300.0))
 
-        return plan
+            # mirror your sense constraints
+            can_sense_X = (aid == "robot") or (aid == "human_a")
+            can_sense_Y = (aid == "robot") or (aid == "human_b")
 
+            agents.append(AgentState(
+                agent_id=aid,
+                max_time=max_time,
+                can_sense_X=can_sense_X,
+                can_sense_Y=can_sense_Y,
+                can_dispose_X=True,   # per your rule: anyone can dispose any prop
+                can_dispose_Y=True,
+            ))
 
-    def _best_step_for_agent(
-        self,
-        agent_id: str,
-        cand_boxes: List[BoxSummary],
-        now_sim: float,
-        *,
-        mode: str,
-        reserved: set,
-    ) -> Optional[Dict[str, Any]]:
-        best = None
-        best_score = -1e18
+        # ---- build BoxInfo list ----
+        box_infos: List[BoxInfo] = []
+        for b in cand:
+            # You already have belief + info functions in your policy code
+            pX = float(self._belief_present_from_box(b, "X"))
+            pY = float(self._belief_present_from_box(b, "Y"))
+            infoX = float(self._info_level_for_box(b, "X"))  # implement if you don’t already have
+            infoY = float(self._info_level_for_box(b, "Y"))
 
-        # what prop would this agent prioritize?
-        # (egoistic uses my goal; prosocial uses “their likely goal” if known, else both)
-        # For now: humans keep their configured goal_property if agent_id == self.agent_id, otherwise infer:
-        def agent_goal(aid: str) -> str:
-            if aid == self.agent_id:
-                return str(self.goal_property)
-            # simple heuristic: if you encode goals elsewhere, use that; else default by id name:
-            if "human_a" in aid:
-                return "X"
-            if "human_b" in aid:
-                return "Y"
-            return "X"  # robot can do both anyway
+            already_sensed = {}
+            for a in agents:
+                already_sensed[a.agent_id] = {
+                    "X": self._already_sensed(b, "X", a.agent_id),
+                    "Y": self._already_sensed(b, "Y", a.agent_id),
+                }
 
-        # ✅ enumerate only props this agent is allowed to SENSE
-        if str(agent_id) == "robot":
-            sense_props = ["X", "Y"]
-        elif str(agent_id) == "human_a":
-            sense_props = ["X"]
-        elif str(agent_id) == "human_b":
-            sense_props = ["Y"]
-        else:
-            sense_props = [str(self.goal_property)]
+            box_infos.append(BoxInfo(
+                box_id=int(b.box_id),
+                deadline=float(b.deadline),
+                sense_time_X=float(b.sense_time_X),
+                sense_time_Y=float(b.sense_time_Y),
+                dispose_time_X=float(b.dispose_time_X),
+                dispose_time_Y=float(b.dispose_time_Y),
+                p_true_X=pX,
+                p_true_Y=pY,
+                disposed_X=bool(b.disposed_X),
+                disposed_Y=bool(b.disposed_Y),
+                info_X=infoX,
+                info_Y=infoY,
+                already_sensed=already_sensed,
+                # if you use your halving rule, keep these:
+                min_disposal_team=int(getattr(b, "min_disposal_team", 1)),
+                max_disposal_team=int(getattr(b, "max_disposal_team", len(agents))),
+                senseable_X=bool(getattr(b, "senseable_X", True)),
+                senseable_Y=bool(getattr(b, "senseable_Y", True)),
+            ))
 
-        for b in cand_boxes:
+        box_map = {int(b.box_id): b for b in cand}
 
-            for prop in sense_props:
-                # gate: can this agent sense that prop here?
-                if not self._can_sense(b, prop, agent_id=agent_id):
-                    continue
-                # inside _best_step_for_agent, before scoring a sense step:
-                already_sensed_by_me = any(
-                    sr.get("status") == "completed"
-                    and str(sr.get("property")) == str(prop)
-                    and str(sr.get("agent_id")) == str(agent_id)
-                    for sr in (b.sense_results or [])
-                )
-                if already_sensed_by_me:
-                    continue
-
-
-                # don’t propose duplicate exact same step that another agent already took
-                if (b.box_id, "sense", prop) in reserved:
-                    continue
-
-                # score sensing
-                s_score = self._score_step(agent_id, b, now_sim, kind="sense", prop=prop, mode=mode, agent_goal=agent_goal)
-                if s_score > best_score:
-                    best_score = s_score
-                    best = {"kind": "sense", "box_id": int(b.box_id), "prop": str(prop)}
-
-            # ✅ disposal candidates for BOTH props (anyone can dispose any property)
-            for prop in ("X", "Y"):
-                # score disposal (only if feasible-ish)
-                if not self._has_completed_sense_for_prop(b, prop):
-                    continue
-               
-                if (b.box_id, "dispose", prop) in reserved:
-                    continue
-                d_score = self._score_step(agent_id, b, now_sim, kind="dispose", prop=prop, mode=mode, agent_goal=agent_goal)
-                if d_score > best_score:
-                    best_score = d_score
-                    best = {"kind": "dispose", "box_id": int(b.box_id), "prop": str(prop)}
-
-            # optionally: assist if someone is disposing (you already expose time_left_sec_dispose in briefs)
-            # If you want it inside candidate plans, you can add it here using your _op_remaining_cache.
-
-        # if best is terrible, return idle
-        if best is None or best_score < -1e9:
-            return None
-        return best
+        def travel_time_fn(agent_id: str, box_id: int) -> float:
+            b = box_map.get(int(box_id))
+            if b is None:
+                return 0.0
+            dist = float(self._dist_to(float(b.x), float(b.y)))
+            speed = float(getattr(self, "travel_speed_mps", 1.0))
+            return dist / max(0.05, speed)
 
 
-
-    def _score_step(
-        self,
-        agent_id: str,
-        b: BoxSummary,
-        now_sim: float,
-        *,
-        kind: str,  # "sense"|"dispose"
-        prop: str,
-        mode: str,
-        agent_goal,
-    ) -> float:
-        """
-        Simple scoring:
-        - urgency: earlier deadline better
-        - travel: closer better (approx using self pose only; OK for prompting)
-        - feasibility: impossible -> huge negative
-        - value:
-            egoistic: prioritize MY goal_property hazard probability
-            prosocial: prioritize both hazards; (X+Y) minus “wasted benign work”
-        """
-                
-        # belief proxy (uses your fusion)
-        pX = self._belief_present_from_box(b, "X")
-        pY = self._belief_present_from_box(b, "Y")
-        
-        # feasibility gate using your optimistic check (assume travel zero ok for a prompt heuristic)
-        if kind == "sense":
-            if not self._feasible_sense_then_dispose(b, prop, now_sim, assume_travel_zero=True):
-                return -1e12
-        if kind == "dispose":
-            if not self._feasible_sense_then_dispose(b, prop, now_sim, assume_travel_zero=True):
-                return -1e12
-            p = pX if prop == "X" else pY
-            if p <= 0.5:
-                return -1e12
-
-        # proxy travel from *this* agent’s perspective (if you track other poses, use them)
-        dist = self._dist_to(b.x, b.y)
-        travel_pen = 2.0 * dist
-
-        # urgency
-        slack = float(b.deadline) - float(now_sim)
-        urg = -slack  # smaller slack => larger urg
+        horizon = float(getattr(self, "planner_horizon_sec", 60.0))
+        return agents, box_infos, travel_time_fn, horizon
 
 
+    def _plan_tuples_to_candidate_schema(self, plan_tuples):
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for aid, acts in (plan_tuples or {}).items():
+            out[aid] = []
+            for (box_id, prop, kind) in acts:
+                out[aid].append({"kind": kind, "box_id": int(box_id), "prop": str(prop)})
+        return out
 
-        if mode == "egoistic":
-            my_goal = str(self.goal_property)
-            
-            # Egoistic cares about disposing *my goal property* only.
-            if prop != my_goal:
-                return -1e11  # effectively disallow non-goal work in egoistic mode
-            
-            val = pX if my_goal == "X" else pY
 
-        else:
-            # prosocial: value either hazard, but avoid “temptation trap” if both low
-            val = (pX + pY) - 0.8 * max(0.0, 0.55 - max(pX, pY))
-
-        # sensing vs disposing preference
-        if kind == "dispose":
-            val *= 1.25
-        else:
-            val *= 0.95
-
-        return 10.0 * val + 0.8 * urg - 0.6 * travel_pen
-
-    def _has_completed_sense_for_prop(self, b: BoxSummary, prop: str) -> bool:
+    def _info_level_for_box(self, b: BoxSummary, prop: str) -> float:
         prop = str(prop).upper()
 
-        for r in b.sense_results or []:
-            # Require completed sense for the same property
-            if (
-                str(r.get("property", "")).upper() == prop
-                and r.get("status") == "completed"
-            ):
+        # Use your current belief fusion (same as _score_step uses)
+        p = float(self._belief_present_from_box(b, prop))
+
+        # Convert belief -> info/confidence in [0,1]
+        return float(info_level_from_p(p))
+
+    def _already_sensed(self, b: BoxSummary, prop: str, agent_id: str) -> bool:
+        """
+        Returns True if this agent has already completed a sense(prop) on this box.
+        """
+        prop = str(prop).upper()
+        aid = str(agent_id)
+
+        for sr in (b.sense_results or []):
+            if str(sr.get("property", "")).upper() != prop:
+                continue
+
+            # server uses either explicit status or completed_at timestamp
+            status = sr.get("status")
+            completed = (status == "completed") or ("completed_at" in sr)
+
+            if not completed:
+                continue
+
+            if str(sr.get("agent_id", "")) == aid:
                 return True
 
         return False
+
 
 
     def _sense_time_sec(self, b: BoxSummary, prop: Property) -> float:
@@ -3032,6 +3063,7 @@ class SimHumanAgent(Node):
             text = payload.get("text")
             target = payload.get("target_speaker", None)
 
+
             if not speaker or not isinstance(text, str):
                 return
 
@@ -3046,13 +3078,14 @@ class SimHumanAgent(Node):
             })
 
             # ----- existing routing filters -----
-            if target is not None and str(target) not in (self.agent_id, "all"):
+            if target is not None and target and str(target) not in (self.agent_id, "all"):
                 return
 
             if speaker == self.agent_id:
                 return
 
         except Exception:
+            self._log("whatt??","")
             return
 
         event = {"speaker_id": speaker, "text": text, "t_wall": time.time()}
@@ -3103,6 +3136,8 @@ class SimHumanAgent(Node):
             if target_speaker:
                 payload["target_speaker"] = str(target_speaker)
 
+            if self.no_target_speaker:
+                payload["target_speaker"] = ""
             out.data = json.dumps(payload)
             self.pub_stt.publish(out)
             self._log("SAY", f"{YELLOW}{final_text}{RESET}")
@@ -3227,6 +3262,9 @@ class SimHumanAgent(Node):
             payload = {"text": final_text, "speaker_id": self.agent_id}
             if target_speaker:
                 payload["target_speaker"] = target_speaker
+
+            if self.no_target_speaker:
+                payload["target_speaker"] = ""
 
             out.data = json.dumps(payload)
 
@@ -3858,54 +3896,64 @@ class SimHumanAgent(Node):
     def _router_tick(self) -> None:
         if self._stop or not getattr(self, "comm_enable", False):
             return
-        # Don't spawn if already running
-        with self._router_lock:
-            if self._router_thread is not None and self._router_thread.is_alive():
-                return
-            if not self.inbox:
-                return
-            th = threading.Thread(target=self._router_thread_main, daemon=True)
-            self._router_thread = th
-            th.start()
+        # Wake router worker; don't spawn new threads
+        if self.inbox:
+            self._router_wakeup.set()
 
-    def _router_thread_main(self) -> None:
-        """
-        ✅ This thread MUST stay responsive and MUST NOT do travel/sense/dispose.
-        It only:
-          - runs LLM decide_on_message for up to N inbox items
-          - publishes reply_text
-          - adds/updates commitments
-        """
+    def _router_worker_main(self) -> None:
+        while not self._stop:
+            # Sleep until someone signals new work
+            self._router_wakeup.wait(timeout=0.5)
+            self._router_wakeup.clear()
+            if self._stop:
+                break
+
+            # Debounce window: accumulate a burst of incoming messages
+            debounce_s = float(getattr(self, "router_debounce_sec", 0.10))
+            if debounce_s > 0:
+                time.sleep(debounce_s)
+
+            self._router_handle_batch()
+
+
+    def _router_handle_batch(self) -> None:
         try:
-            # Lightweight snapshot of time + boxes for router context
             t = self._time()
             now_sim = float(t["server_time"])
-            
-            
             time_limit = float(t["time_limit_sec"])
             if now_sim >= time_limit:
                 self._request_shutdown_with_summary(
                     now_sim=now_sim,
                     time_limit=time_limit,
-                    why="time_limit_reached (router loop)",
+                    why="time_limit_reached (router worker)",
                 )
                 return
 
-            
             boxes = self._boxes_state()
 
-            handled = 0
-            while handled < self.max_inbox_per_tick:
+            # Drain inbox quickly (bounded)
+            batch = []
+            max_batch = int(getattr(self, "max_inbox_batch", 25))
+            
+            copied_inbox = self.inbox.copy()
+            
+            while len(batch) < max_batch:
                 try:
-                    evt = self.inbox.popleft()
+                    evt = copied_inbox.popleft()
                 except Exception:
                     break
+                batch.append(evt)
 
+            if not batch:
+                return
+
+            # Route + keep only those meant for me (or broadcast)
+            routed = []
+            for evt in batch:
                 speaker = str(evt.get("speaker_id", ""))
                 text = str(evt.get("text", ""))
 
                 explicit_target = evt.get("target_speaker", None)
-
                 if explicit_target is not None:
                     tgt = str(explicit_target)
                     route_src = "explicit"
@@ -3913,35 +3961,31 @@ class SimHumanAgent(Node):
                     tgt = self._infer_target_speaker(speaker, text, now_sim)
                     route_src = "llm_infer" if self.infer_target_use_llm else "fallback"
 
-                # ✅ NEW: log what we think the recipient is
-                self._log(
-                    "ROUTE",
+                self._log("ROUTE",
                     f"route src={route_src} from={speaker} -> target={tgt} "
                     f"me={self.agent_id} text={text!r}"
                 )
 
-
-                # If not for me (and not broadcast), ignore
                 if tgt not in (self.agent_id, "all"):
                     self._log("ROUTE", f"ignore msg inferred_target={tgt} from={speaker} text={text!r}")
                     continue
 
-                # If it IS for me, you can optionally annotate event so downstream LLM sees it
                 evt["target_speaker"] = tgt
+                routed.append(evt)
 
-                if self.policy_type == "llm":
-                    if self.think_router_enable:
-                        self._maybe_think(where="router_decide_on_message")
-                    _ = self.llm_policy.decide_on_message(self, boxes, now_sim, evt)
+            if not routed:
+                return
 
+            if self.policy_type == "llm":
+                if self.think_router_enable:
+                    self._maybe_think(where="router_decide_on_message_batch")
 
-                handled += 1
+                # ✅ SINGLE call for the whole batch
+                _ = self.llm_policy.decide_on_message(self, boxes, now_sim, routed)
 
         except Exception as e:
-            self.get_logger().warn(f"[FAIL] router cycle failed: {e}")
-        finally:
-            with self._router_lock:
-                self._router_thread = None
+            self.get_logger().warn(f"[FAIL] router batch failed: {e}")
+
 
 
 def main():
