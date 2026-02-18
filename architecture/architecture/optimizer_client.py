@@ -490,6 +490,10 @@ def plan_assignments_gurobi(
                     continue
 
                 # ---------- SENSING VARS ----------
+                # HARD egoistic restriction: only allow sensing goal property
+                if weights.egoistic_goal_property is not None and str(p) != str(weights.egoistic_goal_property):
+                    continue
+
                 can_sense = (a.can_sense_X if p == "X" else a.can_sense_Y)
                 already = b.already_sensed.get(a.agent_id, {}).get(p, False)
 

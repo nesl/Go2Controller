@@ -233,6 +233,7 @@ class PlanMediator:
         self,
         state: MediationState,
         new_human_turn: Optional[MediationTurn] = None,
+        action_history = None,
     ) -> Tuple[MediationState, Dict[str, Any]]:
         """
         Perform ONE mediation step.
@@ -285,6 +286,7 @@ class PlanMediator:
             state.turns.append(new_human_turn)
             state.interaction.recent_utterances.append(new_human_turn)
 
+        self.action_history = action_history
         # Build LLM messages
         messages = self._build_messages_for_llm(state)
 
@@ -729,6 +731,7 @@ class PlanMediator:
         self,
         state: MediationState,
         reason: str,
+        action_history = None,
     ) -> List[Dict[str, Any]]:
         """
         Build messages for a timeout-based auto-resolve.
@@ -843,6 +846,7 @@ class PlanMediator:
             ),
         }
 
+        self.action_history = action_history
 
         # User payload: identical + only reason field
         user_payload = {
@@ -860,6 +864,9 @@ class PlanMediator:
                 "human_profiles": state.interaction.human_profiles or {},
             },
         }
+        
+        if self.action_history is not None:
+            user_payload.update(self.action_history)
 
         user_msg = {
             "role": "user",
@@ -1058,6 +1065,9 @@ class PlanMediator:
                 "human_profiles": state.interaction.human_profiles or {},
             },
         }
+
+        if self.action_history is not None:
+            user_payload.update(self.action_history)
 
         user_msg = {
             "role": "user",

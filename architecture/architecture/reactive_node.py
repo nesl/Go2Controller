@@ -512,7 +512,7 @@ class InteractionLoopNode(Node):
         )
 
         skills_obj = {
-            "name": f"optimizer.robot.{kind}.{box_id}",
+            "name": f"optimizer.robot.{kind}.{box_id}.{prop}",
             "skills": skills_list,
         }
 

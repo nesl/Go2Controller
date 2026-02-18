@@ -6,6 +6,11 @@ from launch.substitutions import LaunchConfiguration
 from ament_index_python.packages import get_package_share_directory
 import os
 
+from launch.actions import RegisterEventHandler, EmitEvent
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
+
+
 pkg_share = get_package_share_directory('architecture')
 
 RULES_DYNAMIC_PATH = os.path.join(pkg_share, 'config', 'rules.yaml')
@@ -30,6 +35,26 @@ def _clear_runtime_files(context, *args, **kwargs):
 
 def generate_launch_description():
     plan_accept_policy = LaunchConfiguration("plan_accept_policy")
+
+    taskstatemonitor = Node(
+        package='architecture',
+        executable='taskstatemonitor_node',
+        name='taskstatemonitor_node',
+        output='screen',
+        parameters=[{
+            'task_registry_path': os.path.join(pkg_share, 'config', 'task_registry.yaml'),
+            'sim_mode': True,
+            "plan_accept_policy": plan_accept_policy
+        }]
+    )
+
+    shutdown_on_deadline = RegisterEventHandler(
+        OnProcessExit(
+            target_action=taskstatemonitor,
+            on_exit=[EmitEvent(event=Shutdown(reason="Deadline reached: taskstatemonitor exited"))],
+        )
+    )
+
     return LaunchDescription([
         OpaqueFunction(function=_clear_runtime_files),
 
@@ -53,6 +78,7 @@ def generate_launch_description():
                 'enabled': True,
             }]
         ),
+
         Node(
             package='architecture',
             executable='skills_node',
@@ -64,27 +90,9 @@ def generate_launch_description():
                 'sim_mode': True,
             }]
         ),
-        #Node(
-        #    package='architecture',
-        #    executable='hdt2_node',   # adjust if your console_script name differs
-        #    name='hdt2_node',
-        #    output='screen',
-        #    parameters=[{
-        #        'llm_enabled': True,
-        #        'model': 'gpt-5-mini',
-        #    }]
-        #),
-        Node(
-            package='architecture',
-            executable='taskstatemonitor_node',
-            name='taskstatemonitor_node',
-            output='screen',
-            parameters=[{
-                'task_registry_path': os.path.join(pkg_share, 'config', 'task_registry.yaml'),
-                'sim_mode': True,
-                "plan_accept_policy": plan_accept_policy
-            }]
-        ),
+
+        taskstatemonitor,
+
         Node(
             package='architecture',
             executable='reactive_node',
@@ -95,92 +103,10 @@ def generate_launch_description():
                 'model': 'gpt-5-mini',
                 'skills_base_path': os.path.join(pkg_share, 'config', 'skills.yaml'),
                 'skills_composite_path': SKILLS_COMPOSITE_PATH,
-                
             }]
         ),
-        #Node(
-        #    package='architecture',
-        #    executable='coordinator_node',
-        #    name='coordinator_node',
-        #    output='screen',
-        #    parameters=[{
-        #        'llm_enabled': True,
-        #        'model': 'gpt-5-nano',
-        #        'skills_base_path': os.path.join(pkg_share, 'config', 'skills.yaml'),
-        #        'skills_composite_path': SKILLS_COMPOSITE_PATH,
-        #    }]
-        #),
 
-        # The following nodes are temporarily disabled.
-        # If you want them back, remove the '#' on each line
-        # and make sure they stay as proper Node(...) entries
-        #
-        # Node(
-        #     package='architecture',
-        #     executable='broker_node',
-        #     name='broker_node',
-        #     output='screen',
-        #     parameters=[{
-        #         'task_registry_path': os.path.join(pkg_share, 'config', 'task_registry.yaml'),
-        #         'model': 'gpt-4.1-nano',
-        #         'llm_enabled': True,
-        #         'event_summary_model': 'gpt-oss-20b'
-        #     }]
-        # ),
-        # Node(
-        #     package='architecture',
-        #     executable='planner_node',
-        #     name='planner_node',
-        #     output='screen',
-        #     parameters=[{
-        #         'llm_enabled': True,
-        #         'model': 'gpt-5-nano'
-        #     }]
-        # ),
-        # Node(
-        #     package='architecture',
-        #     executable='orchestrator_node',
-        #     name='orchestrator_node',
-        #     output='screen',
-        #     parameters=[{
-        #         'skills_base_path': os.path.join(pkg_share, 'config', 'skills.yaml'),
-        #         'skills_composite_path': SKILLS_COMPOSITE_PATH,
-        #         'registry_path': os.path.join(pkg_share, 'config', 'task_registry.yaml'),
-        #         'rules_path':    RULES_DYNAMIC_PATH,
-        #         'rules_init_path': os.path.join(pkg_share, 'config', 'rules_init.yaml'),
-        #         'model': 'gpt-5-nano',
-        #     }]
-        # ),
-        # Node(
-        #     package='architecture',
-        #     executable='hdt_node',
-        #     name='hdt_node',
-        #     output='screen',
-        #     parameters=[{
-        #         'capsule_topic': '/broker/context_capsule',
-        #         'profiles_topic': '/profiles/summary',
-        #         'perf_topic': '/llm/hdt_perf',
-        #         'human_ids': ['H1', 'H2'],
-        #         'update_period_s': 2.0,
-        #         'enabled': True,
-        #         'llm_enabled': True,
-        #         'model': 'gpt-4.1-nano',
-        #     }]
-        # ),
-        # Node(
-        #     package='architecture',
-        #     executable='router_node',
-        #     name='router_node',
-        #     output='screen',
-        #     parameters=[{
-        #         'model': 'gpt-5-mini',
-        #         'llm_enabled': False,
-        #         'skills_base_path': os.path.join(pkg_share, 'config', 'skills.yaml'),
-        #         'skills_composite_path': SKILLS_COMPOSITE_PATH,
-        #         'registry_path': os.path.join(pkg_share, 'config', 'task_registry.yaml'),
-        #         'rules_path':    RULES_DYNAMIC_PATH,
-        #         'rules_init_path': os.path.join(pkg_share, 'config', 'rules_init.yaml'),
-        #     }]
-        # ),
+        shutdown_on_deadline,
     ])
+
 

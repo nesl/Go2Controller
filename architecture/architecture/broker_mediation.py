@@ -1999,6 +1999,33 @@ class BrokerMediationMixin:
         )
 
 
+        # after session_id = f"mediation:{req_id}" and state created
+        now_ts = float(ts)
+
+        try:
+            self._upsert_mediation_session(
+                session_id=session_id,
+                req_id=str(req_id) if req_id is not None else None,
+                proposer_id=str(proposer_id),
+                created_ts=now_ts,
+                started_ts=None,
+                ended_ts=None,
+                status="pending",
+                turns_used=int(getattr(state, "turns_used", 0) or 0),
+                human_turns=int(self._count_human_turns(state)),
+                suboptimality_pct=float(suboptimal_pct) if suboptimal_pct is not None else None,
+                deadline_risk=float(deadline_risk) if deadline_risk is not None else None,
+                imbalance_XY=float(imbalance_XY) if imbalance_XY is not None else None,
+            )
+            self._log_mediation_event(session_id, "created", now_ts, {
+                "proposer_id": proposer_id,
+                "req_id": req_id,
+                "prefix_plan": prefix_changes,
+            })
+        except Exception:
+            pass
+
+
         setattr(state, "original_prefix_plan", original_prefix_plan)
         setattr(state, "_seen_turn_keys", seen_turn_keys)
         setattr(state, "baseline_human_agreed_override", baseline_agreed)
@@ -2455,6 +2482,134 @@ class BrokerMediationMixin:
             except Exception as e:
                 self.get_logger().warn(f"[mediation] failed to publish final status: {e}")
 
+            ended_ts = float(ts)
+            decision = (raw_decision.get("decision") or "").strip() or None
+            pa = raw_decision.get("planner_action") or {}
+            planner_kind = (pa.get("kind") or "").strip() or None
+            log_tags = raw_decision.get("log_tags") or {}
+            strategy = log_tags.get("strategy")
+            rationale = log_tags.get("rationale")
+
+            dropped_total = int(len(dropped or []))
+            dropped_human_origin = int(sum(1 for d in (dropped or []) if d.get("origin") in ("human", "robot")))
+
+            self._upsert_mediation_session(
+                session_id=session_id,
+                ended_ts=ended_ts,
+                status=str(final_status),
+                decision=decision,
+                planner_kind=planner_kind,
+                strategy=strategy,
+                rationale=rationale,
+                turns_used=int(getattr(session, "turns_used", 0) or 0),
+                human_turns=int(self._count_human_turns(session)),
+                dropped_total=dropped_total,
+                dropped_human_origin=dropped_human_origin,
+            )
+
+            self._log_mediation_event(session_id, "finalize", ended_ts, {
+                "final_status": final_status,
+                "decision": decision,
+                "planner_kind": planner_kind,
+                "dropped_total": dropped_total,
+                "dropped_human_origin": dropped_human_origin,
+            })
+
+
+    def _compute_mediation_outcome_metrics(self, window_sec: Optional[float] = None) -> dict:
+        self._ensure_mediation_tables()
+        cur = self.conn.cursor()
+
+        where = ""
+        args = ()
+        if window_sec is not None:
+            t0 = time.time() - float(window_sec)
+            where = "WHERE created_ts >= ?"
+            args = (t0,)
+
+        rows = cur.execute(f"""
+            SELECT proposer_id, status, decision, planner_kind, was_autoresolve,
+                   dropped_total, dropped_human_origin, turns_used
+            FROM mediation_sessions
+            {where}
+        """, args).fetchall()
+        cur.close()
+
+        out = {
+            "count": 0,
+            "by_status": defaultdict(int),
+            "by_planner_kind": defaultdict(int),
+            "by_proposer": defaultdict(int),
+            "autoresolve_count": 0,
+            "dropped_human_origin_total": 0,
+            "dropped_total": 0,
+            "turns_used_total": 0,
+        }
+
+        for proposer_id, status, decision, planner_kind, was_autoresolve, d_tot, d_h, turns_used in rows:
+            out["count"] += 1
+            out["by_status"][status or "unknown"] += 1
+            out["by_planner_kind"][planner_kind or "unknown"] += 1
+            out["by_proposer"][proposer_id or "unknown"] += 1
+            out["autoresolve_count"] += int(was_autoresolve or 0)
+            out["dropped_total"] += int(d_tot or 0)
+            out["dropped_human_origin_total"] += int(d_h or 0)
+            out["turns_used_total"] += int(turns_used or 0)
+
+        # convert defaultdicts to normal dicts
+        out["by_status"] = dict(out["by_status"])
+        out["by_planner_kind"] = dict(out["by_planner_kind"])
+        out["by_proposer"] = dict(out["by_proposer"])
+
+        # lightweight derived stats
+        if out["count"] > 0:
+            out["avg_turns_used"] = out["turns_used_total"] / float(out["count"])
+            out["autoresolve_rate"] = out["autoresolve_count"] / float(out["count"])
+        else:
+            out["avg_turns_used"] = None
+            out["autoresolve_rate"] = None
+
+        return out
+
+
+    def _print_mediation_outcome_metrics(self, window_sec: Optional[float] = None):
+        try:
+            m = self._compute_mediation_outcome_metrics(window_sec=window_sec)
+            lg = self.get_logger()
+
+            if not m or m.get("count", 0) == 0:
+                lg.info("[mediation][metrics] no mediation sessions recorded.")
+                return
+
+            lg.info("========== MEDIATION OUTCOME METRICS ==========")
+
+            lg.info(f"[mediation][metrics] total_sessions={m['count']}")
+            lg.info(f"[mediation][metrics] avg_turns_used={m.get('avg_turns_used')}")
+            lg.info(f"[mediation][metrics] autoresolve_rate={m.get('autoresolve_rate')} "
+                    f"(count={m.get('autoresolve_count')})")
+
+            lg.info(f"[mediation][metrics] dropped_total={m.get('dropped_total')} "
+                    f"dropped_human_origin_total={m.get('dropped_human_origin_total')}")
+
+            # --- breakdowns ---
+            lg.info("[mediation][metrics] by_status:")
+            for k, v in sorted((m.get("by_status") or {}).items()):
+                lg.info(f"    {k}: {v}")
+
+            lg.info("[mediation][metrics] by_planner_kind:")
+            for k, v in sorted((m.get("by_planner_kind") or {}).items()):
+                lg.info(f"    {k}: {v}")
+
+            lg.info("[mediation][metrics] by_proposer:")
+            for k, v in sorted((m.get("by_proposer") or {}).items()):
+                lg.info(f"    {k}: {v}")
+
+            lg.info("===============================================")
+
+        except Exception as e:
+            self.get_logger().warn(f"[mediation][metrics] print failed: {e}")
+
+
     def _commit_plan_with_provenance(
         self,
         plan: Plan,
@@ -2814,6 +2969,87 @@ class BrokerMediationMixin:
             self._save_human_profile(human_id, cur)
 
 
+    def _ensure_mediation_tables(self):
+        try:
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS mediation_sessions (
+                session_id TEXT PRIMARY KEY,
+                req_id TEXT,
+                proposer_id TEXT,
+                created_ts REAL,
+                started_ts REAL,
+                ended_ts REAL,
+
+                status TEXT,                 -- accept|reject|cancelled|idle|pending
+                decision TEXT,               -- accept|reject (from raw_decision)
+                planner_kind TEXT,           -- keep_baseline|adopt_candidate|merge_plans|request_new_plan
+                strategy TEXT,               -- raw_decision.log_tags.strategy (e.g., timeout_fallback, always_accept)
+                rationale TEXT,              -- raw_decision.log_tags.rationale
+
+                turns_used INTEGER DEFAULT 0,
+                human_turns INTEGER DEFAULT 0,
+                was_autoresolve INTEGER DEFAULT 0,
+                autoresolve_reason TEXT,
+
+                dropped_total INTEGER DEFAULT 0,
+                dropped_human_origin INTEGER DEFAULT 0,
+
+                suboptimality_pct REAL,
+                deadline_risk REAL,
+                imbalance_XY REAL
+            );
+            """)
+
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS mediation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                ts REAL,
+                event_type TEXT,             -- created|init|turn|autoresolve|finalize|status_publish
+                payload_json TEXT
+            );
+            """)
+
+            self.conn.commit()
+        except Exception as e:
+            self.get_logger().warn(f"[mediation][db] ensure tables failed: {e}")
+
+
+    def _log_mediation_event(self, session_id: str, event_type: str, ts: float, payload: dict):
+        try:
+            self._ensure_mediation_tables()
+            self.conn.execute(
+                "INSERT INTO mediation_events(session_id, ts, event_type, payload_json) VALUES (?, ?, ?, ?)",
+                (str(session_id), float(ts), str(event_type), json.dumps(payload or {}, ensure_ascii=False)),
+            )
+            self.conn.commit()
+        except Exception as e:
+            self.get_logger().warn(f"[mediation][db] event log failed: {e}")
+
+
+    def _upsert_mediation_session(self, session_id: str, **fields):
+        """
+        Minimal upsert helper so you can update the same row as session progresses.
+        """
+        try:
+            self._ensure_mediation_tables()
+            # Build dynamic upsert
+            cols = ["session_id"] + list(fields.keys())
+            vals = [str(session_id)] + [fields[k] for k in fields.keys()]
+
+            set_clause = ", ".join([f"{c}=excluded.{c}" for c in fields.keys()])
+            qmarks = ", ".join(["?"] * len(cols))
+            sql = f"""
+            INSERT INTO mediation_sessions({", ".join(cols)})
+            VALUES ({qmarks})
+            ON CONFLICT(session_id) DO UPDATE SET {set_clause}
+            """
+            self.conn.execute(sql, vals)
+            self.conn.commit()
+        except Exception as e:
+            self.get_logger().warn(f"[mediation][db] session upsert failed: {e}")
+
+
     def _load_disposal_outcomes_for_session(self, session: MediationState) -> list[DisposalOutcome]:
         """
         Hook: load realized disposal outcomes that are linked to this mediation
@@ -2956,7 +3192,7 @@ class BrokerMediationMixin:
             ts = float(last_ts or time.time())
 
             try:
-                sess2, raw = self._plan_mediator.step(sess)
+                sess2, raw = self._plan_mediator.step(sess, action_history={"current_action": self.current_action, "history_of_actions": self.history_of_actions[-5:]})
             except Exception as e:
                 self.get_logger().warn(f"[mediation] init step failed: {e}")
 
@@ -2971,6 +3207,25 @@ class BrokerMediationMixin:
                 self._mediation_sessions[session_id] = sess
                 self._finalize_mediation_session(session_id=session_id, session=sess, raw_decision=raw, ts=ts)
                 return
+
+
+            ts = float(last_ts or time.time())
+
+            # mark started_ts on first init
+            self._upsert_mediation_session(
+                session_id=session_id,
+                started_ts=ts,
+                turns_used=int(getattr(sess2, "turns_used", 0) or 0),
+                human_turns=int(self._count_human_turns(sess2)),
+                status=str(getattr(sess2, "status", "pending") or "pending"),
+            )
+
+            self._log_mediation_event(session_id, "init", ts, {
+                "status": getattr(sess2, "status", None),
+                "raw_decision": raw,  # if this is too big, store only subset
+            })
+
+
 
             self.get_logger().info(f'Raw 1 {raw}')
             self._mediation_sessions[session_id] = sess2
@@ -3227,6 +3482,21 @@ class BrokerMediationMixin:
             except Exception:
                 pass
             
+            self._log_mediation_event(session_id, "turn", now_ts, {
+                "speaker": getattr(last_turn, "role", None),
+                "text": getattr(last_turn, "text", None),
+                "rule": (getattr(last_turn, "meta", None) or {}).get("rule"),
+            })
+
+            # also keep the session row fresh
+            self._upsert_mediation_session(
+                session_id=session_id,
+                turns_used=int(getattr(sess, "turns_used", 0) or 0),
+                human_turns=int(self._count_human_turns(sess)),
+                status=str(getattr(sess, "status", "pending") or "pending"),
+            )
+
+            
             turns_used = int(getattr(sess, "turns_used", 0) or 0)
             max_turns = int(getattr(self, "mediation_max_turns", 3) or 3)
 
@@ -3261,7 +3531,7 @@ class BrokerMediationMixin:
             
             
             try:
-                sess2, raw = self._plan_mediator.step(sess, new_human_turn=last_turn)
+                sess2, raw = self._plan_mediator.step(sess, action_history={"current_action": self.current_action, "history_of_actions": self.history_of_actions[-5:]}, new_human_turn=last_turn)
             except Exception as e:
                 self.get_logger().warn(f"[mediation] buffered step failed: {e}")
                 return
@@ -3604,7 +3874,7 @@ class BrokerMediationMixin:
 
             try:
                 try:
-                    messages = self._plan_mediator.build_messages_for_autoresolve(sess, reason=reason)
+                    messages = self._plan_mediator.build_messages_for_autoresolve(sess, reason=reason, action_history={"current_action": self.current_action, "history_of_actions": self.history_of_actions[-5:]})
                     raw = self._mediate_llm_call(messages)
                 except Exception as e:
                     self.get_logger().warn(f"[mediation] autoresolve LLM failed: {e}; falling back to keep_baseline")
@@ -3630,6 +3900,19 @@ class BrokerMediationMixin:
 
                 sess.status = "accept" if raw.get("decision") == "accept" else "reject"
                 self._mediation_sessions[session_id] = sess
+                
+                
+                self._upsert_mediation_session(
+                    session_id=session_id,
+                    was_autoresolve=1,
+                    autoresolve_reason=str(reason),
+                )
+
+                self._log_mediation_event(session_id, "autoresolve", now_ts, {
+                    "reason": reason,
+                })
+
+
 
                 # finalize() will compose forced utterance if needed
                 self._finalize_mediation_session(session_id=session_id, session=sess, raw_decision=raw, ts=now_ts)
@@ -3782,6 +4065,7 @@ class BrokerMediationMixin:
             messages = self._plan_mediator.build_messages_for_autoresolve(
                 sess,
                 reason=reason,
+                action_history={"current_action": self.current_action, "history_of_actions": self.history_of_actions[-5:]}
             )
 
             # 2) Call the SAME LLM wrapper/schema as normal mediation

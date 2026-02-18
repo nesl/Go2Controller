@@ -248,6 +248,9 @@ class BrokerNode(Node, BrokerMediationMixin):
         # Last plan and “fingerprint” of box server state
         self._last_plan = None
         
+        self.current_action = ""
+        self.history_of_actions = []
+        
         # Optimizer output (suggestion / baseline)
         self._last_optimizer_plan: Optional[Plan] = None
 
@@ -257,6 +260,8 @@ class BrokerNode(Node, BrokerMediationMixin):
 
         self._last_boxes_fp = None
         self._optimizer_running = False
+
+        self.allow_mediation = True
 
         # Publish plan as JSON so planner / reactive node can consume it
         self.pub_opt_plan = self.create_publisher(
@@ -289,6 +294,12 @@ class BrokerNode(Node, BrokerMediationMixin):
         self.declare_parameter("event_summary_model", "gpt-5-mini")  # fast, cheap, small context
         self.declare_parameter("event_summary_batch_size", 8)         # run summary after N events
 
+        # thresholds to avoid spam (tune)
+        self.declare_parameter("belief_announce_min_delta_p", 0.15)
+        self.declare_parameter("belief_announce_min_delta_info", 0.20)
+        self.declare_parameter("belief_announce_cooldown_sec", 0.0)
+        self.declare_parameter("belief_announce_enabled", False)
+
         self.event_summary_enabled = (
             self.get_parameter("event_summary_enabled")
             .get_parameter_value()
@@ -314,7 +325,9 @@ class BrokerNode(Node, BrokerMediationMixin):
         self._pending_frontier_check = False
         self._pending_frontier_check_fp = None
 
-
+        # --- box belief announcements ---
+        self._last_box_beliefs = {}          # box_id -> {"pX","pY","infoX","infoY"}
+        self._last_box_announce_ts = {}      # box_id -> last time we spoke about it (wall time)
 
 
         # Async running event summary state
@@ -421,7 +434,7 @@ class BrokerNode(Node, BrokerMediationMixin):
         self._start_time = time.time()
 
         self._last_server_time: Optional[float] = None
-
+        self._shutdown_triggered = False
 
 
         # NEW: last known robot zone (from event-layer)
@@ -466,6 +479,88 @@ class BrokerNode(Node, BrokerMediationMixin):
             f"target_frame={self.target_frame} zone_split_x={self.zone_split_x} server={self.server_url} "
             f"enable_server={self.enable_server}"
         )
+
+    def _deadline_for_box_id(self, boxes_state: list, box_id: int) -> Optional[float]:
+        """
+        Reuse /boxes/state payload: find the deadline for a given box_id.
+        Returns float deadline or None if unknown.
+        """
+        try:
+            box_id = int(box_id)
+        except Exception:
+            return None
+
+        if not isinstance(boxes_state, list):
+            return None
+
+        for b in boxes_state:
+            try:
+                if int(b.get("box_id")) != box_id:
+                    continue
+            except Exception:
+                continue
+
+            d = b.get("deadline")
+            if d is None:
+                return None
+            try:
+                return float(d)
+            except Exception:
+                return None
+
+        return None
+
+    def _prune_committed_robot_head_if_deadline_passed(
+        self,
+        boxes_state: list,
+        current_time: float,
+    ) -> bool:
+        """
+        If the current committed ROBOT head targets a box whose deadline is already passed,
+        drop that head action. Also clears runtime execution state.
+
+        Returns True if the committed plan changed.
+        """
+        committed = getattr(self, "_committed_plan", None) or {}
+        robot_steps = list(committed.get("robot") or [])
+        if not robot_steps:
+            return False
+
+        # committed robot steps are tuples: (box_id, prop, kind)
+        head = robot_steps[0]
+        try:
+            box_id, prop, kind = head
+            box_id = int(box_id)
+        except Exception:
+            return False  # don't guess on malformed
+
+        deadline = self._deadline_for_box_id(boxes_state, box_id)
+        if deadline is None:
+            return False  # can't prove expired
+
+        if float(current_time) <= float(deadline):
+            return False
+
+        # ✅ deadline already passed -> prune head
+        self.get_logger().warn(
+            f"[commit] committed robot head expired: step={head} "
+            f"deadline={deadline:.3f} now={float(current_time):.3f} -> dropping head"
+        )
+
+        robot_steps = robot_steps[1:]
+        if robot_steps:
+            committed["robot"] = robot_steps
+        else:
+            committed.pop("robot", None)
+
+        self._committed_plan = committed
+        self._has_committed_plan = bool(committed)
+        self._last_plan = committed  # keep coherence
+
+
+        return True
+
+
 
     def _always_accept(self) -> bool:
         return ("always_accept" in getattr(self, "plan_accept_policy", "normal"))
@@ -961,35 +1056,45 @@ class BrokerNode(Node, BrokerMediationMixin):
         return changed
 
 
-    def _announce_idle_plan(self, plan: dict, current_time: float):
+    def _announce_idle_plan(
+        self,
+        plan: dict,
+        current_time: float,
+        *,
+        style: str = "commit",   # "commit" or "propose"
+        require_response: bool = False,
+    ):
         """
         Called after a trigger_idle optimizer publish.
-        Announces what the robot will do + proposes human assignments.
+        Announces/proposes what the robot will do + suggests human assignments.
         Debounced to avoid spam.
+
+        style="commit": robot states intent (execution mode)
+        style="propose": robot asks for agreement (mediation mode)
         """
         if self._comms_disabled():
             return
-        
-        if self._no_proactive():
-            #self._robot_say("What should I do?")
+
+        if self._no_proactive() and style != "propose":
             return
-        
+
         # --- debounce identical plans ---
         fp = self._plan_fingerprint(plan)
         now = time.time()
-
-        # small cooldown AND identical-plan suppression
         cooldown_sec = 4.0
         last_t = getattr(self, "_last_idle_announce_ts", None)
         last_fp = getattr(self, "_last_idle_announce_fp", None)
+        last_style = getattr(self, "_last_idle_announce_style", None)
 
-        if last_t is not None and (now - float(last_t)) < cooldown_sec and fp == last_fp:
+        # suppress identical plan repeats within cooldown *for same style*
+        if last_t is not None and (now - float(last_t)) < cooldown_sec and fp == last_fp and style == last_style:
             return
 
         self._last_idle_announce_ts = now
         self._last_idle_announce_fp = fp
+        self._last_idle_announce_style = style
 
-        # --- turn plan into the published JSON-ish structure (same as _publish_optimizer_plan) ---
+        # --- normalize to JSON-ish structure (same as _publish_optimizer_plan) ---
         agents_block = {
             aid: [
                 {"box_id": int(box_id), "property": prop, "kind": kind}
@@ -1002,50 +1107,72 @@ class BrokerNode(Node, BrokerMediationMixin):
         human_a_actions = agents_block.get("human_a") or []
         human_b_actions = agents_block.get("human_b") or []
 
-        # pick “next” action for each (keep it short)
         robot_next = robot_actions[0] if robot_actions else None
         ha_next = human_a_actions[0] if human_a_actions else None
         hb_next = human_b_actions[0] if human_b_actions else None
 
-        # resolve display names
         ha_name = self.agent_id_to_human_name.get("human_a", "Human A")
         hb_name = self.agent_id_to_human_name.get("human_b", "Human B")
 
         parts = []
 
-        # 1) announce robot intent
-        if robot_next:
-            parts.append(f"I'm going to {self._format_one_action(robot_next)}.")
+        # 1) robot part
+        if style == "propose":
+            # Proposal framing (no early commitment)
+            if robot_next:
+                parts.append(f"I have a suggested plan: I handle {self._format_one_action(robot_next)}.")
+            else:
+                parts.append("I have a suggested plan, but I don't have a robot action queued right now.")
         else:
-            parts.append("I don't have a robot action queued right now.")
+            # Commit framing (execution)
+            if robot_next:
+                parts.append(f"I'm going to {self._format_one_action(robot_next)}.")
+            else:
+                parts.append("I don't have a robot action queued right now.")
 
-        # 2) propose human parts
+        # 2) human suggestions
         proposals = []
         if ha_next:
-            proposals.append(f"{ha_name}, could you {self._format_one_action(ha_next)}?")
+            if style == "propose":
+                proposals.append(f"{ha_name} could {self._format_one_action(ha_next)}")
+            else:
+                proposals.append(f"{ha_name}, could you {self._format_one_action(ha_next)}?")
         if hb_next:
-            proposals.append(f"{hb_name}, could you {self._format_one_action(hb_next)}?")
+            if style == "propose":
+                proposals.append(f"{hb_name} could {self._format_one_action(hb_next)}")
+            else:
+                proposals.append(f"{hb_name}, could you {self._format_one_action(hb_next)}?")
 
         if proposals:
-            parts.append(" ".join(proposals))
+            if style == "propose":
+                parts.append("I suggest: " + "; ".join(proposals) + ".")
+            else:
+                parts.append(" ".join(proposals))
 
-        # Optional: mention that optimizer produced more items (without dumping everything)
+        # 3) optional “more actions exist”
         extra = 0
         if robot_actions: extra += max(0, len(robot_actions) - 1)
         if human_a_actions: extra += max(0, len(human_a_actions) - 1)
         if human_b_actions: extra += max(0, len(human_b_actions) - 1)
-        if extra > 0:
-            parts.append("I also have additional suggested actions if you want them.")
+        if extra > 0 and style == "propose":
+            parts.append("I also have additional suggested actions if we want to look ahead.")
+
+        # 4) explicitly invite discussion when proposing
+        if style == "propose":
+            if require_response:
+                parts.append("What do you think? Please reply: accept, counter, or reject.")
+            else:
+                parts.append("What do you think?")
 
         utterance = " ".join(parts).strip()
         if not utterance:
             return
 
         try:
-            # BrokerMediationMixin should provide this
             self._robot_say(utterance)
         except Exception as e:
             self.get_logger().warn(f"[idle] failed to announce plan via TTS: {e}")
+
 
 
     # ------------------------------ Event ingestion ------------------------------
@@ -1550,13 +1677,46 @@ class BrokerNode(Node, BrokerMediationMixin):
         }
 
         with self._action_stack_lock:
-            if rule == "skill_started_any" or kind == "skill_started":
+            if rule == "skill_started_any" and ("optimizer.robot.dispose" in entry["skill"] or "optimizer.robot.sense" in entry["skill"]):
+            
+                if "optimizer.robot.dispose" in entry["skill"]:
+                    new_current_action = "dispose_" + entry["skill"].split(".")[3]
+                elif "optimizer.robot.sense" in entry["skill"]:
+                    new_current_action = "sense_" + entry["skill"].split(".")[3] + entry["skill"].split(".")[4]
+                    
+                if self.current_action and self.current_action != new_current_action:
+                    self.history_of_actions.append({new_current_action:"cancelled"})
+                
+                self.current_action = new_current_action
+                
                 # push
                 self._action_stack.append(entry)
                 return
 
             # done/finished: pop the most recent matching skill
-            if rule == "skill_done_any" or kind in ("skill_finished", "skill_done"):
+            if rule == "skill_done_any" and ("optimizer.robot.dispose" in entry["skill"] or "optimizer.robot.sense" in entry["skill"] or "box.dispose_nearby" == entry["skill"] or "box.sense_nearby" == entry["skill"]):
+            
+                status_field = ""
+                if "box.dispose_nearby" == entry["skill"]:
+                    status_field = "dispose_result"
+                elif "box.sense_nearby" == entry["skill"]:
+                    status_field = "sense_result"
+                else:
+                    if "optimizer.robot.dispose" in entry["skill"]:
+                        old_current_action = "dispose_" + entry["skill"].split(".")[3]
+                    elif "optimizer.robot.sense" in entry["skill"]:
+                        old_current_action = "sense_" + entry["skill"].split(".")[3] + entry["skill"].split(".")[4]
+                    
+                    if self.current_action == old_current_action:
+                        self.history_of_actions.append({old_current_action:"cancelled"})
+            
+                if status_field:
+                    if inner_ctx["box"][status_field]["status"] == "cancelled":
+                        self.history_of_actions.append({self.current_action:"cancelled"})
+                    elif inner_ctx["box"][status_field]["status"] == "completed":
+                        self.history_of_actions.append({self.current_action:"completed"})
+                        
+                self.current_action = ""
                 # search from top down for matching skill
                 for i in range(len(self._action_stack) - 1, -1, -1):
                     if self._action_stack[i].get("skill") == skill:
@@ -2855,12 +3015,62 @@ class BrokerNode(Node, BrokerMediationMixin):
                 )
                 return
             boxes_state = r_state.json()
-            current_time = float((r_time.json() or {}).get("server_time", 0.0))
+            time_json = (r_time.json() or {})
+            
+            current_time = float(time_json.get("server_time", 0.0))
+            time_up = bool(time_json.get("time_up", False))
+
             self._last_server_time = current_time
             self._last_boxes_state = boxes_state
+
+            if time_up and not self._shutdown_triggered:
+                self._shutdown_triggered = True
+
+                self._print_mediation_outcome_metrics()
+                # emit final score (whatever you already do)
+                self.get_logger().warn("[FINAL] time_up=True -> printing final score and shutting down")
+
+                # shut down ROS so the process exits and launch can kill everything
+                rclpy.shutdown()
+                return
+
         except Exception as e:
             self.get_logger().warn(f"[optimizer] failed to contact box server: {e}")
             return
+
+        # NEW: announce fused estimate changes as plain text over existing comms
+        try:
+            if self._no_proactive():
+                if self._maybe_announce_box_estimate_changes(boxes_state, current_time):
+                    self._trigger_optimizer_once_nopub(
+                        reason="negotiate_plan",
+                        boxes_state=boxes_state,
+                        current_time=current_time,
+                    )
+        except Exception as e:
+            self.get_logger().warn(f"[belief] announce failed: {e}")
+
+
+        # ✅ NEW: prune committed robot head if its box deadline already passed
+        try:
+            if self._prune_committed_robot_head_if_deadline_passed(boxes_state, current_time):
+                # After dropping the head, also run the normal "fulfilled" prune
+                # (this keeps everything consistent if multiple steps are stale/fulfilled).
+                self._prune_committed_plan_from_server_state(boxes_state)
+
+                # Republish updated committed plan (reuse your existing block style)
+                if self._committed_plan:
+                    box_positions = getattr(self, "_last_box_positions", {}) or {}
+                    self._publish_optimizer_plan(self._committed_plan, current_time, box_positions)
+                    self.get_logger().info(f"[commit] published committed plan after deadline prune: {self._committed_plan}")
+                    self.get_logger().info(f"[commit] current_action={self._current_action_brief()}")
+                else:
+                    self.get_logger().info("[commit] deadline prune emptied committed plan; skipping publish of empty plan")
+                    self.ask_for_plan = True
+                    self.ask_for_plan_timer = time.time()
+        except Exception as e:
+            self.get_logger().warn(f"[commit] deadline-head prune failed: {e}")
+
 
 
         # ✅ NEW: prune committed plan based on server truth
@@ -2894,7 +3104,7 @@ class BrokerNode(Node, BrokerMediationMixin):
             
             advanced = (head_before is not None) and (head_before != (robot_after[0] if robot_after else None))
 
-            self.get_logger().info(f"[commit] what  happens {self._mediation_in_progress()} {self._committed_plan}.")
+            #self.get_logger().info(f"[commit] what  happens {self._mediation_in_progress()} {self._committed_plan}.")
 
             # If we still have committed robot steps, check optimizer for *missing disposals*
             # and surface them (mediation path) instead of doing auto-commit fallback.
@@ -3285,7 +3495,8 @@ class BrokerNode(Node, BrokerMediationMixin):
                     pass
 
 
-            
+            if self._no_proactive() and  bool(self.get_parameter("belief_announce_enabled").value):
+                self._announce_idle_plan(plan, current_time, style="propose")
 
             # ✅ Publish ONLY if this run came from a trigger callback
             if publish:
@@ -3487,6 +3698,110 @@ class BrokerNode(Node, BrokerMediationMixin):
 
         return travel_time_fn
 
+    def _maybe_announce_box_estimate_changes(self, boxes_state: list, current_time: float) -> None:
+        if self._comms_disabled():
+            return False
+
+        if not bool(self.get_parameter("belief_announce_enabled").value):
+            return False
+
+        # If you want these announcements to count as "proactive", gate on _no_proactive().
+        # If you want them regardless, remove this block.
+        #if self._no_proactive():
+        #    return
+
+        try:
+            min_dp = float(self.get_parameter("belief_announce_min_delta_p").value)
+            min_dinfo = float(self.get_parameter("belief_announce_min_delta_info").value)
+            cooldown = float(self.get_parameter("belief_announce_cooldown_sec").value)
+        except Exception:
+            min_dp, min_dinfo, cooldown = 0.15, 0.20, 6.0
+
+        # Build fused beliefs using the same pipeline as the optimizer
+        agents = self._build_agents_for_optimizer()
+        if not agents:
+            return False
+
+        #self.get_logger().warn(f"[belief] boxes state {boxes_state}")
+        boxes, _ = self._build_boxes_for_optimizer(boxes_state, agents)
+        #self.get_logger().warn(f"[belief] boxes {boxes}")
+        now_wall = time.time()
+
+        updates = []
+        for b in boxes:
+            try:
+                bid = int(b.box_id)
+            except Exception:
+                continue
+
+            pX = float(getattr(b, "p_true_X", 0.5))
+            pY = float(getattr(b, "p_true_Y", 0.5))
+            infoX = float(getattr(b, "info_X", 0.0))
+            infoY = float(getattr(b, "info_Y", 0.0))
+
+            prev = self._last_box_beliefs.get(bid)
+
+            is_new = prev is None
+            changed = False
+            changed_property = {"X": False, "Y": False}
+            if prev is not None:
+                if abs(pX - prev["pX"]) >= min_dp or abs(pY - prev["pY"]) >= min_dp:
+                    changed = True
+                    
+                    if abs(pX - prev["pX"]) >= min_dp:
+                        changed_property["X"] = True
+                    else:
+                        changed_property["Y"] = True
+
+            if not is_new and not changed:
+                continue
+
+            # per-box cooldown
+            last_t = self._last_box_announce_ts.get(bid)
+            if last_t is not None and (now_wall - float(last_t)) < cooldown:
+                continue
+
+            self._last_box_announce_ts[bid] = now_wall
+            updates.append((bid, pX, infoX, pY, infoY, is_new, changed_property.copy()))
+
+            # update snapshot now (so multiple changes in one tick don’t re-trigger)
+            self._last_box_beliefs[bid] = {"pX": pX, "pY": pY, "infoX": infoX, "infoY": infoY}
+
+        if not updates:
+            return False
+
+        # Keep the utterance short (avoid flooding)
+        updates.sort(key=lambda x: x[0])
+        updates = updates[:2]
+
+        parts = []
+        for (bid, pX, infoX, pY, infoY, is_new, changed_property) in updates:
+            if is_new:
+                parts.append(
+                    f"New box {bid} appeared. "
+                )
+            else:
+                # Optionally emphasize whichever property is more confident
+                
+                txt_senseable = ""
+                
+                if changed_property["X"]:
+                    txt_senseable += f"X has new probability of being present ({pX:.2f}). "
+                if changed_property["Y"]:
+                    txt_senseable += f"Y has new probability of being present ({pY:.2f}). "
+                parts.append(
+                    f"Update on box {bid}: " + txt_senseable
+                )
+
+        utterance = " ".join(parts).strip() + " What should we do?"
+        if utterance:
+            try:
+                self._robot_say(utterance)   # <-- your existing comms path
+            except Exception as e:
+                self.get_logger().warn(f"[belief] failed to send speech message: {e}")
+
+
+        return True
 
     def _build_boxes_for_optimizer(
         self,
@@ -3503,6 +3818,15 @@ class BrokerNode(Node, BrokerMediationMixin):
         """
         boxes: List[BoxInfo] = []
         positions: Dict[int, Tuple[float, float]] = {}
+
+
+        # Normalize agents to dict[agent_id] -> AgentState for Bayes fusion
+        if isinstance(agents, dict):
+            agents_by_id = agents
+        elif isinstance(agents, list):
+            agents_by_id = {a.agent_id: a for a in agents if hasattr(a, "agent_id")}
+        else:
+            agents_by_id = {}
 
         for b in boxes_state:
             try:
@@ -3588,8 +3912,8 @@ class BrokerNode(Node, BrokerMediationMixin):
 
 
 
-            pX = p_present_from_sense_results_bayes(sense_results, "X", agents, prior=0.5)
-            pY = p_present_from_sense_results_bayes(sense_results, "Y", agents, prior=0.5)
+            pX = p_present_from_sense_results_bayes(sense_results, "X", agents_by_id, prior=0.5)
+            pY = p_present_from_sense_results_bayes(sense_results, "Y", agents_by_id, prior=0.5)
             infoX = info_level_from_p(pX)
             infoY = info_level_from_p(pY)
 
