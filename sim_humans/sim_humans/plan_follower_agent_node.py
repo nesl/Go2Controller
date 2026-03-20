@@ -45,7 +45,7 @@ class PlanFollowerAgentNode(Node):
         super().__init__("plan_follower_agent")
 
         self.declare_parameter("agent_id", "robot")
-        self.declare_parameter("server_base_url", "http://172.17.40.64:8080")
+        self.declare_parameter("server_base_url", "http://URL:8080")
         self.declare_parameter("request_timeout_sec", 120.0)
 
         self.declare_parameter("speed_mps", 1.0)

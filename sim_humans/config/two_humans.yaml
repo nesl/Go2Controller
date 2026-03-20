@@ -2,7 +2,7 @@ sim_human_a:
   ros__parameters:
     agent_id: "human_a"
     goal_property: "X"
-    server_base_url: "http://172.17.40.64:8080"
+    server_base_url: "http://URL:8080"
     stt_topic: "/audio/stt_text"
 
     policy_type: "llm"
@@ -44,7 +44,7 @@ sim_human_b:
   ros__parameters:
     agent_id: "human_b"
     goal_property: "Y"
-    server_base_url: "http://172.17.40.64:8080"
+    server_base_url: "http://URL:8080"
     stt_topic: "/audio/stt_text"
 
     policy_type: "llm"

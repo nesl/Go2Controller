@@ -143,13 +143,13 @@ class BrokerNode(Node, BrokerMediationMixin):
 
         # Contamination fetch policy (broker owns it)
         self.declare_parameter('contam_enable_server_calls', True)
-        self.declare_parameter('contam_server_url', 'http://172.17.40.64:8080/check')
+        self.declare_parameter('contam_server_url', 'http://URL:8080/check')
         self.declare_parameter('contam_request_timeout_sec', 0.6)
         self.declare_parameter('contam_min_refresh_sec', 120.0)    # throttle per (agent_id,node_id)
 
         # ---------- Optimizer / planner integration ----------
         self.declare_parameter("optimizer_enabled", True)
-        self.declare_parameter("optimizer_base_url", "http://172.17.40.64:8080")
+        self.declare_parameter("optimizer_base_url", "http://URL:8080")
         self.declare_parameter("optimizer_horizon_sec", 600.0)
 
         # Time budgets per agent for this planning horizon (seconds)

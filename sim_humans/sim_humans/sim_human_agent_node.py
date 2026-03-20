@@ -52,7 +52,7 @@ class SimHumanAgent(Node):
         # ---- basic params ----
         self.declare_parameter("agent_id", "human_a")
         self.declare_parameter("goal_property", "X")
-        self.declare_parameter("server_base_url", "http://172.17.40.64:8080")
+        self.declare_parameter("server_base_url", "http://URL:8080")
         self.declare_parameter("stt_topic", "/audio/stt_text")
 
         # motion + timing

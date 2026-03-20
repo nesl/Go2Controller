@@ -1,6 +1,365 @@
 ![Ros2 SDK](https://github.com/abizovnuralem/go2_ros2_sdk/assets/33475993/49edebbe-11b6-49c6-b82d-bc46257674bd)
 
-# Welcome to the Unitree Go2 ROS2 SDK Project!
+
+# 🤖 Human–Robot Collaboration (ROS2 + Go2 Pro)
+
+![ROS2](https://img.shields.io/badge/ROS2-Humble-blue)
+![Docker](https://img.shields.io/badge/Docker-Required-blue)
+![LLM](https://img.shields.io/badge/LLM-Enabled-green)
+![Status](https://img.shields.io/badge/Status-Research--Prototype-orange)
+
+This repository implements a **coordination architecture for non-dyadic human–robot teams**, where humans and robots collaboratively sense, plan, and act under partial observability.
+
+The system integrates:
+
+* ROS2-based robot control (Unitree Go2 Pro)
+* Multimodal perception (vision, audio, Bluetooth)
+* LLM-mediated communication and planning
+* A centralized task server
+* Simulated human teammates for testing
+
+---
+
+# 🧭 System Overview
+
+At a high level, the system follows a **closed-loop coordination pipeline**:
+
+```
+Sensors → Event Processing → State Tracking → Mediation (LLM)
+        → Planning → Execution → Skills
+```
+
+* **Sensors** collect multimodal data (vision, audio, etc.)
+* **Events** abstract raw signals into structured observations
+* **State tracking** maintains a shared world model
+* **Mediation** resolves team decisions via LLM interaction
+* **Planning** generates task-consistent actions
+* **Execution** translates plans into robot skills
+
+---
+
+# 🐳 Setup
+
+All components are designed to run inside Docker. Build it first. To run:
+
+```bash
+cd docker/
+./docker_server_command
+```
+
+All code will be available in:
+
+```
+/ros2_ws
+```
+
+Make sure to always `colcon build && source install/setup.bash`
+
+---
+
+# 🚀 Running the System
+
+The system is composed of four main subsystems that must be launched in order:
+
+---
+
+## 1. Robot + Base ROS2 System
+
+Check the [Go2 Ros2 SDK Project](#unitree-go2-ros2-sdk-project) for more information.
+
+```bash
+ros2 launch go2_robot_sdk robot.launch.py
+```
+
+This initializes:
+
+* Robot interfaces
+* RViz visualization
+* Navigation and mapping
+
+📌 The system relies on **pre-built lab maps (`lab_map`)**, though mapping is also supported through this launch.
+
+---
+
+## 2. Sensor Processing Layer
+
+```bash
+ros2 launch go2_commander bringup.launch.py
+```
+
+This layer activates perception modules and converts raw sensor streams into usable signals.
+
+### Optional modules
+
+| Argument               | Function                               |
+| ---------------------- | -------------------------------------- |
+| `use_coco`             | Object detection (YOLO + LiDAR fusion) |
+| `use_stt`              | Speech-to-text                         |
+| `use_doa`              | Direction-of-arrival (audio)           |
+| `use_tts`              | Text-to-speech                         |
+| `use_bt_rssi`          | Bluetooth sensing                      |
+| `use_vlm`              | Vision-language reasoning              |
+| `use_llm_speech_check` | LLM-based speech interpretation        |
+
+⚠️ Always keep disabled:
+
+* `use_task_manager=false`
+* `use_coverage=false`
+
+---
+
+## 3. Backend Environment Server
+
+Run this outside the docker container.
+
+```bash
+uvicorn app:app --host 0.0.0.0 --port 8080 --no-access-log
+```
+
+The server:
+
+* Maintains the environment state
+* Defines objects and their properties
+* Synchronizes all agents (robot + UI)
+
+---
+
+## 4. Coordination Architecture
+
+```bash
+ros2 launch architecture architecture.launch.py
+```
+
+This is the core of the system. It:
+
+* Tracks task state
+* Processes events
+* Mediates decisions
+* Generates and executes plans
+
+### Plan Acceptance Policy
+
+| Policy          | Behavior                       |
+| --------------- | ------------------------------ |
+| `normal`        | Mediation + proactive planning |
+| `always_accept` | Skip mediation                 |
+| `no_proactive`  | No proactive actions           |
+| Combined        | Supported                      |
+
+---
+
+# 🧪 Simulation Mode
+
+The system can run without a physical robot.
+
+Enable simulation by setting:
+
+```yaml
+sim_mode: True
+```
+
+in:
+
+* `skills_node`
+* `taskstatemonitor_node`
+
+---
+
+## 👥 Simulated Humans
+
+Launch simulated teammates:
+
+```bash
+ros2 launch sim_humans two_humans.launch.py
+```
+
+Or include a simulated robot:
+
+```bash
+ros2 launch sim_humans humans_and_robot.launch.py
+```
+
+Simulated humans:
+
+* Are LLM-driven agents
+* Communicate via the same interface as real users
+* Can be configured in:
+
+```
+sim_humans/config/two_humans.yaml
+```
+
+---
+
+# 🔑 Environment Variables
+
+```bash
+export OPENAI_API_KEY=...
+export GROQ_API_KEY=...
+```
+
+* `GROQ_API_KEY` is optional
+
+---
+
+# 🧩 Key Components
+
+This section explains how the system is structured internally.
+
+---
+
+## Perception Layer
+
+### COCO Detector
+
+```
+coco_detector/coco_detector_node.py
+```
+
+* Runs YOLO object detection
+* Fuses camera + LiDAR
+* Outputs object positions in map coordinates
+
+---
+
+## Sensor Modules
+
+* `bt_rssi_mapper` → Bluetooth sensing
+* `odas_bridge` → Audio processing
+
+  * `ssl_doa`: direction of arrival
+  * `stt_angle`: speech-to-text
+* `speech_processor` → text-to-speech
+
+---
+
+## Vision + Language
+
+* `vlm_pkg/qwen_vlm_server` → image-based reasoning
+* `llm_speech_check_server` → LLM-based input processing
+
+---
+
+## Event Layer
+
+* Converts sensor data into structured events
+* Uses:
+
+  * `rules_init.yaml`
+  * `task_registry.yaml`
+
+Supports:
+
+* Basic events
+* Composite events
+
+---
+
+## Task State Monitor
+
+* Stores all events
+* Maintains world state
+* Triggers mediation (especially from speech inputs)
+
+---
+
+## Mediation (LLM)
+
+Core modules:
+
+```
+broker_mediation.py
+plan_mediator.py
+```
+
+The mediation process:
+
+1. Builds a prompt from the current state
+2. Queries the LLM
+3. Produces a decision:
+
+   * Accept
+   * Reject
+   * Negotiate
+
+---
+
+## Planning
+
+```
+optimizer_client.py
+```
+
+* Generates optimal plans
+* Compares with human proposals
+* Builds human profiles
+
+---
+
+## Execution Pipeline
+
+```
+Plan → reactive_node → skills_node → execution
+```
+
+---
+
+## Skills
+
+Defined in:
+
+```
+architecture/config/skills.yaml
+```
+
+Includes:
+
+* Primitive actions
+* Composite behaviors (state machines)
+
+---
+
+# 📁 Project Structure (Key Modules)
+
+```
+coco_detector/      # Object detection + localization
+bt_rssi_mapper/     # Bluetooth sensing
+odas_bridge/        # Audio processing
+speech_processor/   # Text-to-speech
+vlm_pkg/            # Vision-language + LLM
+architecture/       # Coordination system
+sim_humans/         # Human simulation
+```
+
+---
+
+# ⚠️ Important Notes
+
+* Start the **backend server before the architecture**
+* Ensure **Raspberry Pi ROS2 nodes** are running for sensors
+* Maps must exist or be generated before navigation
+* LLM features require API keys
+
+---
+
+# 📚 Research Context
+
+This system is part of research on:
+
+> **Mixed human–autonomous collaboration in non-dyadic teams**,
+> focusing on coordination through communication, planning, and action.
+
+---
+
+# 🚧 Status
+
+* ✅ Simulation validated
+* ✅ Real robot integration
+* ⚠️ Limited large-scale experiments
+* 🔬 Active research prototype
+
+
+# Unitree Go2 ROS2 SDK Project
 
 > [!IMPORTANT]  
 > I hadn’t updated this repository in a long time, and a lot of changes accumulated, making the project somewhat messy. I’ve finally found time to refactor everything using Clean Architecture principles. Previously, the LiDAR stream ran at around 2 Hz; it now updates at 7 Hz. However, joint states still arrive at 1 Hz, so you may notice some URDF update lag—that’s expected with the new firmware (v1.1.7). We’ll need to find a workaround for that.

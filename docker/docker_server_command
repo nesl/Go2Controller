@@ -1,0 +1,2 @@
+xhost +local:*
+sudo docker run --rm --gpus all --net=host --privileged -v ros2:/app -v /tmp/.X11-unix:/tmp/.X11-unix -e DISPLAY=:1 -it rosrobot

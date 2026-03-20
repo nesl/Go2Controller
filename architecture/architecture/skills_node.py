@@ -102,7 +102,7 @@ class SkillsAgent(Node):
 
         
         # Box server (for calling /sense directly from skills)
-        self.declare_parameter("box_server_url", "http://172.17.40.64:8080")
+        self.declare_parameter("box_server_url", "http://URL:8080")
         self.declare_parameter("box_req_timeout", 200.0)
         self.declare_parameter("agent_id", "robot")  # logical agent id for /sense
 
